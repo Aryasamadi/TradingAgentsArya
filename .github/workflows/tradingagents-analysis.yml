@@ -1,0 +1,613 @@
+name: TradingAgents Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: "Ticker (example: NVDA, AAPL, 0700.HK)"
+        required: true
+        type: string
+
+      date:
+        description: "Analysis date (YYYY-MM-DD)"
+        required: true
+        type: string
+
+      model_id:
+        description: "Model ID managed by the Telegram bot"
+        required: true
+        type: string
+
+      analysts:
+        description: "Comma-separated analysts"
+        required: false
+        default: "market,social,news,fundamentals"
+        type: string
+
+      request_id:
+        description: "Telegram/request ID"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: tradingagents-analysis-state
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    name: "TradingAgents • ${{ inputs.ticker }} • ${{ inputs.date }}"
+    runs-on: ubuntu-latest
+
+    # GitHub-hosted job maximum duration target.
+    timeout-minutes: 360
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+      # ----------------------------------------------------------
+      # Request
+      # ----------------------------------------------------------
+      TICKER: ${{ inputs.ticker }}
+      ANALYSIS_DATE: ${{ inputs.date }}
+      MODEL_ID: ${{ inputs.model_id }}
+      ANALYSTS: ${{ inputs.analysts }}
+      REQUEST_ID: ${{ inputs.request_id }}
+
+      # ----------------------------------------------------------
+      # Model configuration
+      #
+      # Telegram bot will create/update these repository variables
+      # and secrets:
+      #
+      # MODEL_PROVIDER_<MODEL_ID>
+      # MODEL_NAME_<MODEL_ID>
+      # MODEL_BASE_URL_<MODEL_ID>
+      # MODEL_REGION_<MODEL_ID>
+      # MODEL_TOKEN_<MODEL_ID>
+      # ----------------------------------------------------------
+      MODEL_PROVIDER: ${{ vars[format('MODEL_PROVIDER_{0}', inputs.model_id)] }}
+      MODEL_NAME: ${{ vars[format('MODEL_NAME_{0}', inputs.model_id)] }}
+      MODEL_BASE_URL: ${{ vars[format('MODEL_BASE_URL_{0}', inputs.model_id)] }}
+      MODEL_REGION: ${{ vars[format('MODEL_REGION_{0}', inputs.model_id)] }}
+      MODEL_TOKEN: ${{ secrets[format('MODEL_TOKEN_{0}', inputs.model_id)] }}
+
+      # ----------------------------------------------------------
+      # TradingAgents persistent data
+      # ----------------------------------------------------------
+      TRADINGAGENTS_RESULTS_DIR: .runtime/tradingagents_data/results
+      TRADINGAGENTS_CACHE_DIR: .runtime/tradingagents_data/cache
+      TRADINGAGENTS_MEMORY_LOG_PATH: .runtime/tradingagents_data/memory/trading_memory.md
+
+      # ----------------------------------------------------------
+      # Non-interactive execution
+      # ----------------------------------------------------------
+      TRADINGAGENTS_OUTPUT_LANGUAGE: Persian
+      TRADINGAGENTS_CHECKPOINT_ENABLED: "true"
+
+      # Reliability / output control
+      TRADINGAGENTS_LLM_MAX_RETRIES: "6"
+      TRADINGAGENTS_MAX_TOKENS: "8192"
+
+    steps:
+
+      # ==========================================================
+      # 1. Checkout repository
+      # ==========================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ==========================================================
+      # 2. Python
+      # ==========================================================
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      # ==========================================================
+      # 3. Prepare runtime directories
+      # ==========================================================
+      - name: Prepare runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p \
+            "$TRADINGAGENTS_RESULTS_DIR" \
+            "$TRADINGAGENTS_CACHE_DIR" \
+            "$(dirname "$TRADINGAGENTS_MEMORY_LOG_PATH")" \
+            .runtime/run
+
+      # ==========================================================
+      # 4. Restore latest persistent TradingAgents state
+      #
+      # The GitHub runner is temporary.
+      # The Artifact is the persistent bridge between runs.
+      # ==========================================================
+      - name: Restore persistent state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          echo "Searching for latest persistent state artifact..."
+
+          ARTIFACT_ID="$(
+            gh api \
+              "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=tradingagents-state&per_page=100" \
+              --jq '
+                [
+                  .artifacts[]
+                  | select(.expired == false)
+                ]
+                | sort_by(.created_at)
+                | last
+                | .id // empty
+              '
+          )"
+
+          if [[ -z "$ARTIFACT_ID" ]]; then
+            echo "No previous state artifact found."
+            echo "Starting with a clean runtime."
+            exit 0
+          fi
+
+          echo "Restoring artifact ID: $ARTIFACT_ID"
+
+          gh api \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > .runtime/state.zip
+
+          rm -rf .runtime/state-restore
+          mkdir -p .runtime/state-restore
+
+          unzip -q \
+            .runtime/state.zip \
+            -d .runtime/state-restore
+
+          if [[ -d ".runtime/state-restore/tradingagents_data" ]]; then
+            cp -a \
+              .runtime/state-restore/tradingagents_data/. \
+              .runtime/tradingagents_data/
+          else
+            echo "::warning::State artifact does not contain tradingagents_data/."
+          fi
+
+          echo "Persistent state restored."
+
+      # ==========================================================
+      # 5. Install the actual repository package
+      # ==========================================================
+      - name: Install TradingAgents
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python --version
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      # ==========================================================
+      # 6. Configure selected model
+      #
+      # TradingAgents natively supports:
+      # OpenAI
+      # Google
+      # Anthropic
+      # xAI
+      # DeepSeek
+      # Qwen / DashScope
+      # GLM / Zhipu
+      # MiniMax
+      # OpenRouter
+      # Mistral
+      # Moonshot / Kimi
+      # Groq
+      # NVIDIA
+      # Bedrock
+      # Ollama
+      # OpenAI-compatible endpoints
+      #
+      # See the repository's .env.example for the provider keys.
+      # ==========================================================
+      - name: Configure model
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$MODEL_PROVIDER" ]]; then
+            echo "::error::Model '$MODEL_ID' is not configured."
+            echo "::error::Missing MODEL_PROVIDER_${MODEL_ID}."
+            exit 1
+          fi
+
+          if [[ -z "$MODEL_NAME" ]]; then
+            echo "::error::Model '$MODEL_ID' has no model name."
+            echo "::error::Missing MODEL_NAME_${MODEL_ID}."
+            exit 1
+          fi
+
+          PROVIDER="$(
+            printf '%s' "$MODEL_PROVIDER" |
+            tr '[:upper:]' '[:lower:]' |
+            tr '-' '_'
+          )"
+
+          echo "Model ID: $MODEL_ID"
+          echo "Provider: $PROVIDER"
+          echo "Model: $MODEL_NAME"
+
+          # --------------------------------------------------------
+          # Core TradingAgents model configuration
+          # --------------------------------------------------------
+          {
+            echo "TRADINGAGENTS_LLM_PROVIDER=$PROVIDER"
+            echo "TRADINGAGENTS_DEEP_THINK_LLM=$MODEL_NAME"
+            echo "TRADINGAGENTS_QUICK_THINK_LLM=$MODEL_NAME"
+          } >> "$GITHUB_ENV"
+
+          if [[ -n "$MODEL_BASE_URL" ]]; then
+            echo "TRADINGAGENTS_LLM_BACKEND_URL=$MODEL_BASE_URL" >> "$GITHUB_ENV"
+          fi
+
+          # --------------------------------------------------------
+          # Provider-specific authentication
+          # --------------------------------------------------------
+          case "$PROVIDER" in
+
+            openai)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::OpenAI model has no API token."
+                exit 1
+              }
+              echo "OPENAI_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            openai_compatible|custom)
+              [[ -n "$MODEL_BASE_URL" ]] || {
+                echo "::error::OpenAI-compatible model requires Base URL."
+                exit 1
+              }
+
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::OpenAI-compatible model has no API token."
+                exit 1
+              }
+
+              echo "OPENAI_COMPATIBLE_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            google|gemini)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::Google model has no API token."
+                exit 1
+              }
+              echo "GOOGLE_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            anthropic)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::Anthropic model has no API token."
+                exit 1
+              }
+              echo "ANTHROPIC_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            xai)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::xAI model has no API token."
+                exit 1
+              }
+              echo "XAI_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            deepseek)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::DeepSeek model has no API token."
+                exit 1
+              }
+              echo "DEEPSEEK_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            dashscope)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::DashScope model has no API token."
+                exit 1
+              }
+              echo "DASHSCOPE_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            dashscope_cn)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::DashScope CN model has no API token."
+                exit 1
+              }
+              echo "DASHSCOPE_CN_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            zhipu)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::Zhipu model has no API token."
+                exit 1
+              }
+              echo "ZHIPU_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            zhipu_cn)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::Zhipu CN model has no API token."
+                exit 1
+              }
+              echo "ZHIPU_CN_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            minimax)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::MiniMax model has no API token."
+                exit 1
+              }
+              echo "MINIMAX_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            minimax_cn)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::MiniMax CN model has no API token."
+                exit 1
+              }
+              echo "MINIMAX_CN_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            openrouter)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::OpenRouter model has no API token."
+                exit 1
+              }
+              echo "OPENROUTER_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            mistral)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::Mistral model has no API token."
+                exit 1
+              }
+              echo "MISTRAL_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            moonshot)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::Moonshot/Kimi model has no API token."
+                exit 1
+              }
+              echo "MOONSHOT_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            groq)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::Groq model has no API token."
+                exit 1
+              }
+              echo "GROQ_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            nvidia)
+              [[ -n "$MODEL_TOKEN" ]] || {
+                echo "::error::NVIDIA model has no API token."
+                exit 1
+              }
+              echo "NVIDIA_API_KEY=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            bedrock)
+              [[ -n "$MODEL_REGION" ]] && \
+                echo "AWS_DEFAULT_REGION=$MODEL_REGION" >> "$GITHUB_ENV"
+
+              [[ -n "$MODEL_TOKEN" ]] && \
+                echo "AWS_BEARER_TOKEN_BEDROCK=$MODEL_TOKEN" >> "$GITHUB_ENV"
+              ;;
+
+            ollama)
+              # Remote Ollama uses the backend URL.
+              # Local Ollama is not available on a GitHub-hosted runner
+              # unless the workflow explicitly installs/runs it.
+              ;;
+
+            *)
+              echo "::error::Unsupported provider '$PROVIDER'."
+              echo "::error::Use a provider supported by this repository."
+              exit 1
+              ;;
+
+          esac
+
+      # ==========================================================
+      # 7. Validate request
+      # ==========================================================
+      - name: Validate request
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          from datetime import date, datetime
+          import os
+          import re
+
+          ticker = os.environ["TICKER"].strip()
+          trade_date = os.environ["ANALYSIS_DATE"].strip()
+          analysts = os.environ["ANALYSTS"].strip()
+
+          # ------------------------------------------------------
+          # Ticker
+          # ------------------------------------------------------
+          if not ticker:
+              raise SystemExit("Ticker is empty.")
+
+          if not re.fullmatch(r"[A-Za-z0-9._^=-]+", ticker):
+              raise SystemExit(
+                  f"Invalid ticker: {ticker!r}"
+              )
+
+          # ------------------------------------------------------
+          # Date
+          # ------------------------------------------------------
+          try:
+              parsed_date = datetime.strptime(
+                  trade_date,
+                  "%Y-%m-%d"
+              ).date()
+
+          except ValueError:
+              raise SystemExit(
+                  f"Invalid date {trade_date!r}; expected YYYY-MM-DD."
+              )
+
+          if parsed_date > date.today():
+              raise SystemExit(
+                  f"Analysis date cannot be in the future: {trade_date}"
+              )
+
+          # ------------------------------------------------------
+          # Analysts
+          # ------------------------------------------------------
+          allowed = {
+              "market",
+              "social",
+              "news",
+              "fundamentals",
+          }
+
+          selected = [
+              item.strip().lower()
+              for item in analysts.split(",")
+              if item.strip()
+          ]
+
+          if not selected:
+              raise SystemExit(
+                  "At least one analyst is required."
+              )
+
+          unknown = sorted(
+              set(selected) - allowed
+          )
+
+          if unknown:
+              raise SystemExit(
+                  "Unknown analyst(s): " +
+                  ", ".join(unknown)
+              )
+
+          print(f"Ticker: {ticker}")
+          print(f"Date: {trade_date}")
+          print(
+              "Analysts: " +
+              ", ".join(selected)
+          )
+          PY
+
+      # ==========================================================
+      # 8. Run TradingAgents
+      #
+      # Current repository CLI supports unattended execution:
+      #
+      # tradingagents
+      # --ticker
+      # --date
+      # --analysts
+      # --save
+      # --no-show
+      # ==========================================================
+      - name: Run TradingAgents
+        id: analysis
+        shell: bash
+        run: |
+          set -o pipefail
+
+          mkdir -p .runtime/run
+
+          echo "=================================================="
+          echo "TradingAgents starting"
+          echo "Ticker : $TICKER"
+          echo "Date   : $ANALYSIS_DATE"
+          echo "Model  : $MODEL_ID"
+          echo "=================================================="
+
+          tradingagents \
+            --ticker "$TICKER" \
+            --date "$ANALYSIS_DATE" \
+            --analysts "$ANALYSTS" \
+            --save \
+            --no-show \
+            2>&1 | tee .runtime/run/agent.log
+
+      # ==========================================================
+      # 9. Capture immutable run metadata
+      #
+      # This describes the run.
+      # It does not rewrite or summarize the TradingAgents report.
+      # ==========================================================
+      - name: Create run metadata
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > .runtime/run/run.json <<EOF
+          {
+            "request_id": "${REQUEST_ID}",
+            "github_run_id": "${GITHUB_RUN_ID}",
+            "github_run_number": "${GITHUB_RUN_NUMBER}",
+            "repository": "${GITHUB_REPOSITORY}",
+            "workflow": "${GITHUB_WORKFLOW}",
+            "ticker": "${TICKER}",
+            "date": "${ANALYSIS_DATE}",
+            "model_id": "${MODEL_ID}",
+            "provider": "${MODEL_PROVIDER}",
+            "model": "${MODEL_NAME}",
+            "analysts": "${ANALYSTS}",
+            "status": "${{ job.status }}"
+          }
+          EOF
+
+      # ==========================================================
+      # 10. Upload persistent TradingAgents state
+      #
+      # Includes:
+      # - SQLite checkpoint databases
+      # - cache
+      # - memory log
+      # - saved TradingAgents results
+      #
+      # Latest artifact is restored by the next run.
+      # ==========================================================
+      - name: Save persistent state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tradingagents-state
+          path: .runtime/tradingagents_data
+          if-no-files-found: warn
+          retention-days: 90
+
+      # ==========================================================
+      # 11. Upload this specific run
+      #
+      # Keeps raw runtime log + metadata separately from persistent
+      # state.
+      # ==========================================================
+      - name: Save run artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tradingagents-run-${{ github.run_id }}
+          path: .runtime/run
+          if-no-files-found: warn
+          retention-days: 90
