@@ -13,54 +13,6 @@ concurrency:
   group: tradingagents-${{ github.event_name }}-${{ github.run_id }}
   cancel-in-progress: false
 
-env:
-  # Model configuration is written by bot.py into repository secrets.
-  TRADINGAGENTS_LLM_PROVIDER: ${{ secrets.TRADINGAGENTS_LLM_PROVIDER }}
-  TRADINGAGENTS_DEEP_THINK_LLM: ${{ secrets.TRADINGAGENTS_DEEP_THINK_LLM }}
-  TRADINGAGENTS_QUICK_THINK_LLM: ${{ secrets.TRADINGAGENTS_QUICK_THINK_LLM }}
-  TRADINGAGENTS_LLM_BACKEND_URL: ${{ secrets.TRADINGAGENTS_LLM_BACKEND_URL }}
-  TRADINGAGENTS_OUTPUT_LANGUAGE: ${{ secrets.TRADINGAGENTS_OUTPUT_LANGUAGE || 'English' }}
-  TRADINGAGENTS_CHECKPOINT_ENABLED: ${{ secrets.TRADINGAGENTS_CHECKPOINT_ENABLED || 'true' }}
-  TRADINGAGENTS_LLM_MAX_RETRIES: ${{ secrets.TRADINGAGENTS_LLM_MAX_RETRIES }}
-  TRADINGAGENTS_MAX_TOKENS: ${{ secrets.TRADINGAGENTS_MAX_TOKENS }}
-  TRADINGAGENTS_MAX_DEBATE_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_DEBATE_ROUNDS }}
-  TRADINGAGENTS_MAX_RISK_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_RISK_ROUNDS }}
-  TRADINGAGENTS_MAX_TOOL_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_TOOL_ROUNDS }}
-  TRADINGAGENTS_TEMPERATURE: ${{ secrets.TRADINGAGENTS_TEMPERATURE }}
-  TRADINGAGENTS_GOOGLE_THINKING_LEVEL: ${{ secrets.TRADINGAGENTS_GOOGLE_THINKING_LEVEL }}
-  TRADINGAGENTS_OPENAI_REASONING_EFFORT: ${{ secrets.TRADINGAGENTS_OPENAI_REASONING_EFFORT }}
-  TRADINGAGENTS_ANTHROPIC_EFFORT: ${{ secrets.TRADINGAGENTS_ANTHROPIC_EFFORT }}
-  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-  AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-  GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-  XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-  DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-  DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-  DASHSCOPE_CN_API_KEY: ${{ secrets.DASHSCOPE_CN_API_KEY }}
-  ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
-  ZHIPU_CN_API_KEY: ${{ secrets.ZHIPU_CN_API_KEY }}
-  MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-  MINIMAX_CN_API_KEY: ${{ secrets.MINIMAX_CN_API_KEY }}
-  OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-  MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-  MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-  GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-  NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-  OPENAI_COMPATIBLE_API_KEY: ${{ secrets.OPENAI_COMPATIBLE_API_KEY }}
-  AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-  AWS_PROFILE: ${{ secrets.AWS_PROFILE }}
-  OLLAMA_BASE_URL: ${{ secrets.OLLAMA_BASE_URL }}
-  TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
-  TYPESAFE_DEFAULT_MODEL: ${{ secrets.TYPESAFE_DEFAULT_MODEL }}
-  FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-  ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
-  SEC_EDGAR_USER_AGENT: ${{ secrets.SEC_EDGAR_USER_AGENT }}
-
 jobs:
   controller:
     if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -107,6 +59,52 @@ jobs:
     if: ${{ github.event_name == 'repository_dispatch' && github.event.action == 'tradingagents_run' }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      TRADINGAGENTS_LLM_PROVIDER: ${{ secrets.TRADINGAGENTS_LLM_PROVIDER }}
+      TRADINGAGENTS_DEEP_THINK_LLM: ${{ secrets.TRADINGAGENTS_DEEP_THINK_LLM }}
+      TRADINGAGENTS_QUICK_THINK_LLM: ${{ secrets.TRADINGAGENTS_QUICK_THINK_LLM }}
+      TRADINGAGENTS_LLM_BACKEND_URL: ${{ secrets.TRADINGAGENTS_LLM_BACKEND_URL }}
+      TRADINGAGENTS_OUTPUT_LANGUAGE: ${{ secrets.TRADINGAGENTS_OUTPUT_LANGUAGE || 'English' }}
+      TRADINGAGENTS_CHECKPOINT_ENABLED: ${{ secrets.TRADINGAGENTS_CHECKPOINT_ENABLED || 'true' }}
+      TRADINGAGENTS_LLM_MAX_RETRIES: ${{ secrets.TRADINGAGENTS_LLM_MAX_RETRIES }}
+      TRADINGAGENTS_MAX_TOKENS: ${{ secrets.TRADINGAGENTS_MAX_TOKENS }}
+      TRADINGAGENTS_MAX_DEBATE_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_DEBATE_ROUNDS }}
+      TRADINGAGENTS_MAX_RISK_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_RISK_ROUNDS }}
+      TRADINGAGENTS_MAX_TOOL_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_TOOL_ROUNDS }}
+      TRADINGAGENTS_TEMPERATURE: ${{ secrets.TRADINGAGENTS_TEMPERATURE }}
+      TRADINGAGENTS_GOOGLE_THINKING_LEVEL: ${{ secrets.TRADINGAGENTS_GOOGLE_THINKING_LEVEL }}
+      TRADINGAGENTS_OPENAI_REASONING_EFFORT: ${{ secrets.TRADINGAGENTS_OPENAI_REASONING_EFFORT }}
+      TRADINGAGENTS_ANTHROPIC_EFFORT: ${{ secrets.TRADINGAGENTS_ANTHROPIC_EFFORT }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+      DASHSCOPE_CN_API_KEY: ${{ secrets.DASHSCOPE_CN_API_KEY }}
+      ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+      ZHIPU_CN_API_KEY: ${{ secrets.ZHIPU_CN_API_KEY }}
+      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+      MINIMAX_CN_API_KEY: ${{ secrets.MINIMAX_CN_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      OPENAI_COMPATIBLE_API_KEY: ${{ secrets.OPENAI_COMPATIBLE_API_KEY }}
+      AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+      AWS_PROFILE: ${{ secrets.AWS_PROFILE }}
+      OLLAMA_BASE_URL: ${{ secrets.OLLAMA_BASE_URL }}
+      TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+      TYPESAFE_DEFAULT_MODEL: ${{ secrets.TYPESAFE_DEFAULT_MODEL }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+      ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
+      SEC_EDGAR_USER_AGENT: ${{ secrets.SEC_EDGAR_USER_AGENT }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -140,7 +138,6 @@ jobs:
           END_DATE: ${{ github.event.client_payload.end }}
           EVERY: ${{ github.event.client_payload.every || '7' }}
           ANALYSTS: ${{ github.event.client_payload.analysts }}
-          MODE: ${{ github.event.client_payload.mode }}
           PORTFOLIO_JSON: ${{ github.event.client_payload.portfolio_json }}
           REQUEST_ID: ${{ github.event.client_payload.request_id }}
           RUN_ID: ${{ github.event.client_payload.run_id }}
@@ -181,7 +178,6 @@ jobs:
           TICKER: ${{ github.event.client_payload.ticker }}
           ANALYSIS_DATE: ${{ github.event.client_payload.date }}
           ANALYSTS: ${{ github.event.client_payload.analysts }}
-          MODE: ${{ github.event.client_payload.mode }}
         run: |
           python - <<'PY'
           import json, os
