@@ -2,7 +2,18 @@ name: TradingAgents Engine + Telegram Controller
 
 on:
   workflow_dispatch:
-
+    inputs:
+      mode:
+        description: "controller = Telegram bot, engine = one engine request"
+        required: false
+        default: controller
+        type: choice
+        options: [controller, engine]
+      payload:
+        description: "Engine request JSON (used by the bot fallback)"
+        required: false
+        default: "{}"
+        type: string
   repository_dispatch:
     types: [tradingagents_run]
 
@@ -15,159 +26,86 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # =========================
-  # TradingAgents configuration
-  # =========================
   TRADINGAGENTS_LLM_PROVIDER: ${{ secrets.TRADINGAGENTS_LLM_PROVIDER }}
   TRADINGAGENTS_DEEP_THINK_LLM: ${{ secrets.TRADINGAGENTS_DEEP_THINK_LLM }}
   TRADINGAGENTS_QUICK_THINK_LLM: ${{ secrets.TRADINGAGENTS_QUICK_THINK_LLM }}
   TRADINGAGENTS_LLM_BACKEND_URL: ${{ secrets.TRADINGAGENTS_LLM_BACKEND_URL }}
-
   TRADINGAGENTS_OUTPUT_LANGUAGE: ${{ secrets.TRADINGAGENTS_OUTPUT_LANGUAGE || 'English' }}
   TRADINGAGENTS_CHECKPOINT_ENABLED: ${{ secrets.TRADINGAGENTS_CHECKPOINT_ENABLED || 'true' }}
-
   TRADINGAGENTS_MAX_DEBATE_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_DEBATE_ROUNDS }}
   TRADINGAGENTS_MAX_RISK_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_RISK_ROUNDS }}
   TRADINGAGENTS_MAX_TOOL_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_TOOL_ROUNDS }}
-
   TRADINGAGENTS_LLM_MAX_RETRIES: ${{ secrets.TRADINGAGENTS_LLM_MAX_RETRIES }}
   TRADINGAGENTS_MAX_TOKENS: ${{ secrets.TRADINGAGENTS_MAX_TOKENS }}
   TRADINGAGENTS_TEMPERATURE: ${{ secrets.TRADINGAGENTS_TEMPERATURE }}
-
   TRADINGAGENTS_GOOGLE_THINKING_LEVEL: ${{ secrets.TRADINGAGENTS_GOOGLE_THINKING_LEVEL }}
   TRADINGAGENTS_OPENAI_REASONING_EFFORT: ${{ secrets.TRADINGAGENTS_OPENAI_REASONING_EFFORT }}
   TRADINGAGENTS_ANTHROPIC_EFFORT: ${{ secrets.TRADINGAGENTS_ANTHROPIC_EFFORT }}
 
-  # =========================
-  # LLM provider secrets
-  # =========================
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
   AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
   GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
   XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
   DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-
   DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
   DASHSCOPE_CN_API_KEY: ${{ secrets.DASHSCOPE_CN_API_KEY }}
-
   ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
   ZHIPU_CN_API_KEY: ${{ secrets.ZHIPU_CN_API_KEY }}
-
   MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
   MINIMAX_CN_API_KEY: ${{ secrets.MINIMAX_CN_API_KEY }}
-
   OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
   MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
   MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
   GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
   NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
   OPENAI_COMPATIBLE_API_KEY: ${{ secrets.OPENAI_COMPATIBLE_API_KEY }}
-
-  # =========================
-  # Bedrock / Ollama
-  # =========================
   AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_PROFILE: ${{ secrets.AWS_PROFILE }}
-
   OLLAMA_BASE_URL: ${{ secrets.OLLAMA_BASE_URL }}
-
-  # =========================
-  # Data / optional services
-  # =========================
   TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
   TYPESAFE_DEFAULT_MODEL: ${{ secrets.TYPESAFE_DEFAULT_MODEL }}
-
   FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
   ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
   SEC_EDGAR_USER_AGENT: ${{ secrets.SEC_EDGAR_USER_AGENT }}
 
-
 jobs:
-
-  # ============================================================
-  # Telegram Controller
-  # Manual "Run workflow" starts the Telegram controller.
-  # No model configuration is exposed in workflow UI.
-  # ============================================================
   controller:
-
-    if: ${{ github.event_name == 'workflow_dispatch' }}
-
+    if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.mode == 'controller' || inputs.mode == '')) }}
     runs-on: ubuntu-latest
-
     timeout-minutes: 350
-
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v6
-
       - name: Restore controller state
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           mkdir -p .runtime/controller
-
-          artifact_id="$(
-            gh api \
-              "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
-              --jq '
-                [
-                  .artifacts[]
-                  | select(
-                      .name=="tradingagents-controller-state"
-                      and .expired==false
-                    )
-                ]
-                | sort_by(.created_at)
-                | reverse
-                | .[0].id // empty
-              '
-          )"
-
+          artifact_id="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.name=="tradingagents-controller-state" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
           if [[ -n "${artifact_id:-}" ]]; then
-            gh api \
-              "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
-              > .runtime/controller/state.zip
-
-            unzip -o \
-              .runtime/controller/state.zip \
-              -d .runtime/controller \
-              >/dev/null
-
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > .runtime/controller/state.zip
+            unzip -o .runtime/controller/state.zip -d .runtime/controller >/dev/null
             rm -f .runtime/controller/state.zip
           fi
-
       - name: Install controller dependency
-        run: |
-          python -m pip install \
-            --disable-pip-version-check \
-            pynacl
-
+        run: python -m pip install --disable-pip-version-check pynacl
       - name: Start Telegram controller
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           BOT_GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
-
           TELEGRAM_ADMIN_IDS: ${{ secrets.TELEGRAM_ADMIN_IDS }}
           TELEGRAM_ALLOWED_USER_IDS: ${{ secrets.TELEGRAM_ALLOWED_USER_IDS }}
-
           BOT_STATE_PATH: ${{ github.workspace }}/.runtime/controller/bot_state.db
-
           GITHUB_OWNER: ${{ github.repository_owner }}
           GITHUB_REPO: ${{ github.event.repository.name }}
           GITHUB_REF: ${{ github.event.repository.default_branch }}
-
-        run: |
-          python bot.py
-
+        run: python bot.py
       - name: Save controller state
         if: always()
         uses: actions/upload-artifact@v4
@@ -177,226 +115,92 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
-
-  # ============================================================
-  # TradingAgents Engine
-  # repository_dispatch from bot.py starts this job.
-  # ============================================================
   engine:
-
-    if: >-
-      ${{
-        github.event_name == 'repository_dispatch' &&
-        github.event.action == 'tradingagents_run'
-      }}
-
+    if: ${{ github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'engine') }}
     runs-on: ubuntu-latest
-
     timeout-minutes: 360
-
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v6
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
-
       - name: Install TradingAgents
-        run: |
-          python -m pip install -e .
-
+        run: python -m pip install -e .
       - name: Prepare runtime
         run: |
           set -euo pipefail
-
-          mkdir -p \
-            .runtime/run \
-            .runtime/results \
-            .runtime/cache \
-            .runtime/home \
-            .runtime/cache/memory
-
+          mkdir -p .runtime/run .runtime/results .runtime/cache .runtime/home .runtime/cache/memory
       - name: Restore TradingAgents state
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
-          artifact_id="$(
-            gh api \
-              "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
-              --jq '
-                [
-                  .artifacts[]
-                  | select(
-                      .name=="tradingagents-state"
-                      and .expired==false
-                    )
-                ]
-                | sort_by(.created_at)
-                | reverse
-                | .[0].id // empty
-              '
-          )"
-
+          artifact_id="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.name=="tradingagents-state" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
           if [[ -n "${artifact_id:-}" ]]; then
-            gh api \
-              "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
-              > .runtime/state.zip
-
-            unzip -o \
-              .runtime/state.zip \
-              -d .runtime/cache \
-              >/dev/null
-
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > .runtime/state.zip
+            unzip -o .runtime/state.zip -d .runtime/cache >/dev/null
             rm -f .runtime/state.zip
           fi
-
+      - name: Normalize engine request
+        env:
+          REQUEST_JSON: ${{ github.event_name == 'repository_dispatch' && toJSON(github.event.client_payload) || inputs.payload }}
+        run: |
+          python - <<'PY'
+          import json, os
+          p = json.loads(os.environ.get("REQUEST_JSON") or "{}")
+          out = {
+              "MODE": p.get("mode", "analysis"),
+              "TICKER": p.get("ticker", ""),
+              "TICKERS": p.get("tickers", ""),
+              "ANALYSIS_DATE": p.get("date", ""),
+              "START_DATE": p.get("start", ""),
+              "END_DATE": p.get("end", ""),
+              "EVERY": str(p.get("every", "7")),
+              "ANALYSTS": p.get("analysts", ""),
+              "PORTFOLIO_JSON": p.get("portfolio_json", ""),
+              "REQUEST_ID": p.get("request_id", ""),
+          }
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              for k, v in out.items():
+                  f.write(f"{k}<<__TA_EOF__\n{v}\n__TA_EOF__\n")
+          PY
       - name: Run TradingAgents
         env:
-          MODE: ${{ github.event.client_payload.mode || 'analysis' }}
-
-          TICKER: ${{ github.event.client_payload.ticker }}
-          TICKERS: ${{ github.event.client_payload.tickers }}
-
-          ANALYSIS_DATE: ${{ github.event.client_payload.date }}
-
-          START_DATE: ${{ github.event.client_payload.start }}
-          END_DATE: ${{ github.event.client_payload.end }}
-
-          EVERY: ${{ github.event.client_payload.every || '7' }}
-
-          ANALYSTS: ${{ github.event.client_payload.analysts }}
-
-          PORTFOLIO_JSON: ${{ github.event.client_payload.portfolio_json }}
-
-          REQUEST_ID: ${{ github.event.client_payload.request_id }}
-          RUN_ID: ${{ github.event.client_payload.run_id }}
-
           TRADINGAGENTS_RESULTS_DIR: ${{ github.workspace }}/.runtime/results
           TRADINGAGENTS_CACHE_DIR: ${{ github.workspace }}/.runtime/cache
           TRADINGAGENTS_MEMORY_LOG_PATH: ${{ github.workspace }}/.runtime/cache/memory/trading_memory.md
-
         run: |
           set -euo pipefail
-
-          if [[ -z "${TRADINGAGENTS_LLM_PROVIDER:-}" ]]; then
-            echo "No active model configured."
-            echo "Add and activate a model from Telegram first."
+          if [[ -z "${TRADINGAGENTS_LLM_PROVIDER:-}" || -z "${TRADINGAGENTS_DEEP_THINK_LLM:-}" ]]; then
+            echo "No active model configured. Configure and activate a model from Telegram."
             exit 3
           fi
-
-          if [[ -z "${TRADINGAGENTS_DEEP_THINK_LLM:-}" ]]; then
-            echo "No active deep-thinking model configured."
-            echo "Add and activate a model from Telegram first."
-            exit 3
-          fi
-
-          # ----------------------------------------
-          # Optional portfolio
-          # ----------------------------------------
           if [[ -n "${PORTFOLIO_JSON:-}" ]]; then
-            printf '%s' "$PORTFOLIO_JSON" \
-              > .runtime/portfolio.json
-
-            PORT_ARG=(
-              --portfolio
-              "$PWD/.runtime/portfolio.json"
-            )
+            printf '%s' "$PORTFOLIO_JSON" > .runtime/portfolio.json
+            PORT_ARG=(--portfolio "$PWD/.runtime/portfolio.json")
           else
             PORT_ARG=()
           fi
-
-          # ----------------------------------------
-          # Analysis
-          # ----------------------------------------
           if [[ "$MODE" == "analysis" ]]; then
-
-            if [[ -z "${TICKER:-}" ]]; then
-              echo "Missing ticker."
-              exit 2
-            fi
-
-            if [[ -z "${ANALYSIS_DATE:-}" ]]; then
-              echo "Missing analysis date."
-              exit 2
-            fi
-
-            CMD=(
-              tradingagents
-              --ticker "$TICKER"
-              --date "$ANALYSIS_DATE"
-              --save
-              --no-show
-            )
-
-            if [[ -n "${ANALYSTS:-}" ]]; then
-              CMD+=(
-                --analysts
-                "$ANALYSTS"
-              )
-            fi
-
+            [[ -n "${TICKER:-}" ]] || { echo "Missing ticker."; exit 2; }
+            [[ -n "${ANALYSIS_DATE:-}" ]] || { echo "Missing analysis date."; exit 2; }
+            CMD=(tradingagents --ticker "$TICKER" --date "$ANALYSIS_DATE" --save --no-show --checkpoint)
+            [[ -n "${ANALYSTS:-}" ]] && CMD+=(--analysts "$ANALYSTS")
             CMD+=("${PORT_ARG[@]}")
-
-          # ----------------------------------------
-          # Backtest
-          # ----------------------------------------
           elif [[ "$MODE" == "backtest" ]]; then
-
-            if [[ -z "${TICKERS:-}" ]]; then
-              echo "Backtest requires tickers."
-              exit 2
-            fi
-
-            if [[ -z "${START_DATE:-}" ]]; then
-              echo "Backtest requires start date."
-              exit 2
-            fi
-
-            if [[ -z "${END_DATE:-}" ]]; then
-              echo "Backtest requires end date."
-              exit 2
-            fi
-
-            CMD=(
-              tradingagents
-              backtest
-              "$TICKERS"
-              --start "$START_DATE"
-              --end "$END_DATE"
-              --every "$EVERY"
-            )
-
-            if [[ -n "${ANALYSTS:-}" ]]; then
-              CMD+=(
-                --analysts
-                "$ANALYSTS"
-              )
-            fi
-
+            [[ -n "${TICKERS:-}" ]] || { echo "Backtest requires tickers."; exit 2; }
+            [[ -n "${START_DATE:-}" && -n "${END_DATE:-}" ]] || { echo "Backtest requires start and end dates."; exit 2; }
+            CMD=(tradingagents backtest "$TICKERS" --start "$START_DATE" --end "$END_DATE" --every "$EVERY")
+            [[ -n "${ANALYSTS:-}" ]] && CMD+=(--analysts "$ANALYSTS")
             CMD+=("${PORT_ARG[@]}")
-
-            if [[ -n "${RUN_ID:-}" ]]; then
-              CMD+=(
-                --run-id
-                "$RUN_ID"
-              )
-            fi
-
           else
             echo "Unsupported mode: $MODE"
             exit 2
           fi
-
-          # ----------------------------------------
-          # Save request metadata
-          # ----------------------------------------
-          cat > .runtime/run/request.txt <<EOF
+          cat > .runtime/run/request.txt <<EOF2
           request_id=$REQUEST_ID
           mode=$MODE
           ticker=${TICKER:-}
@@ -405,33 +209,17 @@ jobs:
           start=${START_DATE:-}
           end=${END_DATE:-}
           analysts=${ANALYSTS:-<agent-default>}
-          EOF
-
+          EOF2
           echo "Starting TradingAgents..."
           echo "Request ID: $REQUEST_ID"
           echo "Mode: $MODE"
-
-          "${CMD[@]}" \
-            2>&1 | tee .runtime/run/agent.log
-
+          "${CMD[@]}" 2>&1 | tee .runtime/run/agent.log
       - name: Write run metadata
         if: always()
-        env:
-          REQUEST_ID: ${{ github.event.client_payload.request_id }}
-          TICKER: ${{ github.event.client_payload.ticker }}
-          TICKERS: ${{ github.event.client_payload.tickers }}
-          ANALYSIS_DATE: ${{ github.event.client_payload.date }}
-          START_DATE: ${{ github.event.client_payload.start }}
-          END_DATE: ${{ github.event.client_payload.end }}
-          ANALYSTS: ${{ github.event.client_payload.analysts }}
-          MODE: ${{ github.event.client_payload.mode }}
-
         run: |
           python - <<'PY'
-          import json
-          import os
+          import json, os
           from pathlib import Path
-
           data = {
               "github_run_id": os.environ.get("GITHUB_RUN_ID", ""),
               "request_id": os.environ.get("REQUEST_ID", ""),
@@ -443,17 +231,8 @@ jobs:
               "analysts": os.environ.get("ANALYSTS", ""),
               "mode": os.environ.get("MODE", "analysis"),
           }
-
-          Path(".runtime/run/run.json").write_text(
-              json.dumps(
-                  data,
-                  ensure_ascii=False,
-                  indent=2,
-              ),
-              encoding="utf-8",
-          )
+          Path(".runtime/run/run.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
           PY
-
       - name: Save TradingAgents state
         if: always()
         uses: actions/upload-artifact@v4
@@ -462,7 +241,6 @@ jobs:
           path: .runtime/cache/
           retention-days: 90
           if-no-files-found: warn
-
       - name: Upload run artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -471,7 +249,6 @@ jobs:
           path: .runtime/run/
           retention-days: 90
           if-no-files-found: warn
-
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
