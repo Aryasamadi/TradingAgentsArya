@@ -8,7 +8,7 @@ No third-party runtime dependency is required for normal operation.
 
 Required environment variables:
   TELEGRAM_BOT_TOKEN
-  GITHUB_TOKEN
+  BOT_GITHUB_TOKEN
 
 Optional:
   GITHUB_OWNER=Aryasamadi
@@ -48,7 +48,7 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-GH_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
 GH_OWNER = os.getenv("GITHUB_OWNER", "Aryasamadi").strip()
 GH_REPO = os.getenv("GITHUB_REPO", "TradingAgentsArya").strip()
 GH_REF = os.getenv("GITHUB_REF", "main").strip()
