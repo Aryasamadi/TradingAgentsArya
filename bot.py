@@ -310,12 +310,37 @@ def handle_command(m: dict):
     if text.startswith("{") and admin(uid):
         try:
             x = json.loads(text)
+            try:
+                tg("deleteMessage", {"chat_id": cid, "message_id": int(m.get("message_id", 0))})
+            except Exception:
+                pass
             required = ["id","name","provider","model"]
             if any(not str(x.get(k,"" )).strip() for k in required): raise ValueError("id/name/provider/model الزامی است.")
             ts = now(); db("INSERT INTO models(id,name,provider,model,base_url,region,api_key,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,1,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,provider=excluded.provider,model=excluded.model,base_url=excluded.base_url,region=excluded.region,api_key=excluded.api_key,enabled=1,updated_at=excluded.updated_at", (x["id"],x["name"],x["provider"],x["model"],x.get("base_url",""),x.get("region",""),x.get("api_key",""),ts,ts))
-            send(cid, "✅ مدل ثبت شد.", kb([[("▶️ فعال‌سازی", f"activate:{x['id']}"),("🤖 مدل‌ها", "models")]]))
+            activate_model(x["id"])
+            send(cid, "✅ مدل ثبت و فعال شد. تنظیمات امن آن در GitHub Secrets قرار گرفت.", kb([[ ("▶️ اجرای تحلیل", "run"),("🧪 تست مدل", "tests")],[ ("🤖 مدل‌ها", "models")]]))
         except Exception as e: send(cid, f"❌ JSON مدل نامعتبر است:\n<code>{esc(e)}</code>")
 
+
+def test_menu(cid: int):
+    rows = model_rows()
+    if not rows:
+        send(cid, "⚠️ هنوز مدلی ثبت نشده است.", kb([[('🤖 مدل‌ها', 'models')]]))
+        return
+    rows_kb = [[(f"🧪 تست {r['name']}", f"test:{r['id']}" )] for r in rows]
+    rows_kb.append([("◀️ خانه", "home")])
+    send(cid, "مدل موردنظر برای تست را انتخاب کن:", kb(rows_kb))
+
+def launch_test(cid: int, mid: str):
+    try:
+        set_active(mid)
+        rid, active = dispatch_run(
+            "analysis", ticker="AAPL", date=dt.date.today().isoformat(),
+            analysts="market"
+        )
+        send(cid, f"🧪 تست ارسال شد.\nمدل: <code>{esc(active)}</code>\nRequest: <code>{rid}</code>", kb([[('📊 وضعیت','status'),('◀️ خانه','home')]]))
+    except Exception as e:
+        send(cid, f"❌ تست ناموفق بود:\n<code>{esc(e)}</code>", kb([[('🤖 مدل‌ها','models')]]))
 
 def callback(q: dict):
     uid = int(q.get("from",{}).get("id",0)); cid = int(q.get("message",{}).get("chat",{}).get("id",uid)); data = q.get("data","")
@@ -332,7 +357,12 @@ def callback(q: dict):
     elif data == "status": status(cid)
     elif data == "history": history(cid)
     elif data == "artifacts": artifacts(cid)
-    elif data == "tests": run_menu(cid)
+    elif data == "tests": test_menu(cid)
+    elif data.startswith("test:"):
+        if not admin(uid):
+            send(cid, "⛔ فقط Admin می‌تواند تست مدل اجرا کند.")
+            return
+        launch_test(cid, data.split(":",1)[1])
     elif data == "delmenu":
         rows = model_rows(); send(cid,"مدل را برای حذف انتخاب کن.", kb([[ (f"🗑 {r['name']}", f"delete:{r['id']}") ] for r in rows] + [[("◀️ مدل‌ها","models")]]))
     elif data.startswith("delete:"):
