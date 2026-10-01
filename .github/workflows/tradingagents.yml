@@ -32,15 +32,16 @@ env:
   TRADINGAGENTS_LLM_BACKEND_URL: ${{ secrets.TRADINGAGENTS_LLM_BACKEND_URL }}
   TRADINGAGENTS_OUTPUT_LANGUAGE: ${{ secrets.TRADINGAGENTS_OUTPUT_LANGUAGE || 'English' }}
   TRADINGAGENTS_CHECKPOINT_ENABLED: ${{ secrets.TRADINGAGENTS_CHECKPOINT_ENABLED || 'true' }}
-  TRADINGAGENTS_MAX_DEBATE_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_DEBATE_ROUNDS }}
-  TRADINGAGENTS_MAX_RISK_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_RISK_ROUNDS }}
-  TRADINGAGENTS_MAX_TOOL_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_TOOL_ROUNDS }}
-  TRADINGAGENTS_LLM_MAX_RETRIES: ${{ secrets.TRADINGAGENTS_LLM_MAX_RETRIES }}
-  TRADINGAGENTS_MAX_TOKENS: ${{ secrets.TRADINGAGENTS_MAX_TOKENS }}
-  TRADINGAGENTS_TEMPERATURE: ${{ secrets.TRADINGAGENTS_TEMPERATURE }}
-  TRADINGAGENTS_GOOGLE_THINKING_LEVEL: ${{ secrets.TRADINGAGENTS_GOOGLE_THINKING_LEVEL }}
-  TRADINGAGENTS_OPENAI_REASONING_EFFORT: ${{ secrets.TRADINGAGENTS_OPENAI_REASONING_EFFORT }}
-  TRADINGAGENTS_ANTHROPIC_EFFORT: ${{ secrets.TRADINGAGENTS_ANTHROPIC_EFFORT }}
+  TRADINGAGENTS_DEFAULT_ANALYSTS: ${{ secrets.TRADINGAGENTS_DEFAULT_ANALYSTS || 'market,sentiment,news,fundamentals' }}
+  TRADINGAGENTS_MAX_DEBATE_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_DEBATE_ROUNDS || '1' }}
+  TRADINGAGENTS_MAX_RISK_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_RISK_ROUNDS || '1' }}
+  TRADINGAGENTS_MAX_TOOL_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_TOOL_ROUNDS || '20' }}
+  TRADINGAGENTS_LLM_MAX_RETRIES: ${{ secrets.TRADINGAGENTS_LLM_MAX_RETRIES || '6' }}
+  TRADINGAGENTS_MAX_TOKENS: ${{ secrets.TRADINGAGENTS_MAX_TOKENS || '8192' }}
+  TRADINGAGENTS_TEMPERATURE: ${{ secrets.TRADINGAGENTS_TEMPERATURE || '0.0' }}
+  TRADINGAGENTS_GOOGLE_THINKING_LEVEL: ${{ secrets.TRADINGAGENTS_GOOGLE_THINKING_LEVEL || 'medium' }}
+  TRADINGAGENTS_OPENAI_REASONING_EFFORT: ${{ secrets.TRADINGAGENTS_OPENAI_REASONING_EFFORT || 'medium' }}
+  TRADINGAGENTS_ANTHROPIC_EFFORT: ${{ secrets.TRADINGAGENTS_ANTHROPIC_EFFORT || 'high' }}
 
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
   AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
@@ -169,6 +170,7 @@ jobs:
           PY
       - name: Run TradingAgents
         env:
+          TRADINGAGENTS_DEFAULT_ANALYSTS: ${{ secrets.TRADINGAGENTS_DEFAULT_ANALYSTS || 'market,sentiment,news,fundamentals' }}
           TRADINGAGENTS_RESULTS_DIR: ${{ github.workspace }}/.runtime/results
           TRADINGAGENTS_CACHE_DIR: ${{ github.workspace }}/.runtime/cache
           TRADINGAGENTS_MEMORY_LOG_PATH: ${{ github.workspace }}/.runtime/cache/memory/trading_memory.md
@@ -187,14 +189,12 @@ jobs:
           if [[ "$MODE" == "analysis" ]]; then
             [[ -n "${TICKER:-}" ]] || { echo "Missing ticker."; exit 2; }
             [[ -n "${ANALYSIS_DATE:-}" ]] || { echo "Missing analysis date."; exit 2; }
-            CMD=(tradingagents --ticker "$TICKER" --date "$ANALYSIS_DATE" --save --no-show --checkpoint)
-            [[ -n "${ANALYSTS:-}" ]] && CMD+=(--analysts "$ANALYSTS")
+            CMD=(tradingagents --ticker "$TICKER" --date "$ANALYSIS_DATE" --analysts "${ANALYSTS:-${TRADINGAGENTS_DEFAULT_ANALYSTS}}" --save --no-show --checkpoint)
             CMD+=("${PORT_ARG[@]}")
           elif [[ "$MODE" == "backtest" ]]; then
             [[ -n "${TICKERS:-}" ]] || { echo "Backtest requires tickers."; exit 2; }
             [[ -n "${START_DATE:-}" && -n "${END_DATE:-}" ]] || { echo "Backtest requires start and end dates."; exit 2; }
-            CMD=(tradingagents backtest "$TICKERS" --start "$START_DATE" --end "$END_DATE" --every "$EVERY")
-            [[ -n "${ANALYSTS:-}" ]] && CMD+=(--analysts "$ANALYSTS")
+            CMD=(tradingagents backtest "$TICKERS" --start "$START_DATE" --end "$END_DATE" --every "$EVERY" --analysts "${ANALYSTS:-${TRADINGAGENTS_DEFAULT_ANALYSTS}}")
             CMD+=("${PORT_ARG[@]}")
           else
             echo "Unsupported mode: $MODE"
