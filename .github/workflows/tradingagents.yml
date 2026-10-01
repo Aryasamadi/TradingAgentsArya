@@ -3,528 +3,145 @@ name: TradingAgents Engine
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: "Execution mode"
-        required: true
-        default: "analyze"
-        type: choice
-        options:
-          - analyze
-          - backtest
       ticker:
-        description: "Analyze one ticker, e.g. NVDA or 0700.HK"
-        required: false
-        default: ""
+        description: "Ticker"
+        required: true
         type: string
       date:
-        description: "Analysis date YYYY-MM-DD (required for analyze)"
-        required: false
-        default: ""
+        description: "Analysis date (YYYY-MM-DD)"
+        required: true
         type: string
       analysts:
-        description: "Comma-separated analysts: market,social,news,fundamentals"
+        description: "Analysts (comma-separated). Leave empty to use the agent default."
         required: false
-        default: "market,social,news,fundamentals"
+        default: ""
         type: string
-      asset_type:
-        description: "Asset type"
-        required: true
-        default: "stock"
+      request_id:
+        description: "Unique request ID"
+        required: false
+        default: ""
+        type: string
+      run_id:
+        description: "Optional previous run ID for resume/backtest workflows"
+        required: false
+        default: ""
+        type: string
+      portfolio:
+        description: "Optional portfolio JSON path"
+        required: false
+        default: ""
+        type: string
+      mode:
+        description: "Execution mode"
+        required: false
+        default: "analysis"
         type: choice
         options:
-          - stock
-          - crypto
-      portfolio_json:
-        description: "Optional portfolio JSON for trader/risk/portfolio sizing"
-        required: false
-        default: ""
-        type: string
-      start:
-        description: "Backtest start date YYYY-MM-DD"
-        required: false
-        default: ""
-        type: string
-      end:
-        description: "Backtest end date YYYY-MM-DD"
-        required: false
-        default: ""
-        type: string
-      every:
-        description: "Backtest step in days"
-        required: false
-        default: "7"
-        type: number
-      run_id:
-        description: "Existing backtest run id to continue"
-        required: false
-        default: ""
-        type: string
-      model_id:
-        description: "Model id from TRADINGAGENTS_MODEL_CONFIG_JSON; blank uses direct env configuration"
-        required: false
-        default: ""
-        type: string
-      output_language:
-        description: "Agent report language"
-        required: false
-        default: "English"
-        type: string
-      max_debate_rounds:
-        description: "Optional max research debate rounds"
-        required: false
-        default: ""
-        type: string
-      max_risk_rounds:
-        description: "Optional max risk discussion rounds"
-        required: false
-        default: ""
-        type: string
-      max_tool_rounds:
-        description: "Optional max analyst tool rounds"
-        required: false
-        default: ""
-        type: string
-      llm_max_retries:
-        description: "Optional LLM SDK retry budget"
-        required: false
-        default: ""
-        type: string
-      max_tokens:
-        description: "Optional output-token cap"
-        required: false
-        default: ""
-        type: string
-      temperature:
-        description: "Optional sampling temperature"
-        required: false
-        default: ""
-        type: string
-      openai_reasoning_effort:
-        description: "Optional OpenAI reasoning effort"
-        required: false
-        default: ""
-        type: string
-      google_thinking_level:
-        description: "Optional Google thinking level"
-        required: false
-        default: ""
-        type: string
-      anthropic_effort:
-        description: "Optional Anthropic effort"
-        required: false
-        default: ""
-        type: string
-      checkpoint:
-        description: "Enable checkpoint resume"
-        required: true
-        default: true
-        type: boolean
-      clear_checkpoints:
-        description: "Clear all saved checkpoints before an analysis"
-        required: true
-        default: false
-        type: boolean
-      request_id:
-        description: "External request id used by the Telegram controller"
-        required: false
-        default: ""
-        type: string
+          - analysis
+          - backtest
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: tradingagents-state
+  group: tradingagents-engine-${{ github.event.inputs.request_id || github.run_id }}
   cancel-in-progress: false
 
 jobs:
   run:
-    name: TradingAgents ${{ inputs.mode }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    env:
-      DATA_ROOT: ${{ github.workspace }}/.runtime/tradingagents_data
-      RUN_ROOT: ${{ github.workspace }}/.runtime/run
-      MODEL_CONFIG_JSON: ${{ secrets.TRADINGAGENTS_MODEL_CONFIG_JSON }}
-      DIRECT_PROVIDER: ${{ vars.TRADINGAGENTS_LLM_PROVIDER }}
-      DIRECT_QUICK_MODEL: ${{ vars.TRADINGAGENTS_QUICK_THINK_LLM }}
-      DIRECT_DEEP_MODEL: ${{ vars.TRADINGAGENTS_DEEP_THINK_LLM }}
-      DIRECT_BACKEND_URL: ${{ vars.TRADINGAGENTS_LLM_BACKEND_URL }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-      DASHSCOPE_CN_API_KEY: ${{ secrets.DASHSCOPE_CN_API_KEY }}
-      ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
-      ZHIPU_CN_API_KEY: ${{ secrets.ZHIPU_CN_API_KEY }}
-      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-      MINIMAX_CN_API_KEY: ${{ secrets.MINIMAX_CN_API_KEY }}
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-      OPENAI_COMPATIBLE_API_KEY: ${{ secrets.OPENAI_COMPATIBLE_API_KEY }}
-      AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
-      AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-      OLLAMA_BASE_URL: ${{ secrets.OLLAMA_BASE_URL }}
-      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-      ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
-      TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
-      TYPESAFE_DEFAULT_MODEL: ${{ vars.TYPESAFE_DEFAULT_MODEL }}
-      SEC_EDGAR_USER_AGENT: ${{ secrets.SEC_EDGAR_USER_AGENT }}
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 1
+        uses: actions/checkout@v6
 
-      - name: Set up Python 3.13
+      - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
 
-      - name: Prepare runtime directories
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf "$RUN_ROOT"
-          mkdir -p "$DATA_ROOT" "$RUN_ROOT"
-
-      - name: Restore latest persistent state
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=tradingagents-state&per_page=100"
-          URL="$(gh api "$API" --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .archive_download_url // ""')"
-          if [[ -n "$URL" ]]; then
-            echo "Restoring persistent TradingAgents state"
-            curl --fail --silent --show-error --location \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
-              "$URL" -o "$RUN_ROOT/state.zip"
-            unzip -q "$RUN_ROOT/state.zip" -d "$RUN_ROOT/state_restore"
-            cp -a "$RUN_ROOT/state_restore/." "$DATA_ROOT/"
-          else
-            echo "No previous persistent state artifact found; starting with an empty state."
-          fi
-
       - name: Install TradingAgents
-        shell: bash
+        run: python -m pip install -e .
+
+      - name: Prepare runtime directories
         run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[bedrock]"
+          mkdir -p .runtime/run
+          mkdir -p .runtime/results
+          mkdir -p .runtime/cache
 
-      - name: Resolve model and runtime configuration
-        shell: bash
+      - name: Run TradingAgents
         env:
-          INPUT_MODEL_ID: ${{ inputs.model_id }}
-          INPUT_OUTPUT_LANGUAGE: ${{ inputs.output_language }}
-          INPUT_MAX_DEBATE: ${{ inputs.max_debate_rounds }}
-          INPUT_MAX_RISK: ${{ inputs.max_risk_rounds }}
-          INPUT_MAX_TOOL: ${{ inputs.max_tool_rounds }}
-          INPUT_RETRIES: ${{ inputs.llm_max_retries }}
-          INPUT_MAX_TOKENS: ${{ inputs.max_tokens }}
-          INPUT_TEMPERATURE: ${{ inputs.temperature }}
-          INPUT_OPENAI_REASONING: ${{ inputs.openai_reasoning_effort }}
-          INPUT_GOOGLE_THINKING: ${{ inputs.google_thinking_level }}
-          INPUT_ANTHROPIC_EFFORT: ${{ inputs.anthropic_effort }}
-          INPUT_CHECKPOINT: ${{ inputs.checkpoint }}
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          def put(name: str, value: str | None) -> None:
-              if value is not None and value != "":
-                  with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
-                      fh.write(f"{name}={value}\n")
-
-          model_id = os.environ.get("INPUT_MODEL_ID", "").strip()
-          provider = os.environ.get("DIRECT_PROVIDER", "").strip().lower() or "openai"
-          quick = os.environ.get("DIRECT_QUICK_MODEL", "").strip() or "gpt-6-luna"
-          deep = os.environ.get("DIRECT_DEEP_MODEL", "").strip() or "gpt-6-sol"
-          backend = os.environ.get("DIRECT_BACKEND_URL", "").strip()
-
-          raw = os.environ.get("MODEL_CONFIG_JSON", "").strip()
-          if model_id:
-              if not raw:
-                  raise SystemExit("model_id was supplied but TRADINGAGENTS_MODEL_CONFIG_JSON is not configured")
-              try:
-                  catalog = json.loads(raw)
-              except json.JSONDecodeError as exc:
-                  raise SystemExit(f"Invalid TRADINGAGENTS_MODEL_CONFIG_JSON: {exc}") from exc
-              models = catalog.get("models", catalog if isinstance(catalog, list) else None)
-              if not isinstance(models, list):
-                  raise SystemExit("TRADINGAGENTS_MODEL_CONFIG_JSON must contain a 'models' list")
-              selected = next((m for m in models if isinstance(m, dict) and str(m.get("id", "")) == model_id), None)
-              if selected is None:
-                  raise SystemExit(f"Unknown model_id: {model_id}")
-
-              provider = str(selected.get("provider", provider)).strip().lower()
-              quick = str(selected.get("quick_model") or selected.get("model") or quick).strip()
-              deep = str(selected.get("deep_model") or selected.get("model") or deep).strip()
-              backend = str(selected.get("base_url") or selected.get("backend_url") or backend).strip()
-
-              api_key = str(selected.get("api_key") or "")
-              if api_key:
-                  key_name = {
-                      "openai": "OPENAI_API_KEY",
-                      "google": "GOOGLE_API_KEY",
-                      "gemini": "GOOGLE_API_KEY",
-                      "anthropic": "ANTHROPIC_API_KEY",
-                      "xai": "XAI_API_KEY",
-                      "deepseek": "DEEPSEEK_API_KEY",
-                      "dashscope": "DASHSCOPE_API_KEY",
-                      "dashscope_cn": "DASHSCOPE_CN_API_KEY",
-                      "zhipu": "ZHIPU_API_KEY",
-                      "zhipu_cn": "ZHIPU_CN_API_KEY",
-                      "minimax": "MINIMAX_API_KEY",
-                      "minimax_cn": "MINIMAX_CN_API_KEY",
-                      "openrouter": "OPENROUTER_API_KEY",
-                      "mistral": "MISTRAL_API_KEY",
-                      "moonshot": "MOONSHOT_API_KEY",
-                      "groq": "GROQ_API_KEY",
-                      "nvidia": "NVIDIA_API_KEY",
-                      "openai_compatible": "OPENAI_COMPATIBLE_API_KEY",
-                      "custom": "OPENAI_COMPATIBLE_API_KEY",
-                      "bedrock": "AWS_BEARER_TOKEN_BEDROCK",
-                  }.get(provider)
-                  if key_name:
-                      put(key_name, api_key)
-
-              region = str(selected.get("region") or "").strip()
-              if region:
-                  put("AWS_DEFAULT_REGION", region)
-              for env_name, json_key in (
-                  ("AWS_ACCESS_KEY_ID", "aws_access_key_id"),
-                  ("AWS_SECRET_ACCESS_KEY", "aws_secret_access_key"),
-                  ("AWS_SESSION_TOKEN", "aws_session_token"),
-              ):
-                  value = str(selected.get(json_key) or "").strip()
-                  if value:
-                      put(env_name, value)
-
-              ollama_url = str(selected.get("ollama_base_url") or "").strip()
-              if ollama_url:
-                  put("OLLAMA_BASE_URL", ollama_url)
-
-          put("TRADINGAGENTS_LLM_PROVIDER", provider)
-          put("TRADINGAGENTS_QUICK_THINK_LLM", quick)
-          put("TRADINGAGENTS_DEEP_THINK_LLM", deep)
-          put("TRADINGAGENTS_OUTPUT_LANGUAGE", os.environ.get("INPUT_OUTPUT_LANGUAGE", "English").strip() or "English")
-          put("TRADINGAGENTS_RESULTS_DIR", str(Path(os.environ["DATA_ROOT"]) / "logs"))
-          put("TRADINGAGENTS_CACHE_DIR", str(Path(os.environ["DATA_ROOT"]) / "cache"))
-          put("TRADINGAGENTS_MEMORY_LOG_PATH", str(Path(os.environ["DATA_ROOT"]) / "memory" / "trading_memory.md"))
-          put("TRADINGAGENTS_CHECKPOINT_ENABLED", "true" if str(os.environ.get("INPUT_CHECKPOINT", "true")).lower() == "true" else "false")
-          if backend:
-              put("TRADINGAGENTS_LLM_BACKEND_URL", backend)
-
-          mapping = {
-              "TRADINGAGENTS_MAX_DEBATE_ROUNDS": "INPUT_MAX_DEBATE",
-              "TRADINGAGENTS_MAX_RISK_ROUNDS": "INPUT_MAX_RISK",
-              "TRADINGAGENTS_MAX_TOOL_ROUNDS": "INPUT_MAX_TOOL",
-              "TRADINGAGENTS_LLM_MAX_RETRIES": "INPUT_RETRIES",
-              "TRADINGAGENTS_MAX_TOKENS": "INPUT_MAX_TOKENS",
-              "TRADINGAGENTS_TEMPERATURE": "INPUT_TEMPERATURE",
-              "TRADINGAGENTS_OPENAI_REASONING_EFFORT": "INPUT_OPENAI_REASONING",
-              "TRADINGAGENTS_GOOGLE_THINKING_LEVEL": "INPUT_GOOGLE_THINKING",
-              "TRADINGAGENTS_ANTHROPIC_EFFORT": "INPUT_ANTHROPIC_EFFORT",
-          }
-          for env_name, source_name in mapping.items():
-              put(env_name, os.environ.get(source_name, "").strip())
-          PY
-
-      - name: Validate request
-        shell: bash
-        env:
+          TICKER: ${{ inputs.ticker }}
+          ANALYSIS_DATE: ${{ inputs.date }}
+          ANALYSTS: ${{ inputs.analysts }}
+          REQUEST_ID: ${{ inputs.request_id }}
           MODE: ${{ inputs.mode }}
-          TICKER: ${{ inputs.ticker }}
-          ANALYSIS_DATE: ${{ inputs.date }}
-          ANALYSTS: ${{ inputs.analysts }}
-          ASSET_TYPE: ${{ inputs.asset_type }}
-          START_DATE: ${{ inputs.start }}
-          END_DATE: ${{ inputs.end }}
-          EVERY: ${{ inputs.every }}
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os
-          import re
-
-          mode = os.environ["MODE"]
-          date_re = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
-          if mode == "analyze":
-              if not os.environ["TICKER"].strip():
-                  raise SystemExit("ticker is required for analyze mode")
-              if not date_re.fullmatch(os.environ["ANALYSIS_DATE"].strip()):
-                  raise SystemExit("date must be YYYY-MM-DD for analyze mode")
-              analysts = [x.strip().lower() for x in os.environ["ANALYSTS"].split(",") if x.strip()]
-              allowed = {"market", "social", "news", "fundamentals"}
-              unknown = [x for x in analysts if x not in allowed]
-              if not analysts:
-                  raise SystemExit("at least one analyst is required")
-              if unknown:
-                  raise SystemExit("unknown analyst(s): " + ", ".join(unknown))
-          else:
-              if not os.environ["TICKER"].strip():
-                  raise SystemExit("ticker is required for backtest mode (comma-separated)")
-              if not date_re.fullmatch(os.environ["START_DATE"].strip()):
-                  raise SystemExit("start must be YYYY-MM-DD for backtest mode")
-              if not date_re.fullmatch(os.environ["END_DATE"].strip()):
-                  raise SystemExit("end must be YYYY-MM-DD for backtest mode")
-              if int(float(os.environ["EVERY"])) <= 0:
-                  raise SystemExit("every must be > 0")
-          PY
-
-      - name: Write optional portfolio file
-        if: ${{ inputs.portfolio_json != '' }}
-        shell: bash
-        env:
-          PORTFOLIO_JSON: ${{ inputs.portfolio_json }}
-        run: |
-          set -euo pipefail
-          printf '%s' "$PORTFOLIO_JSON" > "$RUN_ROOT/portfolio.json"
-          python -m json.tool "$RUN_ROOT/portfolio.json" >/dev/null
-
-      - name: Run analysis
-        if: ${{ inputs.mode == 'analyze' }}
-        shell: bash
-        env:
-          TICKER: ${{ inputs.ticker }}
-          ANALYSIS_DATE: ${{ inputs.date }}
-          ANALYSTS: ${{ inputs.analysts }}
-          PORTFOLIO_ENABLED: ${{ inputs.portfolio_json != '' }}
-          CHECKPOINT: ${{ inputs.checkpoint }}
-          CLEAR_CHECKPOINTS: ${{ inputs.clear_checkpoints }}
-        run: |
-          set -o pipefail
-          args=(
-            --ticker "$TICKER"
-            --date "$ANALYSIS_DATE"
-            --analysts "$ANALYSTS"
-            --save
-            --no-show
-          )
-          if [[ "$PORTFOLIO_ENABLED" == "true" ]]; then
-            args+=(--portfolio "$RUN_ROOT/portfolio.json")
-          fi
-          if [[ "$CHECKPOINT" == "true" ]]; then
-            args+=(--checkpoint)
-          else
-            args+=(--no-checkpoint)
-          fi
-          if [[ "$CLEAR_CHECKPOINTS" == "true" ]]; then
-            args+=(--clear-checkpoints)
-          fi
-          tradingagents "${args[@]}" 2>&1 | tee "$RUN_ROOT/agent.log"
-
-      - name: Run backtest
-        if: ${{ inputs.mode == 'backtest' }}
-        shell: bash
-        env:
-          TICKERS: ${{ inputs.ticker }}
-          START_DATE: ${{ inputs.start }}
-          END_DATE: ${{ inputs.end }}
-          EVERY: ${{ inputs.every }}
-          ANALYSTS: ${{ inputs.analysts }}
-          ASSET_TYPE: ${{ inputs.asset_type }}
           RUN_ID: ${{ inputs.run_id }}
-          PORTFOLIO_ENABLED: ${{ inputs.portfolio_json != '' }}
+          PORTFOLIO: ${{ inputs.portfolio }}
+          TRADINGAGENTS_RESULTS_DIR: ${{ github.workspace }}/.runtime/results
+          TRADINGAGENTS_CACHE_DIR: ${{ github.workspace }}/.runtime/cache
         run: |
-          set -o pipefail
-          args=(
-            backtest "$TICKERS"
-            --start "$START_DATE"
-            --end "$END_DATE"
-            --every "$EVERY"
-            --asset-type "$ASSET_TYPE"
-          )
-          if [[ -n "$ANALYSTS" ]]; then
-            args+=(--analysts "$ANALYSTS")
+          set -euo pipefail
+
+          if [[ "$MODE" != "analysis" ]]; then
+            echo "Error: mode '$MODE' is not implemented by this engine workflow yet." >&2
+            exit 2
           fi
-          if [[ "$PORTFOLIO_ENABLED" == "true" ]]; then
-            args+=(--portfolio "$RUN_ROOT/portfolio.json")
+
+          if [[ -z "$ANALYSTS" ]]; then
+            CMD=(tradingagents --ticker "$TICKER" --date "$ANALYSIS_DATE" --save --no-show)
+          else
+            CMD=(tradingagents --ticker "$TICKER" --date "$ANALYSIS_DATE" --analysts "$ANALYSTS" --save --no-show)
           fi
-          if [[ -n "$RUN_ID" ]]; then
-            args+=(--run-id "$RUN_ID")
-          fi
-          tradingagents "${args[@]}" 2>&1 | tee "$RUN_ROOT/agent.log"
+
+          printf '%s\n' "request_id=$REQUEST_ID" "ticker=$TICKER" "date=$ANALYSIS_DATE" "analysts=${ANALYSTS:-<agent-default>}" > .runtime/run/request.txt
+          "${CMD[@]}" 2>&1 | tee .runtime/run/agent.log
 
       - name: Write run metadata
         if: always()
-        shell: bash
         env:
-          MODE: ${{ inputs.mode }}
+          REQUEST_ID: ${{ inputs.request_id }}
           TICKER: ${{ inputs.ticker }}
           ANALYSIS_DATE: ${{ inputs.date }}
           ANALYSTS: ${{ inputs.analysts }}
-          ASSET_TYPE: ${{ inputs.asset_type }}
-          START_DATE: ${{ inputs.start }}
-          END_DATE: ${{ inputs.end }}
-          REQUEST_ID: ${{ inputs.request_id }}
         run: |
-          set -euo pipefail
-          mkdir -p "$RUN_ROOT"
           python - <<'PY'
-          import json
-          import os
+          import json, os
           from pathlib import Path
 
-          data = {
-              "github_repository": os.environ["GITHUB_REPOSITORY"],
-              "github_run_id": int(os.environ["GITHUB_RUN_ID"]),
-              "github_run_number": int(os.environ["GITHUB_RUN_NUMBER"]),
-              "github_sha": os.environ.get("GITHUB_SHA", ""),
-              "mode": os.environ["MODE"],
-              "ticker": os.environ.get("TICKER", ""),
-              "analysis_date": os.environ.get("ANALYSIS_DATE", ""),
-              "analysts": os.environ.get("ANALYSTS", ""),
-              "asset_type": os.environ.get("ASSET_TYPE", ""),
-              "start": os.environ.get("START_DATE", ""),
-              "end": os.environ.get("END_DATE", ""),
-              "request_id": os.environ.get("REQUEST_ID", ""),
-              "status": os.environ.get("JOB_STATUS", "unknown"),
-          }
-          Path(os.environ["RUN_ROOT"], "run.json").write_text(
-              json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+          Path(".runtime/run/run.json").write_text(
+              json.dumps(
+                  {
+                      "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+                      "request_id": os.environ.get("REQUEST_ID", ""),
+                      "ticker": os.environ.get("TICKER", ""),
+                      "date": os.environ.get("ANALYSIS_DATE", ""),
+                      "analysts": os.environ.get("ANALYSTS", ""),
+                  },
+                  ensure_ascii=False,
+                  indent=2,
+              ),
               encoding="utf-8",
           )
           PY
-        env:
-          JOB_STATUS: ${{ job.status }}
 
-      - name: Upload persistent state
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tradingagents-state
-          path: .runtime/tradingagents_data
-          if-no-files-found: warn
-          retention-days: 90
-          compression-level: 6
-
-      - name: Upload run bundle
+      - name: Upload run artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tradingagents-run-${{ github.run_id }}
-          path: .runtime/run
-          if-no-files-found: warn
+          path: .runtime/run/
           retention-days: 90
-          compression-level: 6
+          if-no-files-found: warn
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tradingagents-results-${{ github.run_id }}
+          path: .runtime/results/
+          retention-days: 90
+          if-no-files-found: warn
