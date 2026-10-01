@@ -2,509 +2,1241 @@
 # -*- coding: utf-8 -*-
 """TradingAgentsArya Telegram controller.
 
-Telegram = control/monitoring layer.
-GitHub Actions = execution layer.
-SQLite state is restored/saved by the workflow artifact.
+Design goals:
+- one Telegram controller instance
+- one editable UI message per chat
+- guided flows; no command syntax is required
+- model setup asks only URL -> token -> exact model id
+- model test is a real, tiny API connectivity test (not a TradingAgents run)
+- GitHub Actions is the execution layer
+- persistent controller state lives in an Actions artifact
 """
 from __future__ import annotations
-import base64, datetime as dt, hashlib, html, json, os, sqlite3, time, traceback, urllib.error, urllib.parse, urllib.request, uuid
+
+import base64
+import datetime as dt
+import hashlib
+import html
+import json
+import os
+import sqlite3
+import time
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from typing import Any
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
+STATE_KEY = os.getenv("BOT_STATE_KEY", "").strip()
 OWNER = os.getenv("GITHUB_OWNER", "Aryasamadi").strip()
 REPO = os.getenv("GITHUB_REPO", "TradingAgentsArya").strip()
 REF = os.getenv("GITHUB_REF", "main").strip()
 STATE_PATH = os.getenv("BOT_STATE_PATH", "bot_state.db").strip() or "bot_state.db"
 ADMIN_IDS = {int(x) for x in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 ALLOWED_IDS = {int(x) for x in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").split(",") if x.strip().isdigit()}
+
 TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
 GH = f"https://api.github.com/repos/{OWNER}/{REPO}"
+WORKFLOW = ".github/workflows/tradingagents.yml"
 
 DB = sqlite3.connect(STATE_PATH, check_same_thread=False)
 DB.row_factory = sqlite3.Row
-DB.execute("PRAGMA journal_mode=WAL")
 DB.execute("PRAGMA foreign_keys=ON")
-DB.executescript("""
-CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS models(
- id TEXT PRIMARY KEY, name TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
- base_url TEXT DEFAULT '', region TEXT DEFAULT '', token_ciphertext BLOB,
- enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS runs(
- request_id TEXT PRIMARY KEY, workflow_run_id INTEGER, ticker TEXT NOT NULL, date TEXT NOT NULL,
- analysts TEXT DEFAULT '', model_id TEXT DEFAULT '', status TEXT NOT NULL,
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS wizard(
- chat_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, stage TEXT NOT NULL,
- base_url TEXT DEFAULT '', token TEXT DEFAULT '', model_name TEXT DEFAULT '',
- provider TEXT DEFAULT 'openai_compatible', prompt_message_id INTEGER, updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS flows(
- chat_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, stage TEXT NOT NULL,
- data_json TEXT NOT NULL DEFAULT '{}', prompt_message_id INTEGER, updated_at TEXT NOT NULL
-);
-""")
+DB.executescript(
+    """
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS ui (
+        chat_id INTEGER PRIMARY KEY,
+        message_id INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS models (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        base_url TEXT NOT NULL,
+        token_ciphertext BLOB,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS runs (
+        request_id TEXT PRIMARY KEY,
+        workflow_run_id INTEGER,
+        chat_id INTEGER NOT NULL,
+        mode TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        conclusion TEXT DEFAULT '',
+        fallback_attempted INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """
+)
 DB.commit()
-try:
-    DB.execute("ALTER TABLE models ADD COLUMN token_ciphertext BLOB DEFAULT NULL")
+
+# In-memory only: API tokens are never written to the controller DB while a
+# model-creation wizard is in progress. Once saved, the token is encrypted.
+WIZARDS: dict[int, dict[str, str]] = {}
+FLOWS: dict[int, dict[str, Any]] = {}
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def esc(value: Any) -> str:
+    return html.escape(str(value if value is not None else ""), quote=False)
+
+
+def db(sql: str, args: tuple | list = ()):
+    cur = DB.execute(sql, args)
     DB.commit()
-except sqlite3.OperationalError:
-    pass
+    return cur
 
 
-def now(): return dt.datetime.now(dt.timezone.utc).isoformat()
-def esc(v): return html.escape(str(v if v is not None else ""), quote=False)
+def get_setting(key: str, default: str = "") -> str:
+    row = DB.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return str(row[0]) if row else default
 
-def http_json(url: str, method="GET", data=None, headers=None, timeout=60):
-    body = json.dumps(data, ensure_ascii=False).encode() if data is not None else None
-    h = {"Accept": "application/vnd.github+json"}
-    if headers: h.update(headers)
-    if data is not None: h.setdefault("Content-Type", "application/json")
-    req = urllib.request.Request(url, data=body, headers=h, method=method)
+
+def set_setting(key: str, value: str) -> None:
+    db(
+        "INSERT INTO settings(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
+def authorized(user_id: int) -> bool:
+    return user_id in ADMIN_IDS or user_id in ALLOWED_IDS
+
+
+def admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+# ---------- HTTP ----------
+def http_json(url: str, method: str = "GET", data: Any = None, headers: dict | None = None, timeout: int = 60):
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8") if data is not None else None
+    request_headers = {"Accept": "application/vnd.github+json"}
+    if headers:
+        request_headers.update(headers)
+    if data is not None:
+        request_headers.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=body, headers=request_headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        raw = response.read().decode("utf-8", "replace")
+        return response.status, (json.loads(raw) if raw else None)
+
+
+def http_error_code(exc: Exception) -> int | None:
+    if isinstance(exc, urllib.error.HTTPError):
+        return int(exc.code)
+    return None
+
+
+def tg(method: str, payload: dict | None = None):
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read().decode("utf-8", "replace")
-            return r.status, (json.loads(raw) if raw else None)
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", "replace")
-        try: obj = json.loads(raw) if raw else None
-        except Exception: obj = raw
-        raise RuntimeError(f"HTTP {e.code}: {obj}") from e
-
-def tg(method, payload=None):
-    _, obj = http_json(f"{TG}/{method}", "POST", payload or {}, {"Content-Type":"application/json"})
+        _, obj = http_json(
+            f"{TG}/{method}",
+            "POST",
+            payload or {},
+            {"Content-Type": "application/json"},
+            timeout=65,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Telegram API {method} failed") from exc
     if not isinstance(obj, dict) or not obj.get("ok"):
-        raise RuntimeError(f"Telegram API error: {obj}")
+        raise RuntimeError(f"Telegram API {method} failed")
     return obj.get("result")
 
-def gh(method, path, data=None):
-    if not GH_TOKEN: raise RuntimeError("BOT_GITHUB_TOKEN is required")
-    h = {"Authorization":f"Bearer {GH_TOKEN}", "X-GitHub-Api-Version":"2026-03-10", "Accept":"application/vnd.github+json", "User-Agent":"TradingAgentsArya-Telegram"}
-    status, obj = http_json(GH + path, method, data, h)
-    if status >= 300: raise RuntimeError(f"GitHub API error {status}: {obj}")
+
+def gh(method: str, path: str, data: Any = None):
+    if not GH_TOKEN:
+        raise RuntimeError("BOT_GITHUB_TOKEN تنظیم نشده است.")
+    headers = {
+        "Authorization": f"Bearer {GH_TOKEN}",
+        "X-GitHub-Api-Version": "2026-03-10",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "TradingAgentsArya-Telegram",
+    }
+    try:
+        status, obj = http_json(GH + path, method, data, headers, timeout=60)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"GitHub API error {exc.code}") from exc
+    if status >= 300:
+        raise RuntimeError(f"GitHub API error {status}")
     return obj
 
-def db(sql, args=()):
-    cur = DB.execute(sql, args); DB.commit(); return cur
 
-def send(chat_id, text, keyboard=None):
-    p={"chat_id":chat_id,"text":text[:4096],"parse_mode":"HTML","disable_web_page_preview":True}
-    if keyboard is not None: p["reply_markup"]={"inline_keyboard":keyboard}
-    return tg("sendMessage",p)
+# ---------- Telegram UI ----------
+def inline(rows: list[list[tuple[str, str]]]) -> list[list[dict[str, str]]]:
+    return [[{"text": text, "callback_data": data} for text, data in row] for row in rows]
 
-def edit(chat_id, message_id, text, keyboard=None):
-    p={"chat_id":chat_id,"message_id":message_id,"text":text[:4096],"parse_mode":"HTML","disable_web_page_preview":True}
-    if keyboard is not None: p["reply_markup"]={"inline_keyboard":keyboard}
-    try: return tg("editMessageText",p)
-    except Exception as e:
-        if "message is not modified" in str(e).lower(): return None
-        raise
 
-def answer_cb(qid, text="", alert=False): tg("answerCallbackQuery", {"callback_query_id":qid,"text":text[:200],"show_alert":alert})
-def kb(rows): return [[{"text":a,"callback_data":b} for a,b in row] for row in rows]
-def authorized(uid): return uid in ADMIN_IDS or uid in ALLOWED_IDS
-def admin(uid): return uid in ADMIN_IDS
+def answer_callback(query_id: str, text: str = "", alert: bool = False) -> None:
+    tg(
+        "answerCallbackQuery",
+        {"callback_query_id": query_id, "text": text[:200], "show_alert": alert},
+    )
 
-# ---------- secrets / models ----------
-def token_box():
-    from nacl.secret import SecretBox
-    key=hashlib.sha256((OWNER+":"+REPO+":"+GH_TOKEN).encode()).digest()
-    return SecretBox(key)
-def encrypt_token(v): return bytes(token_box().encrypt(v.encode()))
-def decrypt_token(v): return token_box().decrypt(bytes(v)).decode() if v else ""
 
-def github_secret(name, value):
-    from nacl import encoding, public
-    key=gh("GET","/actions/secrets/public-key")
-    pub=public.PublicKey(key["key"].encode(), encoding.Base64Encoder())
-    enc=public.SealedBox(pub).encrypt(value.encode())
-    gh("PUT",f"/actions/secrets/{urllib.parse.quote(name,safe='')}",{"encrypted_value":base64.b64encode(enc).decode(),"key_id":key["key_id"]})
+def send_message(chat_id: int, text: str, rows: list[list[tuple[str, str]]] | None = None) -> int:
+    result = tg(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": text[:4096],
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+            **({"reply_markup": {"inline_keyboard": inline(rows)}} if rows is not None else {}),
+        },
+    )
+    return int(result["message_id"])
 
-PROVIDER_SECRET={
- "openai":"OPENAI_API_KEY","anthropic":"ANTHROPIC_API_KEY","google":"GOOGLE_API_KEY","azure":"AZURE_OPENAI_API_KEY",
- "xai":"XAI_API_KEY","deepseek":"DEEPSEEK_API_KEY","qwen":"DASHSCOPE_API_KEY","qwen-cn":"DASHSCOPE_CN_API_KEY",
- "glm":"ZHIPU_API_KEY","glm-cn":"ZHIPU_CN_API_KEY","minimax":"MINIMAX_API_KEY","minimax-cn":"MINIMAX_CN_API_KEY",
- "openrouter":"OPENROUTER_API_KEY","mistral":"MISTRAL_API_KEY","kimi":"MOONSHOT_API_KEY","groq":"GROQ_API_KEY",
- "nvidia":"NVIDIA_API_KEY","openai_compatible":"OPENAI_COMPATIBLE_API_KEY"
+
+def edit_message(chat_id: int, message_id: int, text: str, rows: list[list[tuple[str, str]]] | None = None) -> bool:
+    try:
+        tg(
+            "editMessageText",
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text[:4096],
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+                **({"reply_markup": {"inline_keyboard": inline(rows)}} if rows is not None else {}),
+            },
+        )
+        return True
+    except Exception as exc:
+        if "message is not modified" in str(exc).lower():
+            return True
+        return False
+
+
+def remember_ui(chat_id: int, message_id: int) -> None:
+    db(
+        "INSERT INTO ui(chat_id,message_id,updated_at) VALUES(?,?,?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET message_id=excluded.message_id,updated_at=excluded.updated_at",
+        (chat_id, message_id, now()),
+    )
+
+
+def ui_message(chat_id: int) -> int | None:
+    row = DB.execute("SELECT message_id FROM ui WHERE chat_id=?", (chat_id,)).fetchone()
+    return int(row[0]) if row else None
+
+
+def show(chat_id: int, text: str, rows: list[list[tuple[str, str]]], message_id: int | None = None) -> int:
+    mid = message_id or ui_message(chat_id)
+    if mid and edit_message(chat_id, mid, text, rows):
+        remember_ui(chat_id, mid)
+        return mid
+    new_mid = send_message(chat_id, text, rows)
+    remember_ui(chat_id, new_mid)
+    return new_mid
+
+
+# ---------- Model storage ----------
+PROVIDER_SECRET = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "azure": "AZURE_OPENAI_API_KEY",
+    "xai": "XAI_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "qwen": "DASHSCOPE_API_KEY",
+    "qwen-cn": "DASHSCOPE_CN_API_KEY",
+    "glm": "ZHIPU_API_KEY",
+    "glm-cn": "ZHIPU_CN_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
+    "minimax-cn": "MINIMAX_CN_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "kimi": "MOONSHOT_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "nvidia": "NVIDIA_API_KEY",
+    "openai_compatible": "OPENAI_COMPATIBLE_API_KEY",
+    "bedrock": "AWS_BEARER_TOKEN_BEDROCK",
+    "ollama": "",
 }
-NO_KEY={"bedrock","ollama"}
 
-def infer_provider(url):
-    host=urllib.parse.urlparse(url).netloc.lower()
-    for needle,p in [("api.openai.com","openai"),("api.anthropic.com","anthropic"),("generativelanguage.googleapis.com","google"),("api.x.ai","xai"),("api.deepseek.com","deepseek"),("openrouter.ai","openrouter"),("api.mistral.ai","mistral"),("api.groq.com","groq"),("api.moonshot.ai","kimi"),("api.minimax.io","minimax")]:
-        if needle in host: return p
+
+def crypt_key() -> bytes:
+    # BOT_STATE_KEY is stable across PAT rotations when configured. The PAT hash
+    # remains a backward-compatible fallback for old controller state.
+    seed = STATE_KEY or f"legacy:{OWNER}:{REPO}:{GH_TOKEN}"
+    return hashlib.sha256(seed.encode("utf-8")).digest()
+
+
+def encrypt_token(token: str) -> bytes:
+    from nacl.secret import SecretBox
+    return bytes(SecretBox(crypt_key()).encrypt(token.encode("utf-8")))
+
+
+def decrypt_token(ciphertext: bytes | memoryview | None) -> str:
+    if not ciphertext:
+        return ""
+    from nacl.secret import SecretBox
+    try:
+        return SecretBox(crypt_key()).decrypt(bytes(ciphertext)).decode("utf-8")
+    except Exception as exc:
+        raise RuntimeError("کلید رمزگشایی State تغییر کرده است؛ مدل را دوباره اضافه کن.") from exc
+
+
+def normalize_base_url(value: str) -> str:
+    value = value.strip()
+    if not value.startswith(("http://", "https://")):
+        raise ValueError("Base URL باید با http:// یا https:// شروع شود.")
+    value = value.rstrip("/")
+    for suffix in ("/chat/completions", "/completions", "/messages", "/generateContent"):
+        if value.lower().endswith(suffix.lower()):
+            value = value[: -len(suffix)].rstrip("/")
+    if not value:
+        raise ValueError("Base URL معتبر نیست.")
+    return value
+
+
+def infer_provider(base_url: str) -> str:
+    host = (urllib.parse.urlparse(base_url).hostname or "").lower()
+    mapping = [
+        ("api.openai.com", "openai"),
+        ("api.anthropic.com", "anthropic"),
+        ("generativelanguage.googleapis.com", "google"),
+        ("api.x.ai", "xai"),
+        ("api.deepseek.com", "deepseek"),
+        ("dashscope-intl.aliyuncs.com", "qwen"),
+        ("dashscope.aliyuncs.com", "qwen-cn"),
+        ("api.z.ai", "glm"),
+        ("open.bigmodel.cn", "glm-cn"),
+        ("api.minimax.io", "minimax"),
+        ("api.minimaxi.com", "minimax-cn"),
+        ("openrouter.ai", "openrouter"),
+        ("api.mistral.ai", "mistral"),
+        ("api.moonshot.ai", "kimi"),
+        ("api.groq.com", "groq"),
+        ("integrate.api.nvidia.com", "nvidia"),
+    ]
+    for needle, provider in mapping:
+        if needle == host or host.endswith("." + needle):
+            return provider
+    if "openai.azure.com" in host or host.endswith("cognitiveservices.azure.com"):
+        return "azure"
+    if "bedrock-runtime" in host and host.endswith("amazonaws.com"):
+        return "bedrock"
+    if host in {"localhost", "127.0.0.1"} or host.endswith(":11434"):
+        return "ollama"
     return "openai_compatible"
 
-def models(): return DB.execute("SELECT * FROM models WHERE enabled=1 ORDER BY name COLLATE NOCASE").fetchall()
-def active_id():
-    r=DB.execute("SELECT value FROM settings WHERE key='active_model'").fetchone(); return str(r[0]) if r else ""
-def set_active(mid): db("INSERT INTO settings(key,value) VALUES('active_model',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(mid,))
 
-def activate(mid):
-    r=DB.execute("SELECT * FROM models WHERE id=? AND enabled=1",(mid,)).fetchone()
-    if not r: raise ValueError("مدل پیدا نشد.")
-    p=r["provider"].strip().lower()
-    if p not in PROVIDER_SECRET and p not in NO_KEY: raise ValueError(f"Provider پشتیبانی نمی‌شود: {p}")
-    if p in PROVIDER_SECRET:
-        tok=decrypt_token(r["token_ciphertext"])
-        if not tok: raise ValueError("توکن مدل موجود نیست؛ مدل را دوباره اضافه کن.")
-        github_secret(PROVIDER_SECRET[p],tok)
-    if p=="ollama": github_secret("OLLAMA_BASE_URL",r["base_url"] or "http://localhost:11434/v1")
-    if p=="bedrock" and r["region"]: github_secret("AWS_DEFAULT_REGION",r["region"])
-    github_secret("TRADINGAGENTS_LLM_PROVIDER",p)
-    github_secret("TRADINGAGENTS_DEEP_THINK_LLM",r["model"])
-    github_secret("TRADINGAGENTS_QUICK_THINK_LLM",r["model"])
-    github_secret("TRADINGAGENTS_LLM_BACKEND_URL",r["base_url"] if p!="ollama" else "")
-    github_secret("TRADINGAGENTS_CHECKPOINT_ENABLED","true")
-    set_active(mid)
-    return r
+def model_rows() -> list[sqlite3.Row]:
+    return DB.execute("SELECT * FROM models WHERE enabled=1 ORDER BY name COLLATE NOCASE").fetchall()
 
-# ---------- execution ----------
-def dispatch_run(mode, ticker="", date="", tickers="", start="", end="", every=7, analysts="", portfolio_json=""):
-    mid=active_id()
-    if not mid: raise ValueError("هیچ مدل فعالی نداریم. اول یک مدل اضافه و فعال کن.")
-    rid=uuid.uuid4().hex
-    payload={"mode":mode,"ticker":ticker.upper().strip(),"date":date.strip(),"tickers":tickers.strip(),"start":start.strip(),"end":end.strip(),"every":str(every),"analysts":analysts.strip(),"portfolio_json":portfolio_json,"request_id":rid}
-    try:
-        gh("POST","/dispatches",{"event_type":"tradingagents_run","client_payload":payload})
-    except Exception as first:
-        # Fallback: same workflow through workflow_dispatch. Requires Actions: write on BOT_GITHUB_TOKEN.
-        try:
-            gh("POST",f"/actions/workflows/tradingagents.yml/dispatches",{"ref":REF,"inputs":{"mode":"engine","payload":json.dumps(payload,ensure_ascii=False)}})
-        except Exception as second:
-            raise RuntimeError(f"ارسال Engine شکست خورد. repository_dispatch: {first}; workflow_dispatch fallback: {second}")
-    display=ticker.upper().strip() or tickers.strip()
-    display_date=date.strip() or f"{start.strip()} → {end.strip()}"
-    db("INSERT INTO runs(request_id,ticker,date,analysts,model_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(rid,display,display_date,analysts.strip(),mid,"queued",now(),now()))
-    return rid,mid
 
-def workflow_runs():
-    x=gh("GET","/actions/runs?per_page=20")
-    return x.get("workflow_runs",[]) if isinstance(x,dict) else []
+def active_model_id() -> str:
+    return get_setting("active_model")
 
-def sync_run_status():
-    rows=DB.execute("SELECT * FROM runs WHERE status NOT IN ('completed','failure','cancelled','skipped') ORDER BY created_at DESC LIMIT 20").fetchall()
-    runs=workflow_runs()
+
+def set_active_model(model_id: str) -> None:
+    row = DB.execute("SELECT id FROM models WHERE id=? AND enabled=1", (model_id,)).fetchone()
+    if not row:
+        raise ValueError("مدل پیدا نشد.")
+    set_setting("active_model", model_id)
+
+
+def github_secret(name: str, value: str) -> None:
+    from nacl import encoding, public
+
+    key = gh("GET", "/actions/secrets/public-key")
+    public_key = public.PublicKey(key["key"].encode(), encoding.Base64Encoder())
+    encrypted = public.SealedBox(public_key).encrypt(value.encode("utf-8"))
+    gh(
+        "PUT",
+        f"/actions/secrets/{urllib.parse.quote(name, safe='')}",
+        {
+            "encrypted_value": base64.b64encode(encrypted).decode("ascii"),
+            "key_id": key["key_id"],
+        },
+    )
+
+
+def write_active_model_secrets(model_row: sqlite3.Row) -> None:
+    provider = model_row["provider"]
+    token = decrypt_token(model_row["token_ciphertext"])
+    if provider in PROVIDER_SECRET and token:
+        github_secret(PROVIDER_SECRET[provider], token)
+    github_secret("TRADINGAGENTS_LLM_PROVIDER", provider)
+    github_secret("TRADINGAGENTS_DEEP_THINK_LLM", model_row["name"])
+    github_secret("TRADINGAGENTS_QUICK_THINK_LLM", model_row["name"])
+    github_secret("TRADINGAGENTS_LLM_BACKEND_URL", model_row["base_url"])
+    github_secret("TRADINGAGENTS_CHECKPOINT_ENABLED", "true")
+
+
+def add_model(name: str, provider: str, base_url: str, token: str) -> str:
+    model_id = "m_" + uuid.uuid4().hex[:12]
+    timestamp = now()
+    db(
+        "INSERT INTO models(id,name,provider,base_url,token_ciphertext,enabled,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,1,?,?)",
+        (model_id, name, provider, base_url, encrypt_token(token), timestamp, timestamp),
+    )
+    row = DB.execute("SELECT * FROM models WHERE id=?", (model_id,)).fetchone()
+    if row is None:
+        raise RuntimeError("ذخیره مدل انجام نشد.")
+    write_active_model_secrets(row)
+    set_active_model(model_id)
+    return model_id
+
+
+# ---------- Real model test ----------
+def post_model_test(model: sqlite3.Row) -> float:
+    provider = model["provider"]
+    base_url = model["base_url"].rstrip("/")
+    token = decrypt_token(model["token_ciphertext"])
+    model_name = model["name"]
+    started = time.monotonic()
+
+    if provider == "anthropic":
+        endpoint = base_url if base_url.endswith("/messages") else base_url + "/v1/messages"
+        status, _ = http_json(
+            endpoint,
+            "POST",
+            {"model": model_name, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply OK only."}]},
+            {"x-api-key": token, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+            timeout=45,
+        )
+    elif provider == "google":
+        encoded_model = urllib.parse.quote(model_name, safe="")
+        endpoint = base_url + f"/models/{encoded_model}:generateContent"
+        endpoint += ("&" if "?" in endpoint else "?") + urllib.parse.urlencode({"key": token})
+        status, _ = http_json(
+            endpoint,
+            "POST",
+            {"contents": [{"parts": [{"text": "Reply OK only."}]}], "generationConfig": {"maxOutputTokens": 8}},
+            {"Content-Type": "application/json"},
+            timeout=45,
+        )
+    else:
+        endpoint = base_url if base_url.endswith("/chat/completions") else base_url + "/chat/completions"
+        status, _ = http_json(
+            endpoint,
+            "POST",
+            {"model": model_name, "messages": [{"role": "user", "content": "Reply OK only."}], "max_tokens": 8},
+            {"Authorization": f"Bearer {token}", "Content-Type": "application/json"} if token else {"Content-Type": "application/json"},
+            timeout=45,
+        )
+
+    if status < 200 or status >= 300:
+        raise RuntimeError(f"HTTP {status}")
+    return time.monotonic() - started
+
+
+# ---------- GitHub execution ----------
+def current_engine_runs() -> list[dict[str, Any]]:
+    active: list[dict[str, Any]] = []
+    for status in ("queued", "in_progress"):
+        data = gh("GET", f"/actions/workflows/tradingagents.yml/runs?status={status}&per_page=50") or {}
+        for run in data.get("workflow_runs", []):
+            # Normal Telegram execution uses repository_dispatch. Manual
+            # workflow_dispatch is reserved for the Controller only.
+            if run.get("event") == "repository_dispatch":
+                active.append(run)
+    unique = {int(run["id"]): run for run in active if run.get("id")}
+    return list(unique.values())
+
+
+def dispatch_run(chat_id: int, mode: str, params: dict[str, Any]) -> tuple[str, str]:
+    model_id = active_model_id()
+    if not model_id:
+        raise ValueError("اول از بخش مدل‌ها یک مدل فعال کن.")
+
+    active = current_engine_runs()
+    if active:
+        raise ValueError("یک پردازش در حال اجراست. بعد از پایان آن، اجرای بعدی را شروع کن.")
+
+    request_id = uuid.uuid4().hex
+    payload = {
+        "request_id": request_id,
+        "mode": mode,
+        "chat_id": str(chat_id),
+        "model_id": model_id,
+        "params": params,
+    }
+
+    # One request is sent exactly once. We deliberately do not fall back to a
+    # second trigger because that could start the engine twice.
+    gh("POST", "/dispatches", {"event_type": "tradingagents_run", "client_payload": payload})
+
+    db(
+        "INSERT INTO runs(request_id,workflow_run_id,chat_id,mode,payload_json,model_id,status,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?, ?,?)",
+        (
+            request_id,
+            None,
+            chat_id,
+            mode,
+            json.dumps(params, ensure_ascii=False),
+            model_id,
+            "queued",
+            now(),
+            now(),
+        ),
+    )
+    return request_id, model_id
+
+
+def sync_run_records() -> None:
+    rows = DB.execute(
+        "SELECT * FROM runs WHERE status NOT IN ('completed','failure','cancelled','skipped') "
+        "ORDER BY created_at DESC LIMIT 30"
+    ).fetchall()
+    if not rows:
+        return
+
+    data = gh("GET", "/actions/workflows/tradingagents.yml/runs?per_page=100") or {}
+    workflow_runs = [r for r in data.get("workflow_runs", []) if r.get("event") == "repository_dispatch"]
+    by_request: dict[str, dict[str, Any]] = {}
+    for run in workflow_runs:
+        title = str(run.get("display_title") or "")
+        for row in rows:
+            if row["request_id"] in title:
+                by_request[row["request_id"]] = run
+                break
+
     for row in rows:
-        candidates=[r for r in runs if r.get("created_at","") >= row["created_at"][:19]]
-        if not candidates: continue
-        # Best available correlation: workflow run created after request. The exact request id is also in engine logs/artifacts.
-        r=candidates[0]
-        status=r.get("status") or "queued"; conclusion=r.get("conclusion")
-        new=(conclusion if status=="completed" and conclusion else status)
-        if new != row["status"]:
-            db("UPDATE runs SET workflow_run_id=?,status=?,updated_at=? WHERE request_id=?",(r.get("id"),new,now(),row["request_id"]))
+        run = by_request.get(row["request_id"])
+        if not run:
+            continue
+        status = str(run.get("status") or "queued")
+        conclusion = str(run.get("conclusion") or "")
+        state = conclusion if status == "completed" and conclusion else status
+        db(
+            "UPDATE runs SET workflow_run_id=?,status=?,conclusion=?,updated_at=? WHERE request_id=?",
+            (run.get("id"), state, conclusion, now(), row["request_id"]),
+        )
 
-def status_text():
-    try: sync_run_status()
-    except Exception: pass
-    rs=DB.execute("SELECT * FROM runs ORDER BY created_at DESC LIMIT 10").fetchall()
-    if not rs: return "<b>📊 وضعیت اجراها</b>\nاجرایی ثبت نشده است."
-    lines=["<b>📊 وضعیت اجراها</b>"]
-    for r in rs:
-        lines.append(f"• <code>{esc(r['request_id'][:10])}</code> — {esc(r['ticker'])} — <b>{esc(r['status'])}</b>")
-    return "\n".join(lines)
 
-# ---------- menus ----------
-def menu(chat,text,rows,message_id=None):
-    if message_id:
-        try: edit(chat,message_id,text,kb(rows)); return message_id
-        except Exception: pass
-    return int(send(chat,text,kb(rows))["message_id"])
+def engine_link(run_id: int | None) -> str:
+    return f"https://github.com/{OWNER}/{REPO}/actions/runs/{run_id}" if run_id else ""
 
-def main_menu(chat,message_id=None):
-    return menu(chat,"<b>🤖 TradingAgentsArya</b>\nکنترل کامل از Telegram؛ اجرا روی GitHub Actions.",[
-        [("▶️ اجرا","run"),("📊 وضعیت","status")],
-        [("🤖 مدل‌ها","models"),("🧪 تست","tests")],
-        [("📜 تاریخچه","history"),("📦 خروجی‌ها","artifacts")],
-    ],message_id)
 
-def model_menu(chat,message_id=None):
-    rows=models(); aid=active_id(); lines=["<b>🤖 مدل‌ها</b>"]
-    buttons=[]
-    if not rows: lines.append("هنوز مدلی ثبت نشده است.")
-    for r in rows:
-        mark=" ✅ فعال" if r["id"]==aid else ""
-        lines.append(f"• <code>{esc(r['name'])}</code> — {esc(r['provider'])}{mark}")
-        buttons.append([(f"⚡ فعال‌سازی {r['name']}",f"activate:{r['id']}")])
-    buttons += [[("➕ افزودن مدل","add")],[ ("🗑 حذف مدل","delmenu") ],[("◀️ خانه","home")]]
-    return menu(chat,"\n".join(lines),buttons,message_id)
-
-def run_menu(chat,message_id=None):
-    return menu(chat,"<b>▶️ اجرای جدید</b>\nفقط مرحله‌به‌مرحله جواب بده؛ نیازی به نوشتن دستور یا فرمت خاص نیست.",[
-        [("🔎 تحلیل جدید","new_analysis")],[("📈 بک‌تست جدید","new_backtest")],
-        [("📊 وضعیت","status"),("🏠 خانه","home")]
-    ],message_id)
-
-def history_menu(chat,message_id=None):
-    rs=DB.execute("SELECT * FROM runs ORDER BY created_at DESC LIMIT 12").fetchall()
-    text="<b>📜 تاریخچه</b>\n"+("اجرایی ثبت نشده است." if not rs else "\n".join(f"• <code>{esc(r['request_id'][:10])}</code> — {esc(r['ticker'])} — {esc(r['status'])}" for r in rs))
-    return menu(chat,text,[[ ("🔄 تازه‌سازی","history"),("◀️ خانه","home") ]],message_id)
-
-def artifacts_menu(chat,message_id=None):
-    data=gh("GET","/actions/artifacts?per_page=20"); items=data.get("artifacts",[])
-    text="<b>📦 خروجی‌ها</b>\n"+("موردی نیست." if not items else "\n".join(f"• <code>{a.get('id')}</code> — {esc(a.get('name'))}" for a in items[:15]))
-    return menu(chat,text,[[ ("🔄 تازه‌سازی","artifacts"),("◀️ خانه","home") ]],message_id)
-
-def test_menu(chat,message_id=None):
-    rs=models(); buttons=[[(f"🧪 {r['name']}",f"test:{r['id']}")] for r in rs]
-    buttons.append([("◀️ خانه","home")])
-    return menu(chat,"<b>🧪 تست مدل</b>\nتست، یک اجرای واقعی کوتاه با همان مدل فعال است.",buttons,message_id)
-
-def delete_menu(chat,message_id=None):
-    rs=models(); buttons=[[(f"🗑 {r['name']}",f"delete:{r['id']}")] for r in rs]; buttons.append([("◀️ مدل‌ها","models")])
-    return menu(chat,"<b>حذف مدل</b>\nمدل را انتخاب کن:",buttons,message_id)
-
-# ---------- guided execution flow ----------
-def flow_row(chat):
-    return DB.execute("SELECT * FROM flows WHERE chat_id=?", (chat,)).fetchone()
-
-def flow_save(chat, uid, kind, stage, data=None, mid=None):
-    payload=json.dumps(data or {}, ensure_ascii=False)
-    db("INSERT INTO flows(chat_id,user_id,kind,stage,data_json,prompt_message_id,updated_at) VALUES(?,?,?,?,?,?,?) "
-       "ON CONFLICT(chat_id) DO UPDATE SET user_id=excluded.user_id,kind=excluded.kind,stage=excluded.stage,data_json=excluded.data_json,prompt_message_id=excluded.prompt_message_id,updated_at=excluded.updated_at",
-       (chat,uid,kind,stage,payload,mid,now()))
-
-def flow_clear(chat):
-    db("DELETE FROM flows WHERE chat_id=?", (chat,))
-
-def flow_data(w):
-    try: return json.loads(w["data_json"] or "{}")
-    except Exception: return {}
-
-def flow_prompt(chat,uid,kind,stage,text,data=None,mid=None,rows=None):
-    rows=rows or [[("❌ لغو","flow_cancel")]]
-    if mid:
-        edit(chat,mid,text,kb(rows)); flow_save(chat,uid,kind,stage,data,mid); return mid
-    n=int(send(chat,text,kb(rows))["message_id"]); flow_save(chat,uid,kind,stage,data,n); return n
-
-def valid_date(text):
-    text=text.strip().lower()
-    if text in ("today","امروز"):
+# ---------- Text validation ----------
+def valid_date(value: str) -> str:
+    value = value.strip().lower()
+    if value in ("today", "امروز"):
         return dt.date.today().isoformat()
     try:
-        return dt.date.fromisoformat(text).isoformat()
-    except ValueError:
-        raise ValueError("تاریخ را به شکل YYYY-MM-DD بفرست؛ مثلاً 2026-09-30")
+        day = dt.date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("تاریخ را مثل 2026-09-30 وارد کن.") from exc
+    if day > dt.date.today():
+        raise ValueError("تاریخ نمی‌تواند در آینده باشد.")
+    return day.isoformat()
 
-def start_analysis_flow(chat,uid,mid=None):
-    flow_clear(chat)
-    return flow_prompt(chat,uid,"analysis","ticker",
-        "<b>🔎 تحلیل جدید</b>\n\n<b>1 از 3</b> — نماد را بفرست.\nمثال: <code>NVDA</code>",{},mid)
 
-def start_backtest_flow(chat,uid,mid=None):
-    flow_clear(chat)
-    return flow_prompt(chat,uid,"backtest","tickers",
-        "<b>📈 بک‌تست جدید</b>\n\n<b>1 از 4</b> — نماد یا نمادها را بفرست.\nمثال: <code>NVDA,AAPL</code>\nمی‌توانی با فاصله هم بنویسی.",{},mid)
+def valid_ticker(value: str, allow_many: bool = False) -> str:
+    raw = value.strip().upper().replace("$", "")
+    if allow_many:
+        parts = [x for x in raw.replace(",", " ").split() if x]
+        if not parts:
+            raise ValueError("حداقل یک Ticker وارد کن.")
+        values = []
+        for part in parts:
+            if not all(ch.isalnum() or ch in "._-^=" for ch in part) or len(part) > 32:
+                raise ValueError(f"Ticker نامعتبر است: {part}")
+            if part not in values:
+                values.append(part)
+        return ",".join(values)
+    if not raw or any(ch.isspace() for ch in raw):
+        raise ValueError("فقط یک Ticker وارد کن؛ مثلاً NVDA")
+    if not all(ch.isalnum() or ch in "._-^=" for ch in raw) or len(raw) > 32:
+        raise ValueError("فرمت Ticker نامعتبر است.")
+    return raw
 
-def flow_finish_analysis(chat,mid,data):
-    rid,model=dispatch_run("analysis",ticker=data["ticker"],date=data["date"],analysts=data.get("analysts", ""))
-    flow_clear(chat)
-    edit(chat,mid,
-         f"<b>🚀 تحلیل ارسال شد</b>\n\nنماد: <code>{esc(data['ticker'])}</code>\nتاریخ: <code>{esc(data['date'])}</code>\nمدل: <code>{esc(model)}</code>\nشناسه: <code>{esc(rid)}</code>",
-         kb([[('📊 وضعیت','status'),('📜 تاریخچه','history')],[('🏠 خانه','home')]]))
 
-def flow_finish_backtest(chat,mid,data):
-    rid,model=dispatch_run("backtest",tickers=data["tickers"],start=data["start"],end=data["end"],every=int(data.get("every",7)),analysts=data.get("analysts", ""))
-    flow_clear(chat)
-    edit(chat,mid,
-         f"<b>🚀 بک‌تست ارسال شد</b>\n\nنمادها: <code>{esc(data['tickers'])}</code>\nبازه: <code>{esc(data['start'])}</code> تا <code>{esc(data['end'])}</code>\nفاصله: <code>{esc(data.get('every',7))} روز</code>\nمدل: <code>{esc(model)}</code>\nشناسه: <code>{esc(rid)}</code>",
-         kb([[('📊 وضعیت','status'),('📜 تاریخچه','history')],[('🏠 خانه','home')]]))
+def is_crypto(ticker: str) -> bool:
+    return ticker.upper().endswith(("-USD", "-USDT", "-USDC", "-BTC", "-ETH"))
 
-def handle_flow(message):
-    chat=int(message["chat"]["id"]); uid=int(message["from"]["id"]); w=flow_row(chat)
-    if not w or w["user_id"]!=uid or not authorized(uid): return False
-    text=(message.get("text") or "").strip(); mid=w["prompt_message_id"]; data=flow_data(w)
-    if not text: return True
+
+# ---------- Main screens ----------
+def home_text() -> str:
+    aid = active_model_id()
+    row = DB.execute("SELECT name,provider FROM models WHERE id=?", (aid,)).fetchone() if aid else None
+    model_line = f"مدل فعال: <b>{esc(row['name'])}</b>" if row else "مدل فعال: <b>تنظیم نشده</b>"
+    return f"<b>🤖 TradingAgentsArya</b>\n\n{model_line}\n\nیک گزینه را انتخاب کن؛ بقیه مراحل مرحله‌به‌مرحله از خودت سؤال می‌شوند."
+
+
+def home(chat_id: int, message_id: int | None = None) -> int:
+    return show(
+        chat_id,
+        home_text(),
+        [
+            [("🚀 اجرای جدید", "run") , ("🤖 مدل‌ها", "models")],
+            [("📊 اجراهای جاری", "active_runs"), ("📜 تاریخچه", "history")],
+            [("📦 خروجی‌ها", "artifacts")],
+        ],
+        message_id,
+    )
+
+
+def model_screen(chat_id: int, message_id: int | None = None) -> int:
+    rows = model_rows()
+    aid = active_model_id()
+    text = "<b>🤖 مدل‌ها</b>\n\n"
+    buttons: list[list[tuple[str, str]]] = []
+    if not rows:
+        text += "هنوز مدلی ثبت نشده."
+    else:
+        for row in rows:
+            mark = "✅ " if row["id"] == aid else ""
+            text += f"{mark}<b>{esc(row['name'])}</b>\n<code>{esc(row['provider'])}</code>\n\n"
+            buttons.append([(f"⚡ فعال‌سازی {row['name']}", f"activate:{row['id']}")])
+    buttons += [
+        [("➕ افزودن مدل", "model_add"), ("🧪 تست اتصال", "model_test_menu")],
+        [("🗑 حذف مدل", "model_delete_menu")],
+        [("🏠 خانه", "home")],
+    ]
+    return show(chat_id, text.rstrip(), buttons, message_id)
+
+
+def run_menu(chat_id: int, message_id: int | None = None) -> int:
+    return show(
+        chat_id,
+        "<b>🚀 اجرای جدید</b>\n\nنوع کار را انتخاب کن:",
+        [[("🔎 تحلیل یک Ticker", "flow_analysis_start")], [("📈 بک‌تست", "flow_backtest_start")], [("🏠 خانه", "home")]],
+        message_id,
+    )
+
+
+def active_runs_screen(chat_id: int, message_id: int | None = None) -> int:
     try:
-        if w["kind"]=="analysis":
-            if w["stage"]=="ticker":
-                t=text.upper().replace("$","").strip()
-                if not t or any(c.isspace() for c in t): raise ValueError("فقط یک نماد وارد کن؛ مثلاً NVDA")
-                data["ticker"]=t
-                flow_prompt(chat,uid,"analysis","date","<b>2 از 3</b> — تاریخ تحلیل را بفرست.\nمثال: <code>2026-09-30</code> یا <code>امروز</code>",data,mid)
+        runs = current_engine_runs()
+    except Exception:
+        runs = []
+    if not runs:
+        text = "<b>📊 اجراهای جاری</b>\n\n✅ هیچ پردازش Engine در حال اجرا نیست."
+    else:
+        lines = ["<b>📊 اجراهای جاری</b>", ""]
+        for run in sorted(runs, key=lambda x: x.get("created_at", ""), reverse=True):
+            title = esc(run.get("display_title") or "Engine")
+            lines.append(f"🟡 <b>{title}</b>")
+            lines.append(f"Run: <code>{esc(run.get('id'))}</code>")
+        text = "\n".join(lines)
+    return show(chat_id, text, [[("🔄 تازه‌سازی", "active_runs"), ("🏠 خانه", "home")]], message_id)
+
+
+def history_screen(chat_id: int, message_id: int | None = None) -> int:
+    try:
+        sync_run_records()
+    except Exception:
+        pass
+    rows = DB.execute("SELECT * FROM runs ORDER BY created_at DESC LIMIT 12").fetchall()
+    if not rows:
+        text = "<b>📜 تاریخچه</b>\n\nهنوز اجرایی ثبت نشده است."
+    else:
+        lines = ["<b>📜 تاریخچه</b>", ""]
+        for row in rows:
+            label = row["mode"]
+            params = json.loads(row["payload_json"] or "{}")
+            subject = params.get("ticker") or params.get("tickers") or "—"
+            lines.append(
+                f"• <code>{esc(row['request_id'][:10])}</code> | {esc(subject)} | <b>{esc(row['status'])}</b> | {esc(label)}"
+            )
+        text = "\n".join(lines)
+    return show(chat_id, text, [[("🔄 تازه‌سازی", "history"), ("🏠 خانه", "home")]], message_id)
+
+
+def artifacts_screen(chat_id: int, message_id: int | None = None) -> int:
+    try:
+        data = gh("GET", "/actions/artifacts?per_page=20") or {}
+        items = [a for a in data.get("artifacts", []) if not a.get("expired")]
+    except Exception:
+        items = []
+    if not items:
+        text = "<b>📦 خروجی‌ها</b>\n\nخروجی‌ای پیدا نشد."
+    else:
+        lines = ["<b>📦 خروجی‌ها</b>", ""]
+        for item in items[:15]:
+            lines.append(f"• <code>{esc(item.get('id'))}</code> — {esc(item.get('name'))}")
+        text = "\n".join(lines)
+    return show(chat_id, text, [[("🔄 تازه‌سازی", "artifacts"), ("🏠 خانه", "home")]], message_id)
+
+
+def model_test_menu(chat_id: int, message_id: int | None = None) -> int:
+    rows = model_rows()
+    if not rows:
+        return show(chat_id, "<b>🧪 تست اتصال</b>\n\nاول یک مدل اضافه کن.", [[("🤖 مدل‌ها", "models")]], message_id)
+    buttons = [[(f"🧪 {row['name']}", f"test_model:{row['id']}")] for row in rows]
+    buttons.append([("◀️ مدل‌ها", "models")])
+    return show(
+        chat_id,
+        "<b>🧪 تست اتصال مدل</b>\n\nاین گزینه یک درخواست بسیار کوتاه به API مدل می‌فرستد. اگر ✅ بگیریم یعنی URL، Token و Model ID پاسخ داده‌اند. هیچ تحلیل TradingAgents اجرا نمی‌شود.",
+        buttons,
+        message_id,
+    )
+
+
+def model_delete_menu(chat_id: int, message_id: int | None = None) -> int:
+    rows = model_rows()
+    buttons = [[(f"🗑 {row['name']}", f"delete_model:{row['id']}")] for row in rows]
+    buttons.append([("◀️ مدل‌ها", "models")])
+    return show(chat_id, "<b>🗑 حذف مدل</b>\n\nمدل موردنظر را انتخاب کن.", buttons, message_id)
+
+
+# ---------- Guided execution ----------
+def flow_save(chat_id: int, kind: str, stage: str, **values: Any) -> None:
+    current = FLOWS.get(chat_id, {})
+    current.update(values)
+    current.update({"kind": kind, "stage": stage})
+    FLOWS[chat_id] = current
+
+
+def flow_clear(chat_id: int) -> None:
+    FLOWS.pop(chat_id, None)
+
+
+def analysis_prompt(chat_id: int, message_id: int | None = None) -> int:
+    flow_clear(chat_id)
+    flow_save(chat_id, "analysis", "ticker", analysts="market,social,news,fundamentals")
+    return show(
+        chat_id,
+        "<b>🔎 تحلیل جدید</b>\n\n<b>مرحله 1 از 2</b>\nTicker را بفرست.\nمثال: <code>NVDA</code>",
+        [[("❌ لغو", "flow_cancel")]],
+        message_id,
+    )
+
+
+def backtest_prompt(chat_id: int, message_id: int | None = None) -> int:
+    flow_clear(chat_id)
+    flow_save(chat_id, "backtest", "tickers", every=7, analysts="market,social,news,fundamentals")
+    return show(
+        chat_id,
+        "<b>📈 بک‌تست</b>\n\n<b>مرحله 1 از 3</b>\nTicker یا چند Ticker را بفرست.\nمثال: <code>NVDA,AAPL</code>",
+        [[("❌ لغو", "flow_cancel")]],
+        message_id,
+    )
+
+
+def analysis_summary(chat_id: int, message_id: int) -> int:
+    data = FLOWS[chat_id]
+    ticker = data["ticker"]
+    analysts = data.get("analysts", "")
+    names = {"market": "Market", "social": "Sentiment", "news": "News", "fundamentals": "Fundamentals"}
+    chosen = ", ".join(names[x] for x in analysts.split(",") if x in names) or "هیچ‌کدام"
+    return show(
+        chat_id,
+        f"<b>✅ آماده اجرا</b>\n\nTicker: <code>{esc(ticker)}</code>\nتاریخ: <code>{esc(data['date'])}</code>\nتحلیلگران: <b>{esc(chosen)}</b>\n\nمدل فعال هم به‌صورت خودکار استفاده می‌شود.",
+        [
+            [("🚀 شروع تحلیل", "analysis_run"), ("🎛 تحلیلگران", "analysis_analysts")],
+            [("📅 تغییر تاریخ", "analysis_change_date")],
+            [("❌ لغو", "flow_cancel")],
+        ],
+        message_id,
+    )
+
+
+def backtest_summary(chat_id: int, message_id: int) -> int:
+    data = FLOWS[chat_id]
+    names = {"market": "Market", "social": "Sentiment", "news": "News", "fundamentals": "Fundamentals"}
+    chosen = ", ".join(names[x] for x in data.get("analysts", "").split(",") if x in names) or "هیچ‌کدام"
+    return show(
+        chat_id,
+        f"<b>✅ آماده اجرا</b>\n\nTickerها: <code>{esc(data['tickers'])}</code>\nشروع: <code>{esc(data['start'])}</code>\nپایان: <code>{esc(data['end'])}</code>\nفاصله: <b>هر {int(data.get('every', 7))} روز</b>\nتحلیلگران: <b>{esc(chosen)}</b>",
+        [
+            [("🚀 شروع بک‌تست", "backtest_run"), ("📅 فاصله", "backtest_every")],
+            [("🎛 تحلیلگران", "backtest_analysts")],
+            [("❌ لغو", "flow_cancel")],
+        ],
+        message_id,
+    )
+
+
+def analyst_picker(chat_id: int, message_id: int, backtest: bool = False) -> int:
+    data = FLOWS[chat_id]
+    selected = set(filter(None, data.get("analysts", "").split(",")))
+    allowed = ["market", "social", "news", "fundamentals"]
+    ticker = data.get("ticker", "")
+    if ticker and is_crypto(ticker):
+        allowed.remove("fundamentals")
+        selected.discard("fundamentals")
+        data["analysts"] = ",".join(x for x in allowed if x in selected)
+
+    labels = {"market": "📊 Market", "social": "💬 Sentiment", "news": "📰 News", "fundamentals": "💰 Fundamentals"}
+    rows = []
+    for i in range(0, len(allowed), 2):
+        pair = allowed[i:i + 2]
+        rows.append([(("✅ " if x in selected else "") + labels[x], f"toggle_analyst:{x}") for x in pair])
+    rows += [[("✅ استفاده از انتخاب", "analysts_done")], [("❌ لغو", "flow_cancel")]]
+    flow_save(chat_id, "backtest" if backtest else "analysis", "analysts")
+    return show(chat_id, "<b>🎛 تحلیلگران</b>\n\nموردهای انتخاب‌شده با ✅ مشخص‌اند.", rows, message_id)
+
+
+def every_picker(chat_id: int, message_id: int) -> int:
+    rows = [
+        [("📅 هر 1 روز", "every:1"), ("📅 هر 7 روز", "every:7")],
+        [("📅 هر 14 روز", "every:14"), ("📅 هر 30 روز", "every:30")],
+        [("◀️ بازگشت", "backtest_summary")],
+    ]
+    return show(chat_id, "<b>📅 فاصله بک‌تست</b>\n\nپیش‌فرض <b>7 روز</b> است.", rows, message_id)
+
+
+def finish_flow(chat_id: int, message_id: int) -> None:
+    data = FLOWS.get(chat_id)
+    if not data:
+        raise ValueError("این مرحله دیگر فعال نیست؛ دوباره از اجرای جدید شروع کن.")
+
+    mode = data["kind"]
+    if mode == "analysis":
+        params = {
+            "ticker": data["ticker"],
+            "date": data["date"],
+            "analysts": data.get("analysts", ""),
+        }
+    else:
+        params = {
+            "tickers": data["tickers"],
+            "start": data["start"],
+            "end": data["end"],
+            "every": int(data.get("every", 7)),
+            "analysts": data.get("analysts", ""),
+        }
+
+    request_id, model_id = dispatch_run(chat_id, mode, params)
+    model = DB.execute("SELECT name FROM models WHERE id=?", (model_id,)).fetchone()
+    flow_clear(chat_id)
+    label = "تحلیل" if mode == "analysis" else "بک‌تست"
+    show(
+        chat_id,
+        f"<b>🚀 {label} در صف اجرا قرار گرفت</b>\n\nشناسه: <code>{esc(request_id)}</code>\nمدل: <b>{esc(model['name'] if model else model_id)}</b>\n\nبرای مشاهده فقط «اجراهای جاری» یا «تاریخچه» را باز کن.",
+        [[("📊 اجراهای جاری", "active_runs"), ("📜 تاریخچه", "history")], [("🏠 خانه", "home")]],
+        message_id,
+    )
+
+
+def handle_flow_text(chat_id: int, text: str, message_id: int) -> bool:
+    data = FLOWS.get(chat_id)
+    if not data:
+        return False
+    try:
+        if data["kind"] == "analysis":
+            if data["stage"] == "ticker":
+                data["ticker"] = valid_ticker(text)
+                flow_save(chat_id, "analysis", "date")
+                show(chat_id, "<b>مرحله 2 از 2</b>\nتاریخ تحلیل را بفرست یا دکمه «امروز» را بزن.", [[("📅 امروز", "analysis_today"), ("❌ لغو", "flow_cancel")]], message_id)
                 return True
-            if w["stage"]=="date":
-                data["date"]=valid_date(text)
-                flow_prompt(chat,uid,"analysis","analysts","<b>3 از 3</b> — نوع تحلیل را انتخاب کن.",data,mid,[[('🧠 همه تحلیلگران','flow_analysis_all')],[('🎯 انتخاب تحلیلگران','flow_analysis_pick')],[('❌ لغو','flow_cancel')]])
+            if data["stage"] == "date":
+                data["date"] = valid_date(text)
+                analysis_summary(chat_id, message_id)
                 return True
-        if w["kind"]=="backtest":
-            if w["stage"]=="tickers":
-                parts=[x.strip().upper().replace("$","") for x in text.replace(","," ").split() if x.strip()]
-                if not parts: raise ValueError("حداقل یک نماد وارد کن؛ مثلاً NVDA,AAPL")
-                data["tickers"]=",".join(dict.fromkeys(parts))
-                flow_prompt(chat,uid,"backtest","start","<b>2 از 4</b> — تاریخ شروع را بفرست.\nمثال: <code>2026-01-01</code>",data,mid)
+            if data["stage"] == "analysts":
                 return True
-            if w["stage"]=="start":
-                data["start"]=valid_date(text)
-                flow_prompt(chat,uid,"backtest","end","<b>3 از 4</b> — تاریخ پایان را بفرست.\nمثال: <code>2026-09-30</code>",data,mid)
+
+        if data["kind"] == "backtest":
+            if data["stage"] == "tickers":
+                data["tickers"] = valid_ticker(text, allow_many=True)
+                flow_save(chat_id, "backtest", "start")
+                show(chat_id, "<b>مرحله 2 از 3</b>\nتاریخ شروع را بفرست.\nمثال: <code>2026-01-01</code>", [[("❌ لغو", "flow_cancel")]], message_id)
                 return True
-            if w["stage"]=="end":
-                data["end"]=valid_date(text)
-                if data["end"] < data["start"]: raise ValueError("تاریخ پایان باید بعد از تاریخ شروع باشد.")
-                flow_prompt(chat,uid,"backtest","every","<b>4 از 4</b> — فاصله تحلیل‌ها را انتخاب کن.",data,mid,[[('📅 هر 1 روز','flow_every:1'),('📅 هر 7 روز','flow_every:7')],[('📅 هر 14 روز','flow_every:14'),('📅 هر 30 روز','flow_every:30')],[('❌ لغو','flow_cancel')]])
+            if data["stage"] == "start":
+                data["start"] = valid_date(text)
+                flow_save(chat_id, "backtest", "end")
+                show(chat_id, "<b>مرحله 3 از 3</b>\nتاریخ پایان را بفرست.", [[("📅 امروز", "backtest_today"), ("❌ لغو", "flow_cancel")]], message_id)
                 return True
-    except Exception as e:
-        edit(chat,mid,f"❌ {esc(e)}\n\nدوباره همین مرحله را وارد کن.",kb([[('❌ لغو','flow_cancel')]]))
+            if data["stage"] == "end":
+                data["end"] = valid_date(text)
+                if data["end"] < data["start"]:
+                    raise ValueError("تاریخ پایان باید بعد از شروع باشد.")
+                backtest_summary(chat_id, message_id)
+                return True
+    except ValueError as exc:
+        show(chat_id, f"<b>⚠️ ورودی درست نیست</b>\n\n{esc(exc)}\n\nهمین مرحله را دوباره وارد کن.", [[("❌ لغو", "flow_cancel")]], message_id)
+        return True
     return True
 
-# ---------- model wizard ----------
-def wrow(chat): return DB.execute("SELECT * FROM wizard WHERE chat_id=?",(chat,)).fetchone()
-def wsave(chat,uid,stage,base_url="",token="",model_name="",provider="openai_compatible",mid=None):
-    db("INSERT INTO wizard(chat_id,user_id,stage,base_url,token,model_name,provider,prompt_message_id,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET user_id=excluded.user_id,stage=excluded.stage,base_url=excluded.base_url,token=excluded.token,model_name=excluded.model_name,provider=excluded.provider,prompt_message_id=excluded.prompt_message_id,updated_at=excluded.updated_at",(chat,uid,stage,base_url,token,model_name,provider,mid,now()))
-def wclear(chat): db("DELETE FROM wizard WHERE chat_id=?",(chat,))
-def wprompt(chat,uid,stage,text,base_url="",token="",model_name="",provider="openai_compatible",mid=None):
-    buttons=[[{"text":"❌ لغو","callback_data":"wizard_cancel"}]]
-    if mid:
-        edit(chat,mid,text,buttons); wsave(chat,uid,stage,base_url,token,model_name,provider,mid); return mid
-    n=int(send(chat,text,buttons)["message_id"]); wsave(chat,uid,stage,base_url,token,model_name,provider,n); return n
 
-def start_wizard(chat,uid,mid=None):
-    return wprompt(chat,uid,"base_url","<b>➕ افزودن مدل</b>\n\n1/3 — Base URL را بفرست.\nمثال: <code>https://integrate.api.nvidia.com/v1</code>\nاگر لازم نیست: <code>-</code>",mid=mid)
+# ---------- Model wizard ----------
+def wizard_start(chat_id: int, message_id: int) -> int:
+    WIZARDS[chat_id] = {"stage": "url"}
+    return show(
+        chat_id,
+        "<b>➕ افزودن مدل</b>\n\n<b>1 از 3 — Base URL</b>\nلینک پایه API را بفرست.\nمثال: <code>https://integrate.api.nvidia.com/v1</code>\n\nلازم نیست Provider را انتخاب کنی؛ از روی URL تشخیص داده می‌شود.",
+        [[("❌ لغو", "wizard_cancel")]],
+        message_id,
+    )
 
-def finish_model(chat,w,provider):
-    name=w["model_name"].strip(); url="" if w["base_url"]=="-" else w["base_url"].strip(); token=w["token"].strip()
-    if not name or not token: raise ValueError("Model name و Token الزامی هستند.")
-    if provider not in PROVIDER_SECRET and provider not in NO_KEY: provider="openai_compatible"
-    if provider not in PROVIDER_SECRET: raise ValueError("این نسخه برای Bedrock/Ollama نیاز به تنظیمات اختصاصی دارد؛ فعلاً OpenAI-compatible را انتخاب کن.")
-    mid="m_"+uuid.uuid4().hex[:10]; ts=now()
-    db("INSERT INTO models(id,name,provider,model,base_url,region,token_ciphertext,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,1,?,?)",(mid,name,provider,name,url,"",encrypt_token(token),ts,ts))
-    github_secret(PROVIDER_SECRET[provider],token); github_secret("TRADINGAGENTS_LLM_PROVIDER",provider); github_secret("TRADINGAGENTS_DEEP_THINK_LLM",name); github_secret("TRADINGAGENTS_QUICK_THINK_LLM",name); github_secret("TRADINGAGENTS_LLM_BACKEND_URL",url); github_secret("TRADINGAGENTS_CHECKPOINT_ENABLED","true")
-    set_active(mid); wclear(chat)
-    edit(chat,w["prompt_message_id"],f"✅ <b>مدل آماده و فعال شد</b>\nمدل: <code>{esc(name)}</code>\nProvider: <code>{esc(provider)}</code>",kb([[("▶️ اجرا","run"),("🧪 تست","tests")],[("🤖 مدل‌ها","models")]]))
 
-def handle_wizard(message):
-    chat=int(message["chat"]["id"]); uid=int(message["from"]["id"]); w=wrow(chat)
-    if not w: return False
-    if w["user_id"]!=uid or not admin(uid): return False
-    text=(message.get("text") or "").strip(); mid=w["prompt_message_id"]
-    if not text: return True
+def wizard_prompt_token(chat_id: int, message_id: int) -> int:
+    return show(chat_id, "<b>2 از 3 — API Token</b>\nتوکن را بفرست.", [[("❌ لغو", "wizard_cancel")]], message_id)
+
+
+def wizard_prompt_model(chat_id: int, message_id: int) -> int:
+    return show(chat_id, "<b>3 از 3 — Model ID</b>\nنام دقیق مدل را دقیقاً همان‌طور که Provider اعلام کرده بفرست.", [[("❌ لغو", "wizard_cancel")]], message_id)
+
+
+def wizard_confirm(chat_id: int, message_id: int) -> int:
+    item = WIZARDS[chat_id]
+    return show(
+        chat_id,
+        f"<b>🔎 بررسی نهایی</b>\n\nProvider: <code>{esc(item['provider'])}</code>\nModel: <code>{esc(item['model'])}</code>\nBase URL: <code>{esc(item['url'])}</code>\n\nهمه‌چیز را بررسی کردی؟",
+        [[("✅ ذخیره و فعال‌سازی", "wizard_save")], [("✏️ اصلاح URL", "wizard_edit_url"), ("✏️ اصلاح Model", "wizard_edit_model")], [("❌ لغو", "wizard_cancel")]],
+        message_id,
+    )
+
+
+def handle_wizard_text(chat_id: int, text: str, message_id: int) -> bool:
+    item = WIZARDS.get(chat_id)
+    if not item:
+        return False
     try:
-        if w["stage"]=="base_url":
-            url="" if text=="-" else text
-            if url and not url.startswith(("http://","https://")): raise ValueError("Base URL باید با http:// یا https:// شروع شود.")
-            p=infer_provider(url) if url else "openai_compatible"; wprompt(chat,uid,"token","<b>2/3 — Token</b>\nتوکن API را بفرست.",url,provider=p,mid=mid); return True
-        if w["stage"]=="token":
-            if len(text)<3: raise ValueError("Token معتبر نیست.")
-            wprompt(chat,uid,"model_name","<b>3/3 — Model name</b>\nنام دقیق مدل را بفرست.",w["base_url"],text,provider=w["provider"],mid=mid); return True
-        if w["stage"]=="model_name":
-            wsave(chat,uid,"confirm",w["base_url"],w["token"],text,w["provider"],mid)
-            buttons=[[ ("⚡ OpenAI-compatible","provider:openai_compatible") ],[("OpenAI","provider:openai"),("Anthropic","provider:anthropic")],[("Google","provider:google"),("DeepSeek","provider:deepseek")],[("NVIDIA","provider:nvidia"),("OpenRouter","provider:openrouter")],[("❌ لغو","wizard_cancel")]]
-            edit(chat,mid,f"<b>Provider</b>\nمدل: <code>{esc(text)}</code>\n\nانتخاب کن:",kb(buttons)); return True
-    except Exception as e:
-        edit(chat,mid,f"❌ {esc(e)}\n\nهمین مرحله را دوباره بفرست.",kb([[ ("❌ لغو","wizard_cancel") ]]))
+        stage = item["stage"]
+        if stage == "url":
+            item["url"] = normalize_base_url(text)
+            item["provider"] = infer_provider(item["url"])
+            item["stage"] = "token"
+            wizard_prompt_token(chat_id, message_id)
+            return True
+        if stage == "token":
+            if len(text.strip()) < 3:
+                raise ValueError("Token خیلی کوتاه است.")
+            item["token"] = text.strip()
+            item["stage"] = "model"
+            wizard_prompt_model(chat_id, message_id)
+            return True
+        if stage == "model":
+            if not text.strip():
+                raise ValueError("Model ID نمی‌تواند خالی باشد.")
+            item["model"] = text.strip()
+            model_id = add_model(item["model"], item["provider"], item["url"], item["token"])
+            WIZARDS.pop(chat_id, None)
+            show(
+                chat_id,
+                f"<b>✅ مدل ذخیره و فعال شد</b>\n\nModel: <code>{esc(item['model'])}</code>\nProvider: <code>{esc(item['provider'])}</code>\n\nاکنون آماده اجراست.",
+                [[("🧪 تست اتصال", f"test_model:{model_id}")], [("🚀 اجرای جدید", "run"), ("🏠 خانه", "home")]],
+                message_id,
+            )
+            return True
+    except ValueError as exc:
+        show(chat_id, f"<b>⚠️ {esc(exc)}</b>", [[("❌ لغو", "wizard_cancel")]], message_id)
+        return True
     return True
 
-# ---------- commands/callbacks ----------
-def command(message):
-    chat=int(message["chat"]["id"]); uid=int(message["from"]["id"]); text=(message.get("text") or "").strip()
-    if not authorized(uid): return
+
+# ---------- Update handling ----------
+def handle_message(message: dict[str, Any]) -> None:
+    chat_id = int(message["chat"]["id"])
+    user_id = int(message["from"]["id"])
+    text = (message.get("text") or "").strip()
+    if not authorized(user_id):
+        return
+
+    mid = ui_message(chat_id)
     if text.startswith("/start"):
-        flow_clear(chat); wclear(chat); main_menu(chat); return
-    if handle_wizard(message): return
-    if handle_flow(message): return
-    # Backward-compatible commands; the normal UI does not require them.
-    if text.startswith("/analyze"):
-        parts=text.split()
-        if len(parts)<3:
-            start_analysis_flow(chat,uid); return
-        try:
-            rid,mid=dispatch_run("analysis",ticker=parts[1],date=valid_date(parts[2]),analysts=parts[3] if len(parts)>3 else "")
-            send(chat,f"✅ تحلیل ارسال شد.\nشناسه: <code>{esc(rid)}</code>")
-        except Exception as e: send(chat,f"❌ <code>{esc(e)}</code>")
+        WIZARDS.pop(chat_id, None)
+        flow_clear(chat_id)
+        home(chat_id, mid)
         return
-    if text.startswith("/backtest"):
-        parts=text.split()
-        if len(parts)<4:
-            start_backtest_flow(chat,uid); return
-        try:
-            every=int(parts[4]) if len(parts)>4 else 7; analysts=parts[5] if len(parts)>5 else ""
-            rid,mid=dispatch_run("backtest",tickers=parts[1],start=valid_date(parts[2]),end=valid_date(parts[3]),every=every,analysts=analysts)
-            send(chat,f"✅ بک‌تست ارسال شد.\nشناسه: <code>{esc(rid)}</code>")
-        except Exception as e: send(chat,f"❌ <code>{esc(e)}</code>")
+    if handle_wizard_text(chat_id, text, mid or 0):
+        return
+    if handle_flow_text(chat_id, text, mid or 0):
         return
 
-def callback(q):
-    uid=int(q.get("from",{}).get("id",0)); m=q.get("message") or {}; chat=int(m.get("chat",{}).get("id",uid)); mid=int(m.get("message_id",0)); data=q.get("data","")
-    if not authorized(uid): answer_cb(q["id"],"دسترسی مجاز نیست.",True); return
-    answer_cb(q["id"])
+    # Backward compatibility for users who already know the old commands.
+    if text.lower().startswith("/analyze"):
+        flow_save(chat_id, "analysis", "ticker", analysts="market,social,news,fundamentals")
+        parts = text.split()
+        if len(parts) >= 3:
+            FLOWS[chat_id]["ticker"] = valid_ticker(parts[1])
+            FLOWS[chat_id]["date"] = valid_date(parts[2])
+            analysis_summary(chat_id, mid or analysis_prompt(chat_id))
+        else:
+            analysis_prompt(chat_id, mid or 0)
+        return
+
+    if text.lower().startswith("/backtest"):
+        parts = text.split()
+        if len(parts) >= 4:
+            flow_save(chat_id, "backtest", "end", every=7, analysts="market,social,news,fundamentals")
+            FLOWS[chat_id].update({"tickers": valid_ticker(parts[1], True), "start": valid_date(parts[2]), "end": valid_date(parts[3])})
+            if FLOWS[chat_id]["end"] < FLOWS[chat_id]["start"]:
+                raise ValueError("تاریخ پایان باید بعد از شروع باشد.")
+            backtest_summary(chat_id, mid or backtest_prompt(chat_id))
+        else:
+            backtest_prompt(chat_id, mid or 0)
+
+
+# ---------- Callback handling ----------
+def callback(query: dict[str, Any]) -> None:
+    user_id = int(query.get("from", {}).get("id", 0))
+    if not authorized(user_id):
+        answer_callback(query["id"], "دسترسی مجاز نیست.", True)
+        return
+    answer_callback(query["id"])
+
+    message = query.get("message") or {}
+    chat_id = int(message.get("chat", {}).get("id", user_id))
+    message_id = int(message.get("message_id", ui_message(chat_id) or 0))
+    data = query.get("data", "")
+
     try:
-        if data=="home": main_menu(chat,mid)
-        elif data=="models": model_menu(chat,mid)
-        elif data=="add":
-            if admin(uid): start_wizard(chat,uid,mid)
-        elif data=="wizard_cancel": wclear(chat); main_menu(chat,mid)
-        elif data.startswith("provider:"):
-            w=wrow(chat)
-            if w and admin(uid) and w["stage"]=="confirm": finish_model(chat,w,data.split(":",1)[1])
-        elif data.startswith("activate:"): activate(data.split(":",1)[1]); model_menu(chat,mid)
-        elif data=="run": run_menu(chat,mid)
-        elif data=="new_analysis":
-            if not active_id(): raise ValueError("اول از بخش مدل‌ها یک مدل را فعال کن.")
-            start_analysis_flow(chat,uid,mid)
-        elif data=="new_backtest":
-            if not active_id(): raise ValueError("اول از بخش مدل‌ها یک مدل را فعال کن.")
-            start_backtest_flow(chat,uid,mid)
-        elif data=="flow_cancel": flow_clear(chat); main_menu(chat,mid)
-        elif data=="flow_analysis_all":
-            w=flow_row(chat); d=flow_data(w); d["analysts"]=""; flow_finish_analysis(chat,mid,d)
-        elif data=="flow_analysis_pick":
-            w=flow_row(chat); d=flow_data(w); flow_save(chat,uid,"analysis","pick_analysts",d,mid)
-            edit(chat,mid,"<b>انتخاب تحلیلگران</b>\nمی‌توانی چند مورد را انتخاب کنی؛ بعد «شروع تحلیل» را بزن.",kb([[('📊 Market','pick:market'),('📰 News','pick:news')],[('💬 Sentiment','pick:sentiment'),('💰 Fundamentals','pick:fundamentals')],[('🚀 شروع تحلیل','flow_analysis_start')],[('❌ لغو','flow_cancel')]]))
-        elif data.startswith("pick:"):
-            w=flow_row(chat); d=flow_data(w); chosen=d.get("analysts",[]); a=data.split(":",1)[1];
-            if not isinstance(chosen,list): chosen=[]
-            if a in chosen: chosen.remove(a)
-            else: chosen.append(a)
-            d["analysts"]=chosen; flow_save(chat,uid,"analysis","pick_analysts",d,mid)
-            labels={'market':'📊 Market','news':'📰 News','sentiment':'💬 Sentiment','fundamentals':'💰 Fundamentals'}
-            rows=[[((('✅ ' if x in chosen else '')+labels[x]),f'pick:{x}') for x in ('market','news')],[((('✅ ' if x in chosen else '')+labels[x]),f'pick:{x}') for x in ('sentiment','fundamentals')],[('🚀 شروع تحلیل','flow_analysis_start')],[('❌ لغو','flow_cancel')]]
-            edit(chat,mid,"<b>انتخاب تحلیلگران</b>\nموارد انتخاب‌شده علامت ✅ دارند.",kb(rows))
-        elif data=="flow_analysis_start":
-            w=flow_row(chat); d=flow_data(w);
-            chosen=d.get("analysts",[]); d["analysts"]=','.join(chosen) if isinstance(chosen,list) else str(chosen or '')
-            if not d["analysts"]: raise ValueError("حداقل یک تحلیلگر انتخاب کن یا «همه تحلیلگران» را بزن.")
-            flow_finish_analysis(chat,mid,d)
-        elif data.startswith("flow_every:"):
-            w=flow_row(chat); d=flow_data(w); d["every"]=int(data.split(":",1)[1]); d["analysts"]="";
-            flow_finish_backtest(chat,mid,d)
-        elif data=="sample":
-            rid,mm=dispatch_run("analysis",ticker="AAPL",date=dt.date.today().isoformat(),analysts="market")
-            edit(chat,mid,f"✅ اجرای نمونه ارسال شد.\nRequest: <code>{rid}</code>",kb([[("📊 وضعیت","status"),("◀️ خانه","home")]]))
-        elif data=="status": menu(chat,status_text(),[[("🔄 تازه‌سازی","status"),("◀️ خانه","home")]],mid)
-        elif data=="history": history_menu(chat,mid)
-        elif data=="artifacts": artifacts_menu(chat,mid)
-        elif data=="tests": test_menu(chat,mid)
-        elif data.startswith("test:"):
-            activate(data.split(":",1)[1]); rid,mm=dispatch_run("analysis",ticker="AAPL",date=dt.date.today().isoformat(),analysts="market"); send(chat,f"🧪 تست ارسال شد.\nRequest: <code>{rid}</code>\nمدل: <code>{esc(mm)}</code>")
-        elif data=="delmenu": delete_menu(chat,mid)
-        elif data.startswith("delete:"):
-            if not admin(uid): return
-            model_id=data.split(":",1)[1]; db("UPDATE models SET enabled=0,updated_at=? WHERE id=?",(now(),model_id))
-            if active_id()==model_id: db("DELETE FROM settings WHERE key='active_model'")
-            model_menu(chat,mid)
-    except Exception as e:
-        try: edit(chat,mid,f"❌ {esc(e)}",kb([[ ("◀️ خانه","home") ]]))
-        except Exception: send(chat,f"❌ <code>{esc(e)}</code>")
+        if data == "home":
+            WIZARDS.pop(chat_id, None)
+            flow_clear(chat_id)
+            home(chat_id, message_id)
+            return
+        if data == "run":
+            if not active_model_id():
+                model_screen(chat_id, message_id)
+            else:
+                run_menu(chat_id, message_id)
+            return
+        if data == "models":
+            model_screen(chat_id, message_id)
+            return
+        if data == "active_runs":
+            active_runs_screen(chat_id, message_id)
+            return
+        if data == "history":
+            history_screen(chat_id, message_id)
+            return
+        if data == "artifacts":
+            artifacts_screen(chat_id, message_id)
+            return
 
-def poll():
-    if not BOT_TOKEN: raise SystemExit("TELEGRAM_BOT_TOKEN is required")
-    if not GH_TOKEN: raise SystemExit("BOT_GITHUB_TOKEN is required")
-    if not ADMIN_IDS and not ALLOWED_IDS: raise SystemExit("TELEGRAM_ADMIN_IDS or TELEGRAM_ALLOWED_USER_IDS is required")
-    offset=0; me=tg("getMe"); print(f"TradingAgents bot started @{me.get('username','')}",flush=True)
+        if data == "model_add":
+            if not admin(user_id):
+                raise ValueError("فقط Admin می‌تواند مدل اضافه کند.")
+            wizard_start(chat_id, message_id)
+            return
+        if data == "wizard_cancel":
+            WIZARDS.pop(chat_id, None)
+            model_screen(chat_id, message_id)
+            return
+        if data == "wizard_edit_url":
+            item = WIZARDS.get(chat_id)
+            if item:
+                item["stage"] = "url"
+                show(chat_id, "<b>اصلاح Base URL</b>\n\nURL جدید را بفرست.", [[("❌ لغو", "wizard_cancel")]], message_id)
+            return
+        if data == "wizard_edit_model":
+            item = WIZARDS.get(chat_id)
+            if item:
+                item["stage"] = "model"
+                show(chat_id, "<b>اصلاح Model ID</b>\n\nنام دقیق مدل را بفرست.", [[("❌ لغو", "wizard_cancel")]], message_id)
+            return
+        if data == "wizard_save":
+            raise ValueError("این مرحله دیگر استفاده نمی‌شود؛ بعد از وارد کردن Model ID ذخیره به‌صورت خودکار انجام می‌شود.")
+        if data == "model_test_menu":
+            model_test_menu(chat_id, message_id)
+            return
+        if data.startswith("test_model:"):
+            model_id = data.split(":", 1)[1]
+            row = DB.execute("SELECT * FROM models WHERE id=? AND enabled=1", (model_id,)).fetchone()
+            if not row:
+                raise ValueError("مدل پیدا نشد.")
+            try:
+                elapsed = post_model_test(row)
+            except Exception as exc:
+                code = http_error_code(exc)
+                detail = f"HTTP {code}" if code else "پاسخ معتبر از API دریافت نشد"
+                show(chat_id, f"<b>❌ تست ناموفق</b>\n\nمدل: <code>{esc(row['name'])}</code>\n{esc(detail)}\n\nTradingAgents اجرا نشد.", [[("🧪 تست دوباره", f"test_model:{model_id}"), ("◀️ مدل‌ها", "models")]], message_id)
+                return
+            show(chat_id, f"<b>✅ تست موفق</b>\n\nمدل: <code>{esc(row['name'])}</code>\nProvider: <code>{esc(row['provider'])}</code>\nزمان پاسخ: <b>{elapsed:.1f}s</b>\n\nAPI پاسخ داده؛ هیچ تحلیل TradingAgents اجرا نشد.", [[("🧪 تست دوباره", f"test_model:{model_id}"), ("◀️ مدل‌ها", "models")]], message_id)
+            return
+        if data.startswith("activate:"):
+            model_id = data.split(":", 1)[1]
+            row = DB.execute("SELECT * FROM models WHERE id=? AND enabled=1", (model_id,)).fetchone()
+            if not row:
+                raise ValueError("مدل پیدا نشد.")
+            write_active_model_secrets(row)
+            set_active_model(model_id)
+            model_screen(chat_id, message_id)
+            return
+        if data == "model_delete_menu":
+            if not admin(user_id):
+                raise ValueError("فقط Admin می‌تواند مدل حذف کند.")
+            model_delete_menu(chat_id, message_id)
+            return
+        if data.startswith("delete_model:"):
+            if not admin(user_id):
+                raise ValueError("فقط Admin می‌تواند مدل حذف کند.")
+            model_id = data.split(":", 1)[1]
+            db("UPDATE models SET enabled=0,updated_at=? WHERE id=?", (now(), model_id))
+            if active_model_id() == model_id:
+                set_setting("active_model", "")
+            model_screen(chat_id, message_id)
+            return
+
+        if data == "flow_analysis_start":
+            if not active_model_id():
+                raise ValueError("اول یک مدل فعال کن.")
+            analysis_prompt(chat_id, message_id)
+            return
+        if data == "flow_backtest_start":
+            if not active_model_id():
+                raise ValueError("اول یک مدل فعال کن.")
+            backtest_prompt(chat_id, message_id)
+            return
+        if data == "flow_cancel":
+            flow_clear(chat_id)
+            WIZARDS.pop(chat_id, None)
+            home(chat_id, message_id)
+            return
+        if data == "analysis_today":
+            data2 = FLOWS.get(chat_id)
+            if not data2 or data2.get("kind") != "analysis":
+                raise ValueError("این مرحله منقضی شده است.")
+            data2["date"] = dt.date.today().isoformat()
+            analysis_summary(chat_id, message_id)
+            return
+        if data == "backtest_today":
+            data2 = FLOWS.get(chat_id)
+            if not data2 or data2.get("kind") != "backtest":
+                raise ValueError("این مرحله منقضی شده است.")
+            data2["end"] = dt.date.today().isoformat()
+            if data2["end"] < data2["start"]:
+                raise ValueError("امروز قبل از تاریخ شروع است.")
+            backtest_summary(chat_id, message_id)
+            return
+        if data == "analysis_change_date":
+            data2 = FLOWS.get(chat_id)
+            if not data2:
+                raise ValueError("این مرحله منقضی شده است.")
+            data2["stage"] = "date"
+            show(chat_id, "تاریخ جدید را بفرست یا «امروز» را بزن.", [[("📅 امروز", "analysis_today"), ("❌ لغو", "flow_cancel")]], message_id)
+            return
+        if data == "analysis_analysts":
+            analyst_picker(chat_id, message_id, backtest=False)
+            return
+        if data == "backtest_analysts":
+            analyst_picker(chat_id, message_id, backtest=True)
+            return
+        if data.startswith("toggle_analyst:"):
+            data2 = FLOWS.get(chat_id)
+            if not data2:
+                raise ValueError("این مرحله منقضی شده است.")
+            key = data.split(":", 1)[1]
+            selected = set(filter(None, data2.get("analysts", "").split(",")))
+            if key in selected:
+                selected.remove(key)
+            else:
+                selected.add(key)
+            order = ["market", "social", "news", "fundamentals"]
+            data2["analysts"] = ",".join(x for x in order if x in selected)
+            analyst_picker(chat_id, message_id, data2.get("kind") == "backtest")
+            return
+        if data == "analysts_done":
+            data2 = FLOWS.get(chat_id)
+            if not data2:
+                raise ValueError("این مرحله منقضی شده است.")
+            if not data2.get("analysts"):
+                raise ValueError("حداقل یک تحلیلگر انتخاب کن.")
+            if data2["kind"] == "analysis":
+                data2["stage"] = "date_done"
+                analysis_summary(chat_id, message_id)
+            else:
+                data2["stage"] = "summary"
+                backtest_summary(chat_id, message_id)
+            return
+        if data == "backtest_every":
+            every_picker(chat_id, message_id)
+            return
+        if data.startswith("every:"):
+            data2 = FLOWS.get(chat_id)
+            if not data2:
+                raise ValueError("این مرحله منقضی شده است.")
+            data2["every"] = int(data.split(":", 1)[1])
+            backtest_summary(chat_id, message_id)
+            return
+        if data == "backtest_summary":
+            backtest_summary(chat_id, message_id)
+            return
+        if data == "analysis_run":
+            finish_flow(chat_id, message_id)
+            return
+        if data == "backtest_run":
+            finish_flow(chat_id, message_id)
+            return
+
+    except Exception as exc:
+        show(chat_id, f"<b>❌ خطا</b>\n\n{esc(exc)}", [[("🏠 خانه", "home")]], message_id)
+
+
+# ---------- Polling ----------
+def get_last_update_id() -> int:
+    value = get_setting("last_update_id", "")
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
+
+def set_last_update_id(value: int) -> None:
+    set_setting("last_update_id", str(value))
+
+
+def poll() -> None:
+    if not BOT_TOKEN:
+        raise SystemExit("TELEGRAM_BOT_TOKEN is required")
+    if not GH_TOKEN:
+        raise SystemExit("BOT_GITHUB_TOKEN is required")
+    if not ADMIN_IDS and not ALLOWED_IDS:
+        raise SystemExit("TELEGRAM_ADMIN_IDS or TELEGRAM_ALLOWED_USER_IDS is required")
+
+    me = tg("getMe")
+    print(f"TradingAgents controller started @{me.get('username', '')}", flush=True)
+    offset = get_last_update_id() + 1
+    conflict_started = 0.0
+
     while True:
         try:
-            updates=tg("getUpdates",{"offset":offset,"timeout":50,"allowed_updates":["message","callback_query"]}) or []
-            for u in updates:
-                offset=int(u["update_id"])+1
+            updates = tg(
+                "getUpdates",
+                {
+                    "offset": offset,
+                    "timeout": 50,
+                    "allowed_updates": ["message", "callback_query"],
+                },
+            ) or []
+            conflict_started = 0.0
+            for update in updates:
+                update_id = int(update["update_id"])
+                offset = max(offset, update_id + 1)
+                # Commit the cursor BEFORE handling the update. A restart can
+                # therefore never replay an already-accepted button/text event.
+                set_last_update_id(update_id)
                 try:
-                    if "callback_query" in u: callback(u["callback_query"])
-                    elif "message" in u: command(u["message"])
-                except Exception: traceback.print_exc()
-        except Exception as e:
-            print(f"Polling error: {e}",flush=True); time.sleep(5)
+                    if "callback_query" in update:
+                        callback(update["callback_query"])
+                    elif "message" in update:
+                        handle_message(update["message"])
+                except Exception:
+                    traceback.print_exc()
+        except Exception as exc:
+            message = str(exc)
+            # Telegram returns 409 when another controller owns getUpdates. Do
+            # not spin and spam the log; give the old instance time to exit.
+            if "409" in message or "Conflict" in message:
+                if not conflict_started:
+                    conflict_started = time.monotonic()
+                    print("Another Telegram controller instance is active; waiting...", flush=True)
+                if time.monotonic() - conflict_started > 120:
+                    print("A second Telegram controller is still active; stopping this controller.", flush=True)
+                    return
+                time.sleep(10)
+            else:
+                print(f"Polling error: {message}", flush=True)
+                time.sleep(5)
 
-if __name__=="__main__": poll()
+
+if __name__ == "__main__":
+    poll()
