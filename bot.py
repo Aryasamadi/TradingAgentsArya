@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS wizard(
  base_url TEXT DEFAULT '', token TEXT DEFAULT '', model_name TEXT DEFAULT '',
  provider TEXT DEFAULT 'openai_compatible', prompt_message_id INTEGER, updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS flows(
+ chat_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, stage TEXT NOT NULL,
+ data_json TEXT NOT NULL DEFAULT '{}', prompt_message_id INTEGER, updated_at TEXT NOT NULL
+);
 """)
 DB.commit()
 try:
@@ -230,8 +234,9 @@ def model_menu(chat,message_id=None):
     return menu(chat,"\n".join(lines),buttons,message_id)
 
 def run_menu(chat,message_id=None):
-    return menu(chat,"<b>▶️ اجرا</b>\nبرای اجرای سریع از /analyze یا /backtest استفاده کن.",[
-        [("🧪 نمونه AAPL","sample")],[("📊 وضعیت","status"),("◀️ خانه","home")]
+    return menu(chat,"<b>▶️ اجرای جدید</b>\nفقط مرحله‌به‌مرحله جواب بده؛ نیازی به نوشتن دستور یا فرمت خاص نیست.",[
+        [("🔎 تحلیل جدید","new_analysis")],[("📈 بک‌تست جدید","new_backtest")],
+        [("📊 وضعیت","status"),("🏠 خانه","home")]
     ],message_id)
 
 def history_menu(chat,message_id=None):
@@ -252,6 +257,99 @@ def test_menu(chat,message_id=None):
 def delete_menu(chat,message_id=None):
     rs=models(); buttons=[[(f"🗑 {r['name']}",f"delete:{r['id']}")] for r in rs]; buttons.append([("◀️ مدل‌ها","models")])
     return menu(chat,"<b>حذف مدل</b>\nمدل را انتخاب کن:",buttons,message_id)
+
+# ---------- guided execution flow ----------
+def flow_row(chat):
+    return DB.execute("SELECT * FROM flows WHERE chat_id=?", (chat,)).fetchone()
+
+def flow_save(chat, uid, kind, stage, data=None, mid=None):
+    payload=json.dumps(data or {}, ensure_ascii=False)
+    db("INSERT INTO flows(chat_id,user_id,kind,stage,data_json,prompt_message_id,updated_at) VALUES(?,?,?,?,?,?,?) "
+       "ON CONFLICT(chat_id) DO UPDATE SET user_id=excluded.user_id,kind=excluded.kind,stage=excluded.stage,data_json=excluded.data_json,prompt_message_id=excluded.prompt_message_id,updated_at=excluded.updated_at",
+       (chat,uid,kind,stage,payload,mid,now()))
+
+def flow_clear(chat):
+    db("DELETE FROM flows WHERE chat_id=?", (chat,))
+
+def flow_data(w):
+    try: return json.loads(w["data_json"] or "{}")
+    except Exception: return {}
+
+def flow_prompt(chat,uid,kind,stage,text,data=None,mid=None,rows=None):
+    rows=rows or [[("❌ لغو","flow_cancel")]]
+    if mid:
+        edit(chat,mid,text,kb(rows)); flow_save(chat,uid,kind,stage,data,mid); return mid
+    n=int(send(chat,text,kb(rows))["message_id"]); flow_save(chat,uid,kind,stage,data,n); return n
+
+def valid_date(text):
+    text=text.strip().lower()
+    if text in ("today","امروز"):
+        return dt.date.today().isoformat()
+    try:
+        return dt.date.fromisoformat(text).isoformat()
+    except ValueError:
+        raise ValueError("تاریخ را به شکل YYYY-MM-DD بفرست؛ مثلاً 2026-09-30")
+
+def start_analysis_flow(chat,uid,mid=None):
+    flow_clear(chat)
+    return flow_prompt(chat,uid,"analysis","ticker",
+        "<b>🔎 تحلیل جدید</b>\n\n<b>1 از 3</b> — نماد را بفرست.\nمثال: <code>NVDA</code>",{},mid)
+
+def start_backtest_flow(chat,uid,mid=None):
+    flow_clear(chat)
+    return flow_prompt(chat,uid,"backtest","tickers",
+        "<b>📈 بک‌تست جدید</b>\n\n<b>1 از 4</b> — نماد یا نمادها را بفرست.\nمثال: <code>NVDA,AAPL</code>\nمی‌توانی با فاصله هم بنویسی.",{},mid)
+
+def flow_finish_analysis(chat,mid,data):
+    rid,model=dispatch_run("analysis",ticker=data["ticker"],date=data["date"],analysts=data.get("analysts", ""))
+    flow_clear(chat)
+    edit(chat,mid,
+         f"<b>🚀 تحلیل ارسال شد</b>\n\nنماد: <code>{esc(data['ticker'])}</code>\nتاریخ: <code>{esc(data['date'])}</code>\nمدل: <code>{esc(model)}</code>\nشناسه: <code>{esc(rid)}</code>",
+         kb([[('📊 وضعیت','status'),('📜 تاریخچه','history')],[('🏠 خانه','home')]]))
+
+def flow_finish_backtest(chat,mid,data):
+    rid,model=dispatch_run("backtest",tickers=data["tickers"],start=data["start"],end=data["end"],every=int(data.get("every",7)),analysts=data.get("analysts", ""))
+    flow_clear(chat)
+    edit(chat,mid,
+         f"<b>🚀 بک‌تست ارسال شد</b>\n\nنمادها: <code>{esc(data['tickers'])}</code>\nبازه: <code>{esc(data['start'])}</code> تا <code>{esc(data['end'])}</code>\nفاصله: <code>{esc(data.get('every',7))} روز</code>\nمدل: <code>{esc(model)}</code>\nشناسه: <code>{esc(rid)}</code>",
+         kb([[('📊 وضعیت','status'),('📜 تاریخچه','history')],[('🏠 خانه','home')]]))
+
+def handle_flow(message):
+    chat=int(message["chat"]["id"]); uid=int(message["from"]["id"]); w=flow_row(chat)
+    if not w or w["user_id"]!=uid or not authorized(uid): return False
+    text=(message.get("text") or "").strip(); mid=w["prompt_message_id"]; data=flow_data(w)
+    if not text: return True
+    try:
+        if w["kind"]=="analysis":
+            if w["stage"]=="ticker":
+                t=text.upper().replace("$","").strip()
+                if not t or any(c.isspace() for c in t): raise ValueError("فقط یک نماد وارد کن؛ مثلاً NVDA")
+                data["ticker"]=t
+                flow_prompt(chat,uid,"analysis","date","<b>2 از 3</b> — تاریخ تحلیل را بفرست.\nمثال: <code>2026-09-30</code> یا <code>امروز</code>",data,mid)
+                return True
+            if w["stage"]=="date":
+                data["date"]=valid_date(text)
+                flow_prompt(chat,uid,"analysis","analysts","<b>3 از 3</b> — نوع تحلیل را انتخاب کن.",data,mid,[[('🧠 همه تحلیلگران','flow_analysis_all')],[('🎯 انتخاب تحلیلگران','flow_analysis_pick')],[('❌ لغو','flow_cancel')]])
+                return True
+        if w["kind"]=="backtest":
+            if w["stage"]=="tickers":
+                parts=[x.strip().upper().replace("$","") for x in text.replace(","," ").split() if x.strip()]
+                if not parts: raise ValueError("حداقل یک نماد وارد کن؛ مثلاً NVDA,AAPL")
+                data["tickers"]=",".join(dict.fromkeys(parts))
+                flow_prompt(chat,uid,"backtest","start","<b>2 از 4</b> — تاریخ شروع را بفرست.\nمثال: <code>2026-01-01</code>",data,mid)
+                return True
+            if w["stage"]=="start":
+                data["start"]=valid_date(text)
+                flow_prompt(chat,uid,"backtest","end","<b>3 از 4</b> — تاریخ پایان را بفرست.\nمثال: <code>2026-09-30</code>",data,mid)
+                return True
+            if w["stage"]=="end":
+                data["end"]=valid_date(text)
+                if data["end"] < data["start"]: raise ValueError("تاریخ پایان باید بعد از تاریخ شروع باشد.")
+                flow_prompt(chat,uid,"backtest","every","<b>4 از 4</b> — فاصله تحلیل‌ها را انتخاب کن.",data,mid,[[('📅 هر 1 روز','flow_every:1'),('📅 هر 7 روز','flow_every:7')],[('📅 هر 14 روز','flow_every:14'),('📅 هر 30 روز','flow_every:30')],[('❌ لغو','flow_cancel')]])
+                return True
+    except Exception as e:
+        edit(chat,mid,f"❌ {esc(e)}\n\nدوباره همین مرحله را وارد کن.",kb([[('❌ لغو','flow_cancel')]]))
+    return True
 
 # ---------- model wizard ----------
 def wrow(chat): return DB.execute("SELECT * FROM wizard WHERE chat_id=?",(chat,)).fetchone()
@@ -304,23 +402,28 @@ def handle_wizard(message):
 def command(message):
     chat=int(message["chat"]["id"]); uid=int(message["from"]["id"]); text=(message.get("text") or "").strip()
     if not authorized(uid): return
-    if text.startswith("/start"): main_menu(chat); return
+    if text.startswith("/start"):
+        flow_clear(chat); wclear(chat); main_menu(chat); return
     if handle_wizard(message): return
+    if handle_flow(message): return
+    # Backward-compatible commands; the normal UI does not require them.
     if text.startswith("/analyze"):
-        p=text.split()
-        if len(p)<3: send(chat,"فرمت: <code>/analyze TICKER YYYY-MM-DD [analysts]</code>"); return
+        parts=text.split()
+        if len(parts)<3:
+            start_analysis_flow(chat,uid); return
         try:
-            rid,mid=dispatch_run("analysis",ticker=p[1],date=p[2],analysts=p[3] if len(p)>3 else "")
-            send(chat,f"✅ تحلیل در صف Engine قرار گرفت.\nمدل: <code>{esc(mid)}</code>\nRequest: <code>{rid}</code>")
+            rid,mid=dispatch_run("analysis",ticker=parts[1],date=valid_date(parts[2]),analysts=parts[3] if len(parts)>3 else "")
+            send(chat,f"✅ تحلیل ارسال شد.\nشناسه: <code>{esc(rid)}</code>")
         except Exception as e: send(chat,f"❌ <code>{esc(e)}</code>")
         return
     if text.startswith("/backtest"):
-        p=text.split()
-        if len(p)<4: send(chat,"فرمت: <code>/backtest NVDA,AAPL 2026-01-01 2026-09-30 7</code>"); return
+        parts=text.split()
+        if len(parts)<4:
+            start_backtest_flow(chat,uid); return
         try:
-            every=int(p[4]) if len(p)>4 else 7; analysts=p[5] if len(p)>5 else ""
-            rid,mid=dispatch_run("backtest",tickers=p[1],start=p[2],end=p[3],every=every,analysts=analysts)
-            send(chat,f"✅ بک‌تست در صف Engine قرار گرفت.\nمدل: <code>{esc(mid)}</code>\nRequest: <code>{rid}</code>")
+            every=int(parts[4]) if len(parts)>4 else 7; analysts=parts[5] if len(parts)>5 else ""
+            rid,mid=dispatch_run("backtest",tickers=parts[1],start=valid_date(parts[2]),end=valid_date(parts[3]),every=every,analysts=analysts)
+            send(chat,f"✅ بک‌تست ارسال شد.\nشناسه: <code>{esc(rid)}</code>")
         except Exception as e: send(chat,f"❌ <code>{esc(e)}</code>")
         return
 
@@ -339,6 +442,35 @@ def callback(q):
             if w and admin(uid) and w["stage"]=="confirm": finish_model(chat,w,data.split(":",1)[1])
         elif data.startswith("activate:"): activate(data.split(":",1)[1]); model_menu(chat,mid)
         elif data=="run": run_menu(chat,mid)
+        elif data=="new_analysis":
+            if not active_id(): raise ValueError("اول از بخش مدل‌ها یک مدل را فعال کن.")
+            start_analysis_flow(chat,uid,mid)
+        elif data=="new_backtest":
+            if not active_id(): raise ValueError("اول از بخش مدل‌ها یک مدل را فعال کن.")
+            start_backtest_flow(chat,uid,mid)
+        elif data=="flow_cancel": flow_clear(chat); main_menu(chat,mid)
+        elif data=="flow_analysis_all":
+            w=flow_row(chat); d=flow_data(w); d["analysts"]=""; flow_finish_analysis(chat,mid,d)
+        elif data=="flow_analysis_pick":
+            w=flow_row(chat); d=flow_data(w); flow_save(chat,uid,"analysis","pick_analysts",d,mid)
+            edit(chat,mid,"<b>انتخاب تحلیلگران</b>\nمی‌توانی چند مورد را انتخاب کنی؛ بعد «شروع تحلیل» را بزن.",kb([[('📊 Market','pick:market'),('📰 News','pick:news')],[('💬 Sentiment','pick:sentiment'),('💰 Fundamentals','pick:fundamentals')],[('🚀 شروع تحلیل','flow_analysis_start')],[('❌ لغو','flow_cancel')]]))
+        elif data.startswith("pick:"):
+            w=flow_row(chat); d=flow_data(w); chosen=d.get("analysts",[]); a=data.split(":",1)[1];
+            if not isinstance(chosen,list): chosen=[]
+            if a in chosen: chosen.remove(a)
+            else: chosen.append(a)
+            d["analysts"]=chosen; flow_save(chat,uid,"analysis","pick_analysts",d,mid)
+            labels={'market':'📊 Market','news':'📰 News','sentiment':'💬 Sentiment','fundamentals':'💰 Fundamentals'}
+            rows=[[((('✅ ' if x in chosen else '')+labels[x]),f'pick:{x}') for x in ('market','news')],[((('✅ ' if x in chosen else '')+labels[x]),f'pick:{x}') for x in ('sentiment','fundamentals')],[('🚀 شروع تحلیل','flow_analysis_start')],[('❌ لغو','flow_cancel')]]
+            edit(chat,mid,"<b>انتخاب تحلیلگران</b>\nموارد انتخاب‌شده علامت ✅ دارند.",kb(rows))
+        elif data=="flow_analysis_start":
+            w=flow_row(chat); d=flow_data(w);
+            chosen=d.get("analysts",[]); d["analysts"]=','.join(chosen) if isinstance(chosen,list) else str(chosen or '')
+            if not d["analysts"]: raise ValueError("حداقل یک تحلیلگر انتخاب کن یا «همه تحلیلگران» را بزن.")
+            flow_finish_analysis(chat,mid,d)
+        elif data.startswith("flow_every:"):
+            w=flow_row(chat); d=flow_data(w); d["every"]=int(data.split(":",1)[1]); d["analysts"]="";
+            flow_finish_backtest(chat,mid,d)
         elif data=="sample":
             rid,mm=dispatch_run("analysis",ticker="AAPL",date=dt.date.today().isoformat(),analysts="market")
             edit(chat,mid,f"✅ اجرای نمونه ارسال شد.\nRequest: <code>{rid}</code>",kb([[("📊 وضعیت","status"),("◀️ خانه","home")]]))
