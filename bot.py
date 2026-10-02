@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""TradingAgentsArya Telegram controller - final hardened build."""
+"""TradingAgentsArya Telegram controller - build v4.
+
+v4 fixes:
+- UI never blocks on network: screens render from local SQLite; a background
+  worker syncs GitHub every 20s.
+- No more locked menus: pressing a button on ANY menu re-anchors the single
+  UI message instead of rejecting the callback.
+- Duplicate Telegram edits are skipped (content hash) => faster, no flood.
+- Outputs are delivered as documents (auto notify + 📄 buttons).
+- Build tag is shown in home so deployment can be verified from Telegram.
+"""
 from __future__ import annotations
 
 import base64
@@ -11,6 +21,7 @@ import io
 import json
 import os
 import sqlite3
+import threading
 import time
 import traceback
 import urllib.error
@@ -19,6 +30,8 @@ import urllib.request
 import uuid
 import zipfile
 from typing import Any
+
+BUILD = "v4"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
@@ -72,6 +85,10 @@ for stmt in (
         pass
 DB.commit()
 
+DB_LOCK = threading.Lock()
+CACHE: dict[str, Any] = {"runs": [], "artifacts": [], "ts": 0.0}
+UI_HASH: dict[int, str] = {}
+
 
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -81,14 +98,25 @@ def esc(value: Any) -> str:
     return html.escape(str(value if value is not None else ""), quote=False)
 
 
+def q(sql: str, args: tuple | list = ()) -> list[sqlite3.Row]:
+    with DB_LOCK:
+        return DB.execute(sql, args).fetchall()
+
+
+def q1(sql: str, args: tuple | list = ()):
+    with DB_LOCK:
+        return DB.execute(sql, args).fetchone()
+
+
 def db(sql: str, args: tuple | list = ()):
-    cur = DB.execute(sql, args)
-    DB.commit()
-    return cur
+    with DB_LOCK:
+        cur = DB.execute(sql, args)
+        DB.commit()
+        return cur
 
 
 def get_setting(key: str, default: str = "") -> str:
-    row = DB.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    row = q1("SELECT value FROM settings WHERE key=?", (key,))
     return str(row[0]) if row else default
 
 
@@ -221,7 +249,7 @@ def edit_message(chat_id: int, message_id: int, text: str, rows: list[list[tuple
 
 
 def get_state(chat_id: int) -> tuple[str, dict, int]:
-    row = DB.execute("SELECT state, payload, ui_message_id FROM chat_state WHERE chat_id=?", (chat_id,)).fetchone()
+    row = q1("SELECT state, payload, ui_message_id FROM chat_state WHERE chat_id=?", (chat_id,))
     if not row:
         return "idle", {}, 0
     return row["state"], json.loads(row["payload"]), int(row["ui_message_id"])
@@ -238,14 +266,21 @@ def set_state(chat_id: int, state: str, payload: dict, ui_message_id: int | None
 
 
 def update_ui(chat_id: int, cb_mid: int | None = None) -> None:
-    state, payload, saved_mid = get_state(chat_id)
-    if cb_mid and saved_mid and int(cb_mid) != saved_mid:
-        return
+    """Render current state onto ONE message. Pressing a button on any older
+    menu re-anchors that message as the single active UI message (no locks)."""
+    state, payload, saved = get_state(chat_id)
+    target = cb_mid or saved
     text, rows = build_ui(state, payload)
-    if saved_mid and edit_message(chat_id, saved_mid, text, rows):
-        set_state(chat_id, state, payload, saved_mid)
+    digest = hashlib.md5((text + json.dumps(rows, ensure_ascii=False)).encode("utf-8")).hexdigest()
+    if target and target == saved and UI_HASH.get(chat_id) == digest:
+        set_state(chat_id, state, payload, saved)
+        return
+    if target and edit_message(chat_id, target, text, rows):
+        UI_HASH[chat_id] = digest
+        set_state(chat_id, state, payload, target)
         return
     new_mid = send_message(chat_id, text, rows)
+    UI_HASH[chat_id] = digest
     set_state(chat_id, state, payload, new_mid)
 
 
@@ -306,7 +341,7 @@ def infer_provider(base_url: str) -> str:
 
 
 def model_rows() -> list[sqlite3.Row]:
-    return DB.execute("SELECT * FROM models WHERE enabled=1 ORDER BY name COLLATE NOCASE").fetchall()
+    return q("SELECT * FROM models WHERE enabled=1 ORDER BY name COLLATE NOCASE")
 
 
 def active_model_id() -> str:
@@ -338,7 +373,7 @@ def add_model(name: str, provider: str, base_url: str, token: str) -> str:
     model_id = "m_" + uuid.uuid4().hex[:12]
     db("INSERT INTO models(id,name,provider,base_url,token_ciphertext,enabled,created_at) VALUES(?,?,?,?,?,1,?)",
        (model_id, name, provider, base_url, encrypt_token(token), now()))
-    row = DB.execute("SELECT * FROM models WHERE id=?", (model_id,)).fetchone()
+    row = q1("SELECT * FROM models WHERE id=?", (model_id,))
     write_active_model_secrets(row)
     set_setting("active_model", model_id)
     return model_id
@@ -374,23 +409,15 @@ def post_model_test(model: sqlite3.Row) -> float:
     return time.monotonic() - started
 
 
-# ---------------- github runs ----------------
-_active_cache = {"ts": 0.0, "runs": []}
-
-
-def current_engine_runs(force: bool = False) -> list[dict[str, Any]]:
-    if not force and time.monotonic() - _active_cache["ts"] < 10:
-        return _active_cache["runs"]
+# ---------------- github runs (worker-synced) ----------------
+def fetch_active_runs() -> list[dict[str, Any]]:
     active: list[dict[str, Any]] = []
     for status in ("queued", "in_progress"):
         data = gh("GET", "/actions/workflows/tradingagents.yml/runs?status=" + status + "&per_page=50", timeout=15) or {}
         for run in data.get("workflow_runs", []):
             if run.get("event") == "repository_dispatch":
                 active.append(run)
-    unique = list({int(run["id"]): run for run in active if run.get("id")}.values())
-    _active_cache["ts"] = time.monotonic()
-    _active_cache["runs"] = unique
-    return unique
+    return list({int(run["id"]): run for run in active if run.get("id")}.values())
 
 
 def dispatch_run(chat_id: int, mode: str, params: dict[str, Any]) -> str:
@@ -409,10 +436,10 @@ def dispatch_run(chat_id: int, mode: str, params: dict[str, Any]) -> str:
 
 
 def sync_run_records() -> None:
-    rows = DB.execute("SELECT * FROM runs WHERE status NOT IN " + str(TERMINAL) + " ORDER BY created_at DESC LIMIT 30").fetchall()
+    rows = q("SELECT * FROM runs WHERE status NOT IN " + str(TERMINAL) + " ORDER BY created_at DESC LIMIT 30")
     if not rows:
         return
-    data = gh("GET", "/actions/workflows/tradingagents.yml/runs?per_page=100") or {}
+    data = gh("GET", "/actions/workflows/tradingagents.yml/runs?per_page=100", timeout=15) or {}
     workflow_runs = [r for r in data.get("workflow_runs", []) if r.get("event") == "repository_dispatch"]
     for row in rows:
         run = None
@@ -430,14 +457,13 @@ def sync_run_records() -> None:
 
 
 def notify_finished() -> None:
-    sync_run_records()
-    rows = DB.execute("SELECT * FROM runs WHERE notified=0 AND status IN " + str(TERMINAL) + " LIMIT 10").fetchall()
+    rows = q("SELECT * FROM runs WHERE notified=0 AND status IN " + str(TERMINAL) + " LIMIT 10")
     for row in rows:
         params = json.loads(row["payload_json"] or "{}")
         subject = params.get("ticker") or params.get("tickers") or "—"
         label = "تحلیل" if row["mode"] == "analysis" else "بک‌تست"
         emoji = "✅" if row["status"] == "success" else "❌"
-        text = emoji + " " + label + " <code>" + esc(subject) + "</code> تمام شد.\nنتیجه: <b>" + esc(row["status"]) + "</b>\nبرای دیدن خروجی دکمه زیر را بزن."
+        text = emoji + " " + label + " <code>" + esc(subject) + "</code> تمام شد.\nنتیجه: <b>" + esc(row["status"]) + "</b>"
         buttons = [[("📄 دیدن خروجی", "view_output:" + row["request_id"])]]
         if row["workflow_run_id"]:
             buttons.append([("🔗 صفحه اجرا", "url:https://github.com/" + OWNER + "/" + REPO + "/actions/runs/" + str(row["workflow_run_id"]))])
@@ -448,37 +474,57 @@ def notify_finished() -> None:
         db("UPDATE runs SET notified=1, updated_at=? WHERE request_id=?", (now(), row["request_id"]))
 
 
+def worker_loop() -> None:
+    while True:
+        for task in (sync_run_records, lambda: CACHE.update(runs=fetch_active_runs()),
+                     lambda: CACHE.update(artifacts=(gh("GET", "/actions/artifacts?per_page=15", timeout=15) or {}).get("artifacts", [])),
+                     notify_finished):
+            try:
+                task()
+            except Exception:
+                pass
+        CACHE["ts"] = time.monotonic()
+        time.sleep(20)
+
+
 def cancel_run(run_id: int) -> None:
     gh("POST", "/actions/runs/" + str(run_id) + "/cancel", timeout=15)
 
 
 # ---------------- output viewer ----------------
 def send_output(chat_id: int, request_id: str) -> None:
-    row = DB.execute("SELECT * FROM runs WHERE request_id=?", (request_id,)).fetchone()
+    row = q1("SELECT * FROM runs WHERE request_id=?", (request_id,))
     if not row:
         send_message(chat_id, "❌ این اجرا پیدا نشد.")
         return
     if not row["workflow_run_id"]:
-        sync_run_records()
-        row = DB.execute("SELECT * FROM runs WHERE request_id=?", (request_id,)).fetchone()
+        try:
+            sync_run_records()
+        except Exception:
+            pass
+        row = q1("SELECT * FROM runs WHERE request_id=?", (request_id,))
     run_id = row["workflow_run_id"]
     if not run_id:
         send_message(chat_id, "⏳ هنوز Run ID ثبت نشده؛ چند ثانیه دیگر دوباره امتحان کن.")
         return
-    data = gh("GET", "/actions/runs/" + str(run_id) + "/artifacts") or {}
-    arts = [a for a in data.get("artifacts", []) if not a.get("expired")]
-    pick = None
-    for prefix in ("engine-results-", "engine-run-"):
-        for art in arts:
-            if str(art.get("name", "")).startswith(prefix):
-                pick = art
+    try:
+        data = gh("GET", "/actions/runs/" + str(run_id) + "/artifacts") or {}
+        arts = [a for a in data.get("artifacts", []) if not a.get("expired")]
+        pick = None
+        for prefix in ("engine-results-", "engine-run-"):
+            for art in arts:
+                if str(art.get("name", "")).startswith(prefix):
+                    pick = art
+                    break
+            if pick:
                 break
-        if pick:
-            break
-    if not pick:
-        send_message(chat_id, "📭 هنوز Artifact خروجی برای این اجرا ساخته نشده است.")
+        if not pick:
+            send_message(chat_id, "📭 هنوز Artifact خروجی برای این اجرا ساخته نشده است.")
+            return
+        raw = gh_bytes("/actions/artifacts/" + str(pick["id"]) + "/zip")
+    except Exception as exc:
+        send_message(chat_id, "❌ دریافت خروجی ناموفق: " + esc(exc))
         return
-    raw = gh_bytes("/actions/artifacts/" + str(pick["id"]) + "/zip")
     zf = zipfile.ZipFile(io.BytesIO(raw))
     scored = []
     for name in zf.namelist():
@@ -492,6 +538,8 @@ def send_output(chat_id: int, request_id: str) -> None:
         except Exception:
             continue
         score = 0
+        if "complete_report" in low:
+            score += 5
         if "report" in low:
             score += 3
         if low.endswith(".md"):
@@ -505,7 +553,7 @@ def send_output(chat_id: int, request_id: str) -> None:
     scored.sort(key=lambda item: -item[0])
     caption = "📄 خروجی " + ("تحلیل" if row["mode"] == "analysis" else "بک‌تست") + " — " + scored[0][1]
     tg_document(chat_id, scored[0][1].replace("/", "_"), scored[0][2].encode("utf-8"), caption)
-    for _, extra_name, extra_body in scored[1:3]:
+    for _, extra_name, extra_body in scored[1:2]:
         try:
             tg_document(chat_id, extra_name.replace("/", "_"), extra_body.encode("utf-8"), "📎 " + extra_name)
         except Exception:
@@ -555,18 +603,19 @@ def analysts_names(csv: str) -> str:
     return chosen or "هیچ‌کدام"
 
 
-# ---------------- ui screens ----------------
+# ---------------- ui screens (local-only, no network) ----------------
 def build_ui(state: str, payload: dict) -> tuple[str, list[list[tuple[str, str]]]]:
     flash = payload.pop("flash", None)
     head = ("<b>" + esc(flash) + "</b>\n\n") if flash else ""
 
     if state == "idle":
         aid = active_model_id()
-        mrow = DB.execute("SELECT name FROM models WHERE id=?", (aid,)).fetchone() if aid else None
+        mrow = q1("SELECT name FROM models WHERE id=?", (aid,)) if aid else None
         model_line = "مدل فعال: <b>" + esc(mrow["name"]) + "</b>" if mrow else "مدل فعال: <b>تنظیم نشده</b>"
-        busy = DB.execute("SELECT COUNT(*) c FROM runs WHERE status NOT IN " + str(TERMINAL)).fetchone()["c"]
+        busy = q1("SELECT COUNT(*) c FROM runs WHERE status NOT IN " + str(TERMINAL))["c"]
         live = "\n🟡 اجرای فعال: <b>" + str(busy) + "</b>" if busy else ""
-        return head + "<b>🤖 TradingAgentsArya</b>\n" + model_line + live + "\nیک گزینه را انتخاب کن:", [
+        return (head + "<b>🤖 TradingAgentsArya</b>\n" + model_line + live +
+                "\nیک گزینه را انتخاب کن.\n<code>build " + BUILD + "</code>"), [
             [("🚀 تحلیل جدید", "flow_analysis_start"), ("📈 بک‌تست", "flow_backtest_start")],
             [("🤖 مدل‌ها", "models"), ("📊 اجراهای جاری", "active_runs")],
             [("📜 تاریخچه", "history"), ("📦 خروجی‌ها", "artifacts")],
@@ -651,12 +700,7 @@ def build_ui(state: str, payload: dict) -> tuple[str, list[list[tuple[str, str]]
         ]
 
     if state == "active_runs":
-        note = ""
-        try:
-            runs = current_engine_runs()
-        except Exception:
-            runs = []
-            note = "\n⚠️ ارتباط با GitHub موقتاً برقرار نشد؛ فهرست محلی نمایش داده می‌شود."
+        runs = list(CACHE.get("runs", []))
         lines = [head + "<b>📊 اجراهای جاری</b>"]
         buttons = []
         if runs:
@@ -665,7 +709,7 @@ def build_ui(state: str, payload: dict) -> tuple[str, list[list[tuple[str, str]]
                 lines.append("🟡 <b>" + esc(run.get("display_title") or "Engine") + "</b>")
                 buttons.append([("🛑 لغو این اجرا", "cancelw:" + str(run.get("id")))])
         else:
-            local = DB.execute("SELECT * FROM runs WHERE status NOT IN " + str(TERMINAL) + " ORDER BY created_at DESC LIMIT 5").fetchall()
+            local = q("SELECT * FROM runs WHERE status NOT IN " + str(TERMINAL) + " ORDER BY created_at DESC LIMIT 5")
             if local:
                 lines.append("")
                 for row in local:
@@ -674,16 +718,11 @@ def build_ui(state: str, payload: dict) -> tuple[str, list[list[tuple[str, str]]
                         buttons.append([("🛑 لغو این اجرا", "cancelw:" + str(row["workflow_run_id"]))])
             else:
                 lines.append("✅ هیچ پردازش فعالی وجود ندارد.")
-        lines.append(note)
         buttons.append([("🔄 تازه‌سازی", "active_runs"), ("🏠 خانه", "home")])
         return "\n".join(lines), buttons
 
     if state == "history":
-        try:
-            sync_run_records()
-        except Exception:
-            pass
-        rows = DB.execute("SELECT * FROM runs ORDER BY created_at DESC LIMIT 6").fetchall()
+        rows = q("SELECT * FROM runs ORDER BY created_at DESC LIMIT 8")
         if not rows:
             return head + "<b>📜 تاریخچه</b>\nهنوز اجرایی ثبت نشده.", [[("🏠 خانه", "home")]]
         lines = [head + "<b>📜 تاریخچه</b>", ""]
@@ -700,16 +739,12 @@ def build_ui(state: str, payload: dict) -> tuple[str, list[list[tuple[str, str]]
         return "\n".join(lines), buttons
 
     if state == "artifacts":
-        try:
-            data = gh("GET", "/actions/artifacts?per_page=15", timeout=15) or {}
-            items = [a for a in data.get("artifacts", []) if not a.get("expired")]
-        except Exception:
-            items = []
+        items = [a for a in CACHE.get("artifacts", []) if not a.get("expired")][:12]
         if not items:
             text = head + "<b>📦 خروجی‌ها</b>\nخروجی‌ای پیدا نشد."
         else:
             lines = [head + "<b>📦 خروجی‌ها</b>", ""]
-            for item in items[:12]:
+            for item in items:
                 lines.append("• <code>" + esc(item.get("id")) + "</code> — " + esc(item.get("name")))
             text = "\n".join(lines)
         return text, [[("🔄 تازه‌سازی", "artifacts"), ("🏠 خانه", "home")]]
@@ -798,17 +833,14 @@ def callback(query: dict[str, Any]) -> None:
     chat_id = int(message.get("chat", {}).get("id", user_id))
     cb_mid = int(message.get("message_id", 0))
     data = query.get("data", "")
-    state, payload, saved_mid = get_state(chat_id)
-
-    if saved_mid and cb_mid and cb_mid != saved_mid and not data.startswith(("view_output:", "cancelw:")):
-        answer_callback(query["id"], "این منو قدیمی است؛ از منوی فعال استفاده کن.", True)
-        return
+    state, payload, _ = get_state(chat_id)
 
     answer_callback(query["id"])
 
     try:
         if data.startswith("view_output:"):
-            send_output(chat_id, data.split(":", 1)[1])
+            answer_callback(query["id"], "📄 در حال آماده‌سازی خروجی...")
+            threading.Thread(target=send_output, args=(chat_id, data.split(":", 1)[1]), daemon=True).start()
             return
         if data.startswith("cancelw:"):
             cancel_run(int(data.split(":", 1)[1]))
@@ -846,7 +878,7 @@ def callback(query: dict[str, Any]) -> None:
             payload = {"flash": "🗑 مدل حذف شد."}
             set_state(chat_id, "models", payload)
         elif data.startswith("activate:"):
-            row = DB.execute("SELECT * FROM models WHERE id=? AND enabled=1", (data.split(":", 1)[1],)).fetchone()
+            row = q1("SELECT * FROM models WHERE id=? AND enabled=1", (data.split(":", 1)[1],))
             if not row:
                 raise ValueError("مدل پیدا نشد.")
             write_active_model_secrets(row)
@@ -854,7 +886,7 @@ def callback(query: dict[str, Any]) -> None:
             payload = {"flash": "⚡ مدل " + row["name"] + " فعال شد."}
             set_state(chat_id, "models", payload)
         elif data.startswith("test_model:"):
-            row = DB.execute("SELECT * FROM models WHERE id=? AND enabled=1", (data.split(":", 1)[1],)).fetchone()
+            row = q1("SELECT * FROM models WHERE id=? AND enabled=1", (data.split(":", 1)[1],))
             if not row:
                 raise ValueError("مدل پیدا نشد.")
             try:
@@ -932,13 +964,13 @@ def poll() -> None:
     if not ADMIN_IDS and not ALLOWED_IDS:
         raise SystemExit("TELEGRAM_ADMIN_IDS or TELEGRAM_ALLOWED_USER_IDS is required")
     me = tg("getMe")
-    print("TradingAgents controller started @" + str(me.get("username", "")), flush=True)
+    print("TradingAgents controller started @" + str(me.get("username", "")) + " build " + BUILD, flush=True)
+    threading.Thread(target=worker_loop, daemon=True).start()
     try:
         offset = int(get_setting("last_update_id", "0")) + 1
     except ValueError:
         offset = 1
     conflict_started = 0.0
-    last_notify = 0.0
     while True:
         try:
             updates = tg("getUpdates", {"offset": offset, "timeout": 50, "allowed_updates": ["message", "callback_query"]}) or []
@@ -953,12 +985,6 @@ def poll() -> None:
                     elif "message" in update and update["message"].get("text"):
                         if authorized(int(update["message"]["from"]["id"])):
                             handle_text(int(update["message"]["chat"]["id"]), update["message"]["text"])
-                except Exception:
-                    traceback.print_exc()
-            if time.monotonic() - last_notify > 60:
-                last_notify = time.monotonic()
-                try:
-                    notify_finished()
                 except Exception:
                     traceback.print_exc()
         except Exception as exc:
