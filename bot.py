@@ -140,9 +140,15 @@ def http_json(url: str, method: str = "GET", data: Any = None, headers: dict | N
         raise RuntimeError("HTTP " + str(exc.code)) from exc
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
+class _StripAuthRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow redirects like curl -L, but never forward the GitHub token
+    to the signed storage URL (avoids 401 from blob storage)."""
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+        newreq = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if newreq is not None:
+            newreq.remove_header("Authorization")
+        return newreq
 
 
 def gh(method: str, path: str, data: Any = None, timeout: int = 30):
@@ -160,8 +166,6 @@ def gh(method: str, path: str, data: Any = None, timeout: int = 30):
 
 
 def gh_bytes(path: str) -> bytes:
-    """Download an artifact zip: follow the 302 WITHOUT the Authorization
-    header (the signed storage URL must not receive the GitHub token)."""
     if not GH_TOKEN:
         raise RuntimeError("BOT_GITHUB_TOKEN تنظیم نشده است.")
     headers = {
@@ -170,20 +174,9 @@ def gh_bytes(path: str) -> bytes:
         "User-Agent": "TradingAgentsArya-Bot",
     }
     req = urllib.request.Request(GH + path, headers=headers, method="GET")
-    opener = urllib.request.build_opener(_NoRedirect())
-    location = ""
+    opener = urllib.request.build_opener(_StripAuthRedirect())
     try:
-        with opener.open(req, timeout=60) as resp:
-            status = getattr(resp, "status", 200)
-            if status < 300:
-                return resp.read()
-            location = resp.headers.get("Location") or ""
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError("HTTP " + str(exc.code)) from exc
-    if not location:
-        raise RuntimeError("لینک دانلود دریافت نشد.")
-    try:
-        with urllib.request.urlopen(location, timeout=180) as resp:
+        with opener.open(req, timeout=180) as resp:
             return resp.read()
     except urllib.error.HTTPError as exc:
         raise RuntimeError("HTTP " + str(exc.code)) from exc
