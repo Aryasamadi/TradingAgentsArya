@@ -1,19 +1,11 @@
+# ruff: noqa: RUF001, RUF002, RUF003
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""TradingAgentsArya Telegram controller - build v4.
-
-v4 fixes:
-- UI never blocks on network: screens render from local SQLite; a background
-  worker syncs GitHub every 20s.
-- No more locked menus: pressing a button on ANY menu re-anchors the single
-  UI message instead of rejecting the callback.
-- Duplicate Telegram edits are skipped (content hash) => faster, no flood.
-- Outputs are delivered as documents (auto notify + 📄 buttons).
-- Build tag is shown in home so deployment can be verified from Telegram.
-"""
+"""TradingAgentsArya Telegram controller - build v4."""
 from __future__ import annotations
 
 import base64
+import contextlib
 import datetime as dt
 import hashlib
 import html
@@ -21,6 +13,7 @@ import io
 import json
 import os
 import sqlite3
+import sys
 import threading
 import time
 import traceback
@@ -79,10 +72,8 @@ for stmt in (
     "ALTER TABLE runs ADD COLUMN conclusion TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE runs ADD COLUMN notified INTEGER NOT NULL DEFAULT 0",
 ):
-    try:
+    with contextlib.suppress(sqlite3.OperationalError):
         DB.execute(stmt)
-    except sqlite3.OperationalError:
-        pass
 DB.commit()
 
 DB_LOCK = threading.Lock()
@@ -207,10 +198,8 @@ def gh_bytes(path: str) -> bytes:
 
 
 def answer_callback(query_id: str, text: str = "", alert: bool = False) -> None:
-    try:
+    with contextlib.suppress(Exception):
         tg("answerCallbackQuery", {"callback_query_id": query_id, "text": text[:200], "show_alert": alert})
-    except Exception:
-        pass
 
 
 # ---------------- ui core ----------------
@@ -236,11 +225,14 @@ def send_message(chat_id: int, text: str, rows: list[list[tuple[str, str]]] | No
 
 def edit_message(chat_id: int, message_id: int, text: str, rows: list[list[tuple[str, str]]]) -> bool:
     try:
-        tg("editMessageText", {
-            "chat_id": chat_id, "message_id": message_id, "text": text[:4096],
-            "parse_mode": "HTML", "disable_web_page_preview": True,
-            "reply_markup": {"inline_keyboard": inline(rows)},
-        })
+        tg(
+            "editMessageText",
+            {
+                "chat_id": chat_id, "message_id": message_id, "text": text[:4096],
+                "parse_mode": "HTML", "disable_web_page_preview": True,
+                "reply_markup": {"inline_keyboard": inline(rows)},
+            },
+        )
         return True
     except Exception as exc:
         if "message is not modified" in str(exc).lower():
@@ -266,12 +258,10 @@ def set_state(chat_id: int, state: str, payload: dict, ui_message_id: int | None
 
 
 def update_ui(chat_id: int, cb_mid: int | None = None) -> None:
-    """Render current state onto ONE message. Pressing a button on any older
-    menu re-anchors that message as the single active UI message (no locks)."""
     state, payload, saved = get_state(chat_id)
     target = cb_mid or saved
     text, rows = build_ui(state, payload)
-    digest = hashlib.md5((text + json.dumps(rows, ensure_ascii=False)).encode("utf-8")).hexdigest()
+    digest = hashlib.sha256((text + json.dumps(rows, ensure_ascii=False)).encode("utf-8")).hexdigest()
     if target and target == saved and UI_HASH.get(chat_id) == digest:
         set_state(chat_id, state, payload, saved)
         return
@@ -466,23 +456,27 @@ def notify_finished() -> None:
         text = emoji + " " + label + " <code>" + esc(subject) + "</code> تمام شد.\nنتیجه: <b>" + esc(row["status"]) + "</b>"
         buttons = [[("📄 دیدن خروجی", "view_output:" + row["request_id"])]]
         if row["workflow_run_id"]:
-            buttons.append([("🔗 صفحه اجرا", "url:https://github.com/" + OWNER + "/" + REPO + "/actions/runs/" + str(row["workflow_run_id"]))])
+            run_url = "url:https://github.com/" + OWNER + "/" + REPO + "/actions/runs/" + str(row["workflow_run_id"])
+            buttons.append([("🔗 صفحه اجرا", run_url)])
         try:
             send_message(int(row["chat_id"]), text, buttons)
         except Exception:
-            traceback.print_exc()
+            sys.stderr.write(traceback.format_exc())
         db("UPDATE runs SET notified=1, updated_at=? WHERE request_id=?", (now(), row["request_id"]))
 
 
 def worker_loop() -> None:
     while True:
-        for task in (sync_run_records, lambda: CACHE.update(runs=fetch_active_runs()),
-                     lambda: CACHE.update(artifacts=(gh("GET", "/actions/artifacts?per_page=15", timeout=15) or {}).get("artifacts", [])),
-                     notify_finished):
-            try:
+        for task in (
+            sync_run_records,
+            lambda: CACHE.update(runs=fetch_active_runs()),
+            lambda: CACHE.update(
+                artifacts=(gh("GET", "/actions/artifacts?per_page=15", timeout=15) or {}).get("artifacts", [])
+            ),
+            notify_finished,
+        ):
+            with contextlib.suppress(Exception):
                 task()
-            except Exception:
-                pass
         CACHE["ts"] = time.monotonic()
         time.sleep(20)
 
@@ -498,10 +492,8 @@ def send_output(chat_id: int, request_id: str) -> None:
         send_message(chat_id, "❌ این اجرا پیدا نشد.")
         return
     if not row["workflow_run_id"]:
-        try:
+        with contextlib.suppress(Exception):
             sync_run_records()
-        except Exception:
-            pass
         row = q1("SELECT * FROM runs WHERE request_id=?", (request_id,))
     run_id = row["workflow_run_id"]
     if not run_id:
@@ -554,10 +546,8 @@ def send_output(chat_id: int, request_id: str) -> None:
     caption = "📄 خروجی " + ("تحلیل" if row["mode"] == "analysis" else "بک‌تست") + " — " + scored[0][1]
     tg_document(chat_id, scored[0][1].replace("/", "_"), scored[0][2].encode("utf-8"), caption)
     for _, extra_name, extra_body in scored[1:2]:
-        try:
+        with contextlib.suppress(Exception):
             tg_document(chat_id, extra_name.replace("/", "_"), extra_body.encode("utf-8"), "📎 " + extra_name)
-        except Exception:
-            pass
 
 
 # ---------------- validation ----------------
@@ -757,7 +747,7 @@ def analyst_ui(payload: dict, head: str, backtest: bool) -> tuple[str, list[list
     ticker = payload.get("ticker", "")
     if not backtest and ticker and is_crypto(ticker):
         allowed.remove("fundamentals")
-    selected = set(x for x in payload.get("analysts", "").split(",") if x in allowed)
+    selected = {x for x in payload.get("analysts", "").split(",") if x in allowed}
     payload["analysts"] = ",".join(x for x in allowed if x in selected)
     rows = []
     for i in range(0, len(allowed), 2):
@@ -840,7 +830,9 @@ def callback(query: dict[str, Any]) -> None:
     try:
         if data.startswith("view_output:"):
             answer_callback(query["id"], "📄 در حال آماده‌سازی خروجی...")
-            threading.Thread(target=send_output, args=(chat_id, data.split(":", 1)[1]), daemon=True).start()
+            threading.Thread(
+                target=send_output, args=(chat_id, data.split(":", 1)[1]), daemon=True
+            ).start()
             return
         if data.startswith("cancelw:"):
             cancel_run(int(data.split(":", 1)[1]))
@@ -925,7 +917,7 @@ def callback(query: dict[str, Any]) -> None:
             set_state(chat_id, "bt_analysts", payload)
         elif data.startswith("toggle_analyst:"):
             key = data.split(":", 1)[1]
-            selected = set(x for x in payload.get("analysts", "").split(",") if x)
+            selected = {x for x in payload.get("analysts", "").split(",") if x}
             if key in selected:
                 selected.remove(key)
             else:
@@ -964,7 +956,8 @@ def poll() -> None:
     if not ADMIN_IDS and not ALLOWED_IDS:
         raise SystemExit("TELEGRAM_ADMIN_IDS or TELEGRAM_ALLOWED_USER_IDS is required")
     me = tg("getMe")
-    print("TradingAgents controller started @" + str(me.get("username", "")) + " build " + BUILD, flush=True)
+    sys.stdout.write("TradingAgents controller started @" + str(me.get("username", "")) + " build " + BUILD + "\n")
+    sys.stdout.flush()
     threading.Thread(target=worker_loop, daemon=True).start()
     try:
         offset = int(get_setting("last_update_id", "0")) + 1
@@ -982,23 +975,29 @@ def poll() -> None:
                 try:
                     if "callback_query" in update:
                         callback(update["callback_query"])
-                    elif "message" in update and update["message"].get("text"):
-                        if authorized(int(update["message"]["from"]["id"])):
-                            handle_text(int(update["message"]["chat"]["id"]), update["message"]["text"])
+                    elif (
+                        "message" in update
+                        and update["message"].get("text")
+                        and authorized(int(update["message"]["from"]["id"]))
+                    ):
+                        handle_text(int(update["message"]["chat"]["id"]), update["message"]["text"])
                 except Exception:
-                    traceback.print_exc()
+                    sys.stderr.write(traceback.format_exc())
         except Exception as exc:
             message = str(exc)
             if "409" in message or "Conflict" in message:
                 if not conflict_started:
                     conflict_started = time.monotonic()
-                    print("Another controller is active; waiting...", flush=True)
+                    sys.stdout.write("Another controller is active; waiting...\n")
+                    sys.stdout.flush()
                 if time.monotonic() - conflict_started > 120:
-                    print("Second controller still active; stopping.", flush=True)
+                    sys.stdout.write("Second controller still active; stopping.\n")
+                    sys.stdout.flush()
                     return
                 time.sleep(10)
             else:
-                print("Polling error: " + message, flush=True)
+                sys.stdout.write("Polling error: " + message + "\n")
+                sys.stdout.flush()
                 time.sleep(5)
 
 
