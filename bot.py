@@ -535,12 +535,21 @@ def send_output(chat_id: int, request_id: str) -> None:
         if name.endswith("/"):
             continue
         low = name.lower()
+        
+        # 🛡️ فیلترهای امنیتی: هرگز کدها و دیتابیس‌ها را به عنوان گزارش نفرست
+        if low.endswith((".py", ".db", ".sqlite", ".zip", ".sh", ".yml", ".yaml")):
+            continue
+        if "bot.py" in low or "tradingagents.yml" in low or "__pycache__" in low:
+            continue
+            
         if not low.endswith((".md", ".txt", ".log", ".json")):
             continue
+            
         try:
             body = zf.read(name).decode("utf-8", "replace")
         except Exception:
             continue
+            
         score = 0
         if "complete_report" in low:
             score += 5
@@ -551,11 +560,13 @@ def send_output(chat_id: int, request_id: str) -> None:
         if low.endswith("agent.log"):
             score += 1
         scored.append((score, name, body))
+        
     if not scored:
-        send_message(chat_id, "📭 خروجی متنی داخل Artifact پیدا نشد.")
+        send_message(chat_id, "📭 گزارش متنی (Markdown) داخل Artifact پیدا نشد.")
         return
+        
     scored.sort(key=lambda item: -item[0])
-    caption = "📄 خروجی " + ("تحلیل" if row["mode"] == "analysis" else "بک‌تست") + " — " + scored[0][1]
+    caption = "📄 گزارش " + ("تحلیل" if row["mode"] == "analysis" else "بک‌تست") + " — " + scored[0][1]
     tg_document(chat_id, scored[0][1].replace("/", "_"), scored[0][2].encode("utf-8"), caption)
     for _, extra_name, extra_body in scored[1:2]:
         with contextlib.suppress(Exception):
