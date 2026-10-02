@@ -203,21 +203,15 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p .runtime/results
-          if [[ -f .runtime/run/agent.log ]]; then
-            grep -Eo '[A-Za-z0-9_./~-]+\.md' .runtime/run/agent.log | sort -u | while read -r rel; do
-              for base in "$PWD" "$HOME"; do
-                src="$base/$rel"
-                [[ -f "$src" ]] && cp -f "$src" ".runtime/results/$(basename "$rel")" || true
-              done
+          echo "Searching for TradingAgents reports in $HOME/.tradingagents/ ..."
+          if [[ -d "$HOME/.tradingagents" ]]; then
+            find "$HOME/.tradingagents" -type f \( -name '*.md' -o -name '*.txt' -o -name '*.json' \) -newer .runtime/run/marker 2>/dev/null | while read -r f; do
+              cp -f "$f" ".runtime/results/$(basename "$f")" || true
             done
           fi
-          find "$HOME" "$PWD" -maxdepth 6 -type f \( -name '*.md' -o -name '*report*.json' -o -name '*report*.txt' \) \
-            -newer .runtime/run/marker \
-            -not -path '*/.git/*' -not -path '*/.runtime/*' -not -path '*/.cache/*' -not -path '*/.local/*' \
-            -not -path '*/.npm/*' -not -path '*/node_modules/*' 2>/dev/null | while read -r f; do
-            cp -f "$f" ".runtime/results/$(basename "$f")" || true
-          done
-          echo "Collected: $(find .runtime/results -type f | wc -l) files"
+          # Cleanup: never send python code or databases as a report
+          find .runtime/results -type f \( -name "*.py" -o -name "*.db" -o -name "*.zip" -o -name "*.yml" \) -delete || true
+          echo "Collected files for Telegram:"
           ls -la .runtime/results || true
 
       - name: Save TradingAgents state
