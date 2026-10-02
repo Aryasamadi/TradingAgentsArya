@@ -1,5 +1,8 @@
-name: TradingAgents Engine + Controller
-run-name: ${{ github.event_name == 'repository_dispatch' && format('Engine · {0}', github.event.client_payload.request_id) || 'Telegram Controller' }}
+name: TradingAgents Engine + Telegram Controller
+run-name: >-
+  ${{ github.event_name == 'repository_dispatch'
+  && format('Engine · {0}', github.event.client_payload.request_id)
+  || 'Telegram Controller' }}
 
 on:
   workflow_dispatch:
@@ -8,10 +11,9 @@ on:
 
 permissions:
   contents: read
-  actions: read
+  actions: write
 
 env:
-  # TradingAgents Core Configs
   TRADINGAGENTS_OUTPUT_LANGUAGE: ${{ secrets.TRADINGAGENTS_OUTPUT_LANGUAGE || 'English' }}
   TRADINGAGENTS_CHECKPOINT_ENABLED: ${{ secrets.TRADINGAGENTS_CHECKPOINT_ENABLED || 'true' }}
   TRADINGAGENTS_DEFAULT_ANALYSTS: ${{ secrets.TRADINGAGENTS_DEFAULT_ANALYSTS || 'market,social,news,fundamentals' }}
@@ -21,23 +23,25 @@ env:
   TRADINGAGENTS_LLM_MAX_RETRIES: ${{ secrets.TRADINGAGENTS_LLM_MAX_RETRIES || '6' }}
   TRADINGAGENTS_MAX_TOKENS: ${{ secrets.TRADINGAGENTS_MAX_TOKENS || '8192' }}
   TRADINGAGENTS_TEMPERATURE: ${{ secrets.TRADINGAGENTS_TEMPERATURE || '0.0' }}
-  
-  # Dynamic Model Configs (Injected by Bot)
+  TRADINGAGENTS_GOOGLE_THINKING_LEVEL: ${{ secrets.TRADINGAGENTS_GOOGLE_THINKING_LEVEL || 'medium' }}
+  TRADINGAGENTS_OPENAI_REASONING_EFFORT: ${{ secrets.TRADINGAGENTS_OPENAI_REASONING_EFFORT || 'medium' }}
+  TRADINGAGENTS_ANTHROPIC_EFFORT: ${{ secrets.TRADINGAGENTS_ANTHROPIC_EFFORT || 'high' }}
   TRADINGAGENTS_LLM_PROVIDER: ${{ secrets.TRADINGAGENTS_LLM_PROVIDER }}
   TRADINGAGENTS_DEEP_THINK_LLM: ${{ secrets.TRADINGAGENTS_DEEP_THINK_LLM }}
   TRADINGAGENTS_QUICK_THINK_LLM: ${{ secrets.TRADINGAGENTS_QUICK_THINK_LLM }}
   TRADINGAGENTS_LLM_BACKEND_URL: ${{ secrets.TRADINGAGENTS_LLM_BACKEND_URL }}
-
-  # Provider API Keys
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-  GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
   AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+  GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
   XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
   DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
   DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+  DASHSCOPE_CN_API_KEY: ${{ secrets.DASHSCOPE_CN_API_KEY }}
   ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+  ZHIPU_CN_API_KEY: ${{ secrets.ZHIPU_CN_API_KEY }}
   MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+  MINIMAX_CN_API_KEY: ${{ secrets.MINIMAX_CN_API_KEY }}
   OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
   MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
   MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
@@ -45,6 +49,17 @@ env:
   NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
   OPENAI_COMPATIBLE_API_KEY: ${{ secrets.OPENAI_COMPATIBLE_API_KEY }}
   AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+  AWS_PROFILE: ${{ secrets.AWS_PROFILE }}
+  OLLAMA_BASE_URL: ${{ secrets.OLLAMA_BASE_URL }}
+  TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+  TYPESAFE_DEFAULT_MODEL: ${{ secrets.TYPESAFE_DEFAULT_MODEL }}
+  FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+  ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
+  SEC_EDGAR_USER_AGENT: ${{ secrets.SEC_EDGAR_USER_AGENT }}
 
 jobs:
   controller:
@@ -52,40 +67,49 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     concurrency:
-      group: tradingagents-controller-${{ github.repository }}
+      group: tradingagents-telegram-controller-${{ github.repository }}
       cancel-in-progress: true
     steps:
-      - uses: actions/checkout@v4
-      - name: Restore Bot State
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Restore controller state
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p .runtime
-          artifact_id="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.name=="bot-state" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
+          set -euo pipefail
+          mkdir -p .runtime/controller
+          artifact_id="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name=="controller-state" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
           if [[ -n "${artifact_id:-}" ]]; then
-            gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > .runtime/state.zip
-            unzip -o .runtime/state.zip -d .runtime >/dev/null && rm -f .runtime/state.zip
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > .runtime/controller/state.zip
+            unzip -o .runtime/controller/state.zip -d .runtime/controller >/dev/null
+            rm -f .runtime/controller/state.zip
           fi
-      - name: Install Dependencies
+
+      - name: Install controller dependency
         run: python -m pip install --disable-pip-version-check PyNaCl
-      - name: Run Telegram Controller
+
+      - name: Start Telegram controller
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           BOT_GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
           BOT_STATE_KEY: ${{ secrets.BOT_STATE_KEY }}
           TELEGRAM_ADMIN_IDS: ${{ secrets.TELEGRAM_ADMIN_IDS }}
           TELEGRAM_ALLOWED_USER_IDS: ${{ secrets.TELEGRAM_ALLOWED_USER_IDS }}
-          BOT_STATE_PATH: ${{ github.workspace }}/.runtime/bot_state.db
+          BOT_STATE_PATH: ${{ github.workspace }}/.runtime/controller/bot_state.db
           GITHUB_OWNER: ${{ github.repository_owner }}
           GITHUB_REPO: ${{ github.event.repository.name }}
         run: python bot.py
-      - name: Save Bot State
+
+      - name: Save controller state
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bot-state
-          path: .runtime/bot_state.db
+          name: controller-state
+          path: .runtime/controller/bot_state.db
           retention-days: 90
+          if-no-files-found: warn
 
   engine:
     if: ${{ github.event_name == 'repository_dispatch' }}
@@ -95,23 +119,44 @@ jobs:
       group: tradingagents-engine-${{ github.event.client_payload.request_id }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
+
       - name: Install TradingAgents
         run: python -m pip install -e .
-      - name: Restore Engine Cache
+
+      - name: Prepare runtime
+        run: |
+          set -euo pipefail
+          mkdir -p .runtime/run .runtime/results .runtime/cache
+
+      - name: Restore TradingAgents state
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p .runtime/cache
-          artifact_id="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.name=="engine-cache" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
+          set -euo pipefail
+          artifact_id="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name=="engine-cache" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
           if [[ -n "${artifact_id:-}" ]]; then
-            gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > .runtime/cache.zip
-            unzip -o .runtime/cache.zip -d .runtime/cache >/dev/null && rm -f .runtime/cache.zip
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > .runtime/state.zip
+            unzip -o .runtime/state.zip -d .runtime/cache >/dev/null
+            rm -f .runtime/state.zip
           fi
+
+      - name: Validate unattended configuration
+        run: |
+          set -euo pipefail
+          [[ -n "${TRADINGAGENTS_LLM_PROVIDER:-}" ]] || { echo "Missing active LLM provider."; exit 3; }
+          [[ -n "${TRADINGAGENTS_DEEP_THINK_LLM:-}" ]] || { echo "Missing active deep-thinking model."; exit 3; }
+          [[ -n "${TRADINGAGENTS_QUICK_THINK_LLM:-}" ]] || { echo "Missing active quick-thinking model."; exit 3; }
+          [[ -n "${TRADINGAGENTS_LLM_BACKEND_URL:-}" ]] || { echo "Missing active model Base URL."; exit 3; }
+
       - name: Parse Request & Run Engine
         env:
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}
@@ -119,29 +164,84 @@ jobs:
           python -c '
           import json, os, sys, subprocess
           p = json.loads(os.environ["PAYLOAD"])
-          mode = p.get("mode")
-          params = p.get("params", {})
-          
+          mode = str(p.get("mode") or "")
+          params = p.get("params") or {}
+          default_analysts = os.environ.get("TRADINGAGENTS_DEFAULT_ANALYSTS", "market,social,news,fundamentals")
           cmd = ["tradingagents"]
           if mode == "analysis":
-              cmd += ["--ticker", params["ticker"], "--date", params["date"], "--analysts", params.get("analysts", "market,news,fundamentals"), "--save", "--no-show"]
+              missing = [k for k in ("ticker", "date") if not params.get(k)]
+              if missing:
+                  sys.exit("Missing params: " + ", ".join(missing))
+              cmd += ["--ticker", str(params["ticker"]), "--date", str(params["date"]),
+                      "--analysts", str(params.get("analysts") or default_analysts),
+                      "--save", "--no-show"]
           elif mode == "backtest":
-              cmd += ["backtest", params["tickers"], "--start", params["start"], "--end", params["end"], "--every", str(params.get("every", 7)), "--analysts", params.get("analysts", "market,news,fundamentals")]
-          
-          print(f"Executing: {\" \".join(cmd)}")
-          sys.exit(subprocess.call(cmd))
+              missing = [k for k in ("tickers", "start", "end") if not params.get(k)]
+              if missing:
+                  sys.exit("Missing params: " + ", ".join(missing))
+              cmd += ["backtest", str(params["tickers"]),
+                      "--start", str(params["start"]), "--end", str(params["end"]),
+                      "--every", str(params.get("every") or 7),
+                      "--analysts", str(params.get("analysts") or default_analysts)]
+          else:
+              sys.exit("Unsupported mode: " + mode)
+          print("Executing:", " ".join(cmd), flush=True)
+          open(".runtime/run/marker", "w").close()
+          code = subprocess.call(cmd)
+          print("CLI exit code:", code, flush=True)
+          sys.exit(code)
           '
-      - name: Save Engine Cache
+
+      - name: Collect engine outputs
+        if: always()
+        run: |
+          python - <<'PY'
+          import os, shutil
+          start = 0.0
+          try:
+              start = os.path.getmtime(".runtime/run/marker")
+          except OSError:
+              pass
+          skip = {".git", ".runtime", ".venv", "node_modules", ".cache", "__pycache__"}
+          count = 0
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in skip and not d.endswith(".egg-info")]
+              for name in files:
+                  path = os.path.join(root, name)
+                  try:
+                      if os.path.getmtime(path) >= start and os.path.getsize(path) > 0:
+                          dst = os.path.join(".runtime", "results", os.path.relpath(path, "."))
+                          os.makedirs(os.path.dirname(dst), exist_ok=True)
+                          shutil.copy2(path, dst)
+                          count += 1
+                  except OSError:
+                      pass
+          print("Collected files:", count)
+          PY
+
+      - name: Save TradingAgents state
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: engine-cache
           path: .runtime/cache/
           retention-days: 90
-      - name: Upload Run Logs
+          if-no-files-found: warn
+
+      - name: Upload run logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-run-${{ github.run_id }}
+          path: .runtime/run/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: engine-results-${{ github.run_id }}
-          path: .runtime/
+          path: .runtime/results/
           retention-days: 90
+          if-no-files-found: warn
