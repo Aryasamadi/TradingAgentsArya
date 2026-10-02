@@ -141,7 +141,8 @@ def http_json(url: str, method: str = "GET", data: Any = None, headers: dict | N
 
 
 def http_bytes(url: str, headers: dict | None = None, timeout: int = 120) -> bytes:
-    req_headers = {"Accept": "application/zip", "User-Agent": "TradingAgentsArya-Bot"}
+    # GitHub API requires application/vnd.github+json even for binary artifact downloads
+    req_headers = {"Accept": "application/vnd.github+json", "User-Agent": "TradingAgentsArya-Bot"}
     if headers:
         req_headers.update(headers)
     req = urllib.request.Request(url, headers=req_headers, method="GET")
@@ -194,7 +195,7 @@ def gh(method: str, path: str, data: Any = None, timeout: int = 30):
 
 
 def gh_bytes(path: str) -> bytes:
-    return http_bytes(GH + path, {"Authorization": "Bearer " + GH_TOKEN, "Accept": "application/zip"})
+    return http_bytes(GH + path, {"Authorization": "Bearer " + GH_TOKEN})
 
 
 def answer_callback(query_id: str, text: str = "", alert: bool = False) -> None:
