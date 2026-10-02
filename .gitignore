@@ -1,223 +1,249 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+name: TradingAgents Engine + Telegram Controller
+run-name: >-
+  ${{ github.event_name == 'repository_dispatch'
+  && format('Engine · {0}', github.event.client_payload.request_id)
+  || 'Telegram Controller' }}
 
-# C extensions
-*.so
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [tradingagents_run]
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+permissions:
+  contents: read
+  actions: write
 
-# PyInstaller
-#   Usually these files are written by a python script from a template
-#   before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+env:
+  TRADINGAGENTS_OUTPUT_LANGUAGE: ${{ secrets.TRADINGAGENTS_OUTPUT_LANGUAGE || 'English' }}
+  TRADINGAGENTS_CHECKPOINT_ENABLED: ${{ secrets.TRADINGAGENTS_CHECKPOINT_ENABLED || 'true' }}
+  TRADINGAGENTS_DEFAULT_ANALYSTS: ${{ secrets.TRADINGAGENTS_DEFAULT_ANALYSTS || 'market,social,news,fundamentals' }}
+  TRADINGAGENTS_MAX_DEBATE_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_DEBATE_ROUNDS || '1' }}
+  TRADINGAGENTS_MAX_RISK_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_RISK_ROUNDS || '1' }}
+  TRADINGAGENTS_MAX_TOOL_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_TOOL_ROUNDS || '20' }}
+  TRADINGAGENTS_LLM_MAX_RETRIES: ${{ secrets.TRADINGAGENTS_LLM_MAX_RETRIES || '6' }}
+  TRADINGAGENTS_MAX_TOKENS: ${{ secrets.TRADINGAGENTS_MAX_TOKENS || '8192' }}
+  TRADINGAGENTS_TEMPERATURE: ${{ secrets.TRADINGAGENTS_TEMPERATURE || '0.0' }}
+  TRADINGAGENTS_GOOGLE_THINKING_LEVEL: ${{ secrets.TRADINGAGENTS_GOOGLE_THINKING_LEVEL || 'medium' }}
+  TRADINGAGENTS_OPENAI_REASONING_EFFORT: ${{ secrets.TRADINGAGENTS_OPENAI_REASONING_EFFORT || 'medium' }}
+  TRADINGAGENTS_ANTHROPIC_EFFORT: ${{ secrets.TRADINGAGENTS_ANTHROPIC_EFFORT || 'high' }}
+  TRADINGAGENTS_LLM_PROVIDER: ${{ secrets.TRADINGAGENTS_LLM_PROVIDER }}
+  TRADINGAGENTS_DEEP_THINK_LLM: ${{ secrets.TRADINGAGENTS_DEEP_THINK_LLM }}
+  TRADINGAGENTS_QUICK_THINK_LLM: ${{ secrets.TRADINGAGENTS_QUICK_THINK_LLM }}
+  TRADINGAGENTS_LLM_BACKEND_URL: ${{ secrets.TRADINGAGENTS_LLM_BACKEND_URL }}
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+  GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+  DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+  DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+  DASHSCOPE_CN_API_KEY: ${{ secrets.DASHSCOPE_CN_API_KEY }}
+  ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+  ZHIPU_CN_API_KEY: ${{ secrets.ZHIPU_CN_API_KEY }}
+  MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+  MINIMAX_CN_API_KEY: ${{ secrets.MINIMAX_CN_API_KEY }}
+  OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+  MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+  MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+  GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+  NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+  OPENAI_COMPATIBLE_API_KEY: ${{ secrets.OPENAI_COMPATIBLE_API_KEY }}
+  AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+  AWS_PROFILE: ${{ secrets.AWS_PROFILE }}
+  OLLAMA_BASE_URL: ${{ secrets.OLLAMA_BASE_URL }}
+  TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+  TYPESAFE_DEFAULT_MODEL: ${{ secrets.TYPESAFE_DEFAULT_MODEL }}
+  FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+  ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
+  SEC_EDGAR_USER_AGENT: ${{ secrets.SEC_EDGAR_USER_AGENT }}
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+jobs:
+  controller:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    concurrency:
+      group: tradingagents-telegram-controller-${{ github.repository }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
+      - name: Restore controller state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .runtime/controller
+          artifact_id="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name=="controller-state" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
+          if [[ -n "${artifact_id:-}" ]]; then
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > .runtime/controller/state.zip
+            unzip -o .runtime/controller/state.zip -d .runtime/controller >/dev/null
+            rm -f .runtime/controller/state.zip
+          fi
 
-# Translations
-*.mo
-*.pot
+      - name: Install controller dependency
+        run: python -m pip install --disable-pip-version-check PyNaCl
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+      - name: Start Telegram controller
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          BOT_GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+          BOT_STATE_KEY: ${{ secrets.BOT_STATE_KEY }}
+          TELEGRAM_ADMIN_IDS: ${{ secrets.TELEGRAM_ADMIN_IDS }}
+          TELEGRAM_ALLOWED_USER_IDS: ${{ secrets.TELEGRAM_ALLOWED_USER_IDS }}
+          BOT_STATE_PATH: ${{ github.workspace }}/.runtime/controller/bot_state.db
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPO: ${{ github.event.repository.name }}
+        run: python bot.py
 
-# Flask stuff:
-instance/
-.webassets-cache
+      - name: Save controller state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: controller-state
+          path: .runtime/controller/bot_state.db
+          retention-days: 90
+          if-no-files-found: warn
 
-# Scrapy stuff:
-.scrapy
+  engine:
+    if: ${{ github.event_name == 'repository_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    concurrency:
+      group: tradingagents-engine-${{ github.event.client_payload.request_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
 
-# Sphinx documentation
-docs/_build/
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
 
-# PyBuilder
-.pybuilder/
-target/
+      - name: Install TradingAgents
+        run: python -m pip install -e .
 
-# Jupyter Notebook
-.ipynb_checkpoints
+      - name: Prepare runtime
+        run: |
+          set -euo pipefail
+          mkdir -p .runtime/run .runtime/results .runtime/cache
 
-# IPython
-profile_default/
-ipython_config.py
+      - name: Restore TradingAgents state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          artifact_id="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name=="engine-cache" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
+          if [[ -n "${artifact_id:-}" ]]; then
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > .runtime/state.zip
+            unzip -o .runtime/state.zip -d .runtime/cache >/dev/null
+            rm -f .runtime/state.zip
+          fi
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+      - name: Validate unattended configuration
+        run: |
+          set -euo pipefail
+          [[ -n "${TRADINGAGENTS_LLM_PROVIDER:-}" ]] || { echo "Missing active LLM provider."; exit 3; }
+          [[ -n "${TRADINGAGENTS_DEEP_THINK_LLM:-}" ]] || { echo "Missing active deep-thinking model."; exit 3; }
+          [[ -n "${TRADINGAGENTS_QUICK_THINK_LLM:-}" ]] || { echo "Missing active quick-thinking model."; exit 3; }
+          [[ -n "${TRADINGAGENTS_LLM_BACKEND_URL:-}" ]] || { echo "Missing active model Base URL."; exit 3; }
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-# Pipfile.lock
+      - name: Run TradingAgents CLI
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          python - <<'PY'
+          import json, os, subprocess, sys
+          p = json.loads(os.environ["PAYLOAD"])
+          mode = str(p.get("mode") or "")
+          params = p.get("params") or {}
+          default_analysts = os.environ.get("TRADINGAGENTS_DEFAULT_ANALYSTS", "market,social,news,fundamentals")
+          cmd = ["tradingagents"]
+          if mode == "analysis":
+              missing = [k for k in ("ticker", "date") if not params.get(k)]
+              if missing:
+                  sys.exit("Missing params: " + ", ".join(missing))
+              cmd += ["--ticker", str(params["ticker"]), "--date", str(params["date"]),
+                      "--analysts", str(params.get("analysts") or default_analysts),
+                      "--save", "--no-show"]
+          elif mode == "backtest":
+              missing = [k for k in ("tickers", "start", "end") if not params.get(k)]
+              if missing:
+                  sys.exit("Missing params: " + ", ".join(missing))
+              cmd += ["backtest", str(params["tickers"]),
+                      "--start", str(params["start"]), "--end", str(params["end"]),
+                      "--every", str(params.get("every") or 7),
+                      "--analysts", str(params.get("analysts") or default_analysts)]
+          else:
+              sys.exit("Unsupported mode: " + mode)
+          print("Executing:", " ".join(cmd), flush=True)
+          os.makedirs(".runtime/run", exist_ok=True)
+          open(".runtime/run/marker", "w").close()
+          with open(".runtime/run/agent.log", "w", encoding="utf-8") as log:
+              proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+              for line in proc.stdout:
+                  sys.stdout.write(line)
+                  log.write(line)
+          code = proc.wait()
+          print("CLI exit code:", code, flush=True)
+          sys.exit(code)
+          PY
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-# uv.lock
+      - name: Collect engine outputs
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p .runtime/results
+          if [[ -d "$HOME/.tradingagents/logs/reports" ]]; then
+            cp -r "$HOME/.tradingagents/logs/reports/." .runtime/results/ || true
+          fi
+          if [[ -f .runtime/run/agent.log ]]; then
+            grep -Eo '[A-Za-z0-9_./~-]+\.md' .runtime/run/agent.log | sort -u | while read -r rel; do
+              for base in "$PWD" "$HOME"; do
+                src="$base/$rel"
+                [[ -f "$src" ]] && cp -f "$src" ".runtime/results/$(basename "$rel")" || true
+              done
+            done
+          fi
+          find "$HOME/.tradingagents" "$PWD" -maxdepth 8 -type f \( -name '*.md' -o -name '*report*.json' -o -name '*report*.txt' \) \
+            -newer .runtime/run/marker -not -path '*/.git/*' -not -path '*/.runtime/*' 2>/dev/null | while read -r f; do
+            cp -f "$f" ".runtime/results/$(basename "$f")" || true
+          done
+          echo "Collected: $(find .runtime/results -type f | wc -l) files"
+          ls -la .runtime/results || true
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-# poetry.lock
-# poetry.toml
+      - name: Save TradingAgents state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-cache
+          path: .runtime/cache/
+          retention-days: 90
+          if-no-files-found: warn
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-# pdm.lock
-# pdm.toml
-.pdm-python
-.pdm-build/
+      - name: Upload run logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-run-${{ github.run_id }}
+          path: .runtime/run/
+          retention-days: 90
+          if-no-files-found: warn
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-# pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
-
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# Redis
-*.rdb
-*.aof
-*.pid
-
-# RabbitMQ
-mnesia/
-rabbitmq/
-rabbitmq-data/
-
-# ActiveMQ
-activemq-data/
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
-# PyCharm
-#   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#   and can be added to the global gitignore or merged into this file.  For a more nuclear
-#   option (not recommended) you can uncomment the following to ignore the entire idea folder.
-# .idea/
-
-# Abstra
-#   Abstra is an AI-powered process automation framework.
-#   Ignore directories containing user credentials, local state, and settings.
-#   Learn more at https://abstra.io/docs
-.abstra/
-
-# Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#   you could uncomment the following to ignore the entire vscode folder
-# .vscode/
-
-# Ruff stuff:
-.ruff_cache/
-
-# PyPI configuration file
-.pypirc
-
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
-
-# Streamlit
-.streamlit/secrets.toml
-
-# Cache
-**/data_cache/
-
-# Enterprise env file (secrets) and generated run reports
-.env.enterprise
-reports/
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-results-${{ github.run_id }}
+          path: .runtime/results/
+          retention-days: 90
+          if-no-files-found: warn
