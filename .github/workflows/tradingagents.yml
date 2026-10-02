@@ -157,12 +157,12 @@ jobs:
           [[ -n "${TRADINGAGENTS_QUICK_THINK_LLM:-}" ]] || { echo "Missing active quick-thinking model."; exit 3; }
           [[ -n "${TRADINGAGENTS_LLM_BACKEND_URL:-}" ]] || { echo "Missing active model Base URL."; exit 3; }
 
-      - name: Parse Request & Run Engine
+      - name: Run TradingAgents CLI
         env:
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: |
-          python -c '
-          import json, os, sys, subprocess
+          python - <<'PY'
+          import json, os, subprocess, sys
           p = json.loads(os.environ["PAYLOAD"])
           mode = str(p.get("mode") or "")
           params = p.get("params") or {}
@@ -186,38 +186,39 @@ jobs:
           else:
               sys.exit("Unsupported mode: " + mode)
           print("Executing:", " ".join(cmd), flush=True)
+          os.makedirs(".runtime/run", exist_ok=True)
           open(".runtime/run/marker", "w").close()
-          code = subprocess.call(cmd)
+          with open(".runtime/run/agent.log", "w", encoding="utf-8") as log:
+              proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+              for line in proc.stdout:
+                  sys.stdout.write(line)
+                  log.write(line)
+          code = proc.wait()
           print("CLI exit code:", code, flush=True)
           sys.exit(code)
-          '
+          PY
 
       - name: Collect engine outputs
         if: always()
         run: |
-          python - <<'PY'
-          import os, shutil
-          start = 0.0
-          try:
-              start = os.path.getmtime(".runtime/run/marker")
-          except OSError:
-              pass
-          skip = {".git", ".runtime", ".venv", "node_modules", ".cache", "__pycache__"}
-          count = 0
-          for root, dirs, files in os.walk("."):
-              dirs[:] = [d for d in dirs if d not in skip and not d.endswith(".egg-info")]
-              for name in files:
-                  path = os.path.join(root, name)
-                  try:
-                      if os.path.getmtime(path) >= start and os.path.getsize(path) > 0:
-                          dst = os.path.join(".runtime", "results", os.path.relpath(path, "."))
-                          os.makedirs(os.path.dirname(dst), exist_ok=True)
-                          shutil.copy2(path, dst)
-                          count += 1
-                  except OSError:
-                      pass
-          print("Collected files:", count)
-          PY
+          set -uo pipefail
+          mkdir -p .runtime/results
+          if [[ -f .runtime/run/agent.log ]]; then
+            grep -Eo '[A-Za-z0-9_./~-]+\.md' .runtime/run/agent.log | sort -u | while read -r rel; do
+              for base in "$PWD" "$HOME"; do
+                src="$base/$rel"
+                [[ -f "$src" ]] && cp -f "$src" ".runtime/results/$(basename "$rel")" || true
+              done
+            done
+          fi
+          find "$HOME" "$PWD" -maxdepth 6 -type f \( -name '*.md' -o -name '*report*.json' -o -name '*report*.txt' \) \
+            -newer .runtime/run/marker \
+            -not -path '*/.git/*' -not -path '*/.runtime/*' -not -path '*/.cache/*' -not -path '*/.local/*' \
+            -not -path '*/.npm/*' -not -path '*/node_modules/*' 2>/dev/null | while read -r f; do
+            cp -f "$f" ".runtime/results/$(basename "$f")" || true
+          done
+          echo "Collected: $(find .runtime/results -type f | wc -l) files"
+          ls -la .runtime/results || true
 
       - name: Save TradingAgents state
         if: always()
