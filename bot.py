@@ -140,14 +140,50 @@ def http_json(url: str, method: str = "GET", data: Any = None, headers: dict | N
         raise RuntimeError("HTTP " + str(exc.code)) from exc
 
 
-def http_bytes(url: str, headers: dict | None = None, timeout: int = 120) -> bytes:
-    # GitHub API requires application/vnd.github+json even for binary artifact downloads
-    req_headers = {"Accept": "application/vnd.github+json", "User-Agent": "TradingAgentsArya-Bot"}
-    if headers:
-        req_headers.update(headers)
-    req = urllib.request.Request(url, headers=req_headers, method="GET")
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def gh(method: str, path: str, data: Any = None, timeout: int = 30):
+    if not GH_TOKEN:
+        raise RuntimeError("BOT_GITHUB_TOKEN تنظیم نشده است.")
+    headers = {
+        "Authorization": "Bearer " + GH_TOKEN,
+        "X-GitHub-Api-Version": "2026-03-10",
+        "Accept": "application/vnd.github+json",
+    }
+    status, obj = http_json(GH + path, method, data, headers, timeout=timeout)
+    if status >= 300:
+        raise RuntimeError("GitHub API error " + str(status))
+    return obj
+
+
+def gh_bytes(path: str) -> bytes:
+    """Download an artifact zip: follow the 302 WITHOUT the Authorization
+    header (the signed storage URL must not receive the GitHub token)."""
+    if not GH_TOKEN:
+        raise RuntimeError("BOT_GITHUB_TOKEN تنظیم نشده است.")
+    headers = {
+        "Authorization": "Bearer " + GH_TOKEN,
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "TradingAgentsArya-Bot",
+    }
+    req = urllib.request.Request(GH + path, headers=headers, method="GET")
+    opener = urllib.request.build_opener(_NoRedirect())
+    location = ""
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=60) as resp:
+            status = getattr(resp, "status", 200)
+            if status < 300:
+                return resp.read()
+            location = resp.headers.get("Location") or ""
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError("HTTP " + str(exc.code)) from exc
+    if not location:
+        raise RuntimeError("لینک دانلود دریافت نشد.")
+    try:
+        with urllib.request.urlopen(location, timeout=180) as resp:
             return resp.read()
     except urllib.error.HTTPError as exc:
         raise RuntimeError("HTTP " + str(exc.code)) from exc
@@ -178,24 +214,6 @@ def tg_document(chat_id: int, filename: str, data: bytes, caption: str) -> None:
     )
     with urllib.request.urlopen(req, timeout=120) as resp:
         resp.read()
-
-
-def gh(method: str, path: str, data: Any = None, timeout: int = 30):
-    if not GH_TOKEN:
-        raise RuntimeError("BOT_GITHUB_TOKEN تنظیم نشده است.")
-    headers = {
-        "Authorization": "Bearer " + GH_TOKEN,
-        "X-GitHub-Api-Version": "2026-03-10",
-        "Accept": "application/vnd.github+json",
-    }
-    status, obj = http_json(GH + path, method, data, headers, timeout=timeout)
-    if status >= 300:
-        raise RuntimeError("GitHub API error " + str(status))
-    return obj
-
-
-def gh_bytes(path: str) -> bytes:
-    return http_bytes(GH + path, {"Authorization": "Bearer " + GH_TOKEN})
 
 
 def answer_callback(query_id: str, text: str = "", alert: bool = False) -> None:
