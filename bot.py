@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # ruff: noqa
 # -*- coding: utf-8 -*-
-"""TradingAgentsArya Telegram controller - build v10 (Final Corrected v2).
+"""TradingAgentsArya Telegram controller - build v11 (Final Stable).
 
-Fixes:
-- Model list: 2 columns per row (6 rows x 2 cols = 12 per page).
-- Error messages have [Back] button, not [Home].
-- Toast/Popup messages have NO buttons.
-- /cancel hard-stops everything (local flows + GitHub engines).
-- Test runs truly async; result sent immediately.
+Fixes in v11:
+- FIXED: BUTTON_DATA_INVALID (64 byte limit) by using short indices for models.
+- UI: Model list is now 2 columns x 6 rows (12 items/page).
+- NEW: Delete Provider feature with confirmation.
+- UX: All error messages have a [Back] button, not [Home].
+- UX: Toast notifications have no buttons.
+- /cancel hard-stops everything immediately.
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ import uuid
 import zipfile
 from typing import Any
 
-BUILD = "v10"
+BUILD = "v11"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
@@ -233,7 +234,6 @@ def tg_document(chat_id: int, filename: str, data: bytes, caption: str) -> None:
 
 
 def answer_callback(query_id: str, text: str = "", alert: bool = False) -> None:
-    """Toast (top bar) or Popup (center). NO buttons."""
     with contextlib.suppress(Exception):
         tg("answerCallbackQuery", {"callback_query_id": query_id, "text": text[:200], "show_alert": alert})
 
@@ -412,6 +412,11 @@ def get_provider(prov_id: str):
     return q1("SELECT * FROM providers WHERE id=?", (prov_id,))
 
 
+def delete_provider(prov_id: str) -> None:
+    db("DELETE FROM models WHERE provider_id=?", (prov_id,))
+    db("DELETE FROM providers WHERE id=?", (prov_id,))
+
+
 def model_rows():
     return q("SELECT * FROM models WHERE enabled=1 ORDER BY name COLLATE NOCASE")
 
@@ -463,7 +468,6 @@ def add_model_from_provider(prov_id: str, model_name: str) -> str:
 
 # ---------------- Smart Model Test (Truly Async) ----------------
 def run_model_test_async(chat_id: int, model_name: str, base_url: str, token: str, provider_type: str, return_to: str):
-    """Runs in background. Sends result as NEW message with [Back] button."""
     try:
         started = time.monotonic()
         
@@ -502,14 +506,12 @@ def run_model_test_async(chat_id: int, model_name: str, base_url: str, token: st
             else:
                 raise
         
-        # SUCCESS: Clean message with Back button
         send_message(
             chat_id,
             f"<b>✅ تست موفق</b>\nمدل: <code>{esc(model_name)}</code>\nزمان پاسخ: <b>{elapsed:.1f}s</b>",
             [[("◀️ بازگشت", return_to)]]
         )
     except Exception as exc:
-        # FAILURE: Exact raw error with Back button
         raw_error = str(exc)
         send_message(
             chat_id,
@@ -539,7 +541,7 @@ def fetch_models_list(base_url: str, token: str) -> list[str]:
                     models.append(item["id"])
                 elif isinstance(item, str):
                     models.append(item)
-        return models  # Keep original order from API
+        return models
     except Exception:
         return []
 
@@ -629,18 +631,14 @@ def cancel_run(run_id: int) -> None:
     gh("POST", f"/actions/runs/{run_id}/cancel", timeout=15)
 
 
-# ---------------- Hard Cancel (/cancel) - Stops EVERYTHING ----------------
 def hard_cancel(chat_id: int) -> str:
-    """Cancel ALL local flows AND all running GitHub engines."""
     cancelled_flows = 0
     cancelled_engines = 0
     
-    # 1. Clear ALL local state
     WIZARDS.pop(chat_id, None)
     FLOWS.pop(chat_id, None)
-    cancelled_flows = 1  # At least the command itself
+    cancelled_flows = 1
     
-    # 2. Cancel ALL running GitHub engine runs
     try:
         runs = fetch_active_runs()
         for run in runs:
@@ -652,7 +650,6 @@ def hard_cancel(chat_id: int) -> str:
     except Exception:
         pass
     
-    # 3. Mark all local runs as cancelled
     db("UPDATE runs SET status='cancelled', conclusion='cancelled_by_user', updated_at=? WHERE chat_id=? AND status NOT IN " + str(TERMINAL), (now(), chat_id))
     
     parts = []
@@ -875,9 +872,35 @@ def providers_menu(chat_id: int, target_mid: int | None = None) -> int:
     text = "<b>📋 پرووایدرها</b>\nیک Provider را انتخاب کنید:"
     buttons = []
     for p in provs:
-        buttons.append([(f"🔹 {esc(p['name'])}", f"list_provider_models:{p['id']}")])
+        buttons.append([(f"🔹 {esc(p['name'])}", f"provider_detail:{p['id']}")])
     buttons.append([("🏠 خانه", "home")])
     return show(chat_id, text, buttons, target_mid)
+
+
+def provider_detail_screen(chat_id: int, prov_id: str, target_mid: int | None = None) -> int:
+    prov = get_provider(prov_id)
+    if not prov:
+        return show(chat_id, "❌ Provider یافت نشد.", [[("◀️ پرووایدرها", "providers_menu")]], target_mid)
+    return show(chat_id,
+                f"<b>🔹 {esc(prov['name'])}</b>\nType: <code>{esc(prov['provider_type'])}</code>\nURL: <code>{esc(prov['base_url'])}</code>",
+                [
+                    [("📋 لیست مدل‌ها", f"list_provider_models:{prov_id}")],
+                    [("🗑 حذف این Provider", f"ask_delete_provider:{prov_id}")],
+                    [("◀️ بازگشت", "providers_menu")],
+                ], target_mid)
+
+
+def ask_delete_provider_screen(chat_id: int, prov_id: str, target_mid: int | None = None) -> int:
+    prov = get_provider(prov_id)
+    if not prov:
+        return show(chat_id, "❌ Provider یافت نشد.", [[("◀️ پرووایدرها", "providers_menu")]], target_mid)
+    count = q1("SELECT COUNT(*) c FROM models WHERE provider_id=?", (prov_id,))["c"]
+    return show(chat_id,
+                f"<b>⚠️ حذف Provider</b>\n\nآیا مطمئنی می‌خواهی <b>{esc(prov['name'])}</b> و <b>{count}</b> مدل مرتبط با آن را حذف کنی؟\n\nاین عمل غیرقابل بازگشت است.",
+                [
+                    [("✅ بله، حذف شود", f"confirm_delete_provider:{prov_id}")],
+                    [("❌ انصراف", f"provider_detail:{prov_id}")],
+                ], target_mid)
 
 
 def list_provider_models_screen(chat_id: int, prov_id: str, page: int = 0, target_mid: int | None = None) -> int:
@@ -892,6 +915,7 @@ def list_provider_models_screen(chat_id: int, prov_id: str, page: int = 0, targe
         return show(chat_id, f"📭 لیست مدل‌ها برای <b>{esc(prov['name'])}</b> دریافت نشد.",
                     [[("✏️ ورود دستی", f"manual_model_for_prov:{prov_id}"), ("◀️ پرووایدرها", "providers_menu")]], target_mid)
     
+    # Store full list in memory to use short indices in buttons
     WIZARDS[chat_id] = {"stage": "provider_models", "prov_id": prov_id, "models_list": models}
     
     per_page = 12
@@ -904,14 +928,17 @@ def list_provider_models_screen(chat_id: int, prov_id: str, page: int = 0, targe
     buttons = []
     
     # 2 COLUMNS per row (6 rows x 2 cols = 12 per page)
+    # Use short index 'm:<index>' to avoid 64-byte limit
     for i in range(0, len(page_models), 2):
         row_models = page_models[i:i+2]
         row_buttons = []
-        for model_id in row_models:
+        for idx_offset, model_id in enumerate(row_models):
+            global_idx = start + i + idx_offset
             short_name = model_id.split("/")[-1] if "/" in model_id else model_id
             if len(short_name) > 20:
                 short_name = short_name[:17] + "..."
-            row_buttons.append((short_name, f"model_detail:{prov_id}:{model_id}"))
+            # Callback data is short: "md:<prov_id>:<index>"
+            row_buttons.append((short_name, f"md:{prov_id}:{global_idx}"))
         buttons.append(row_buttons)
     
     nav_row = []
@@ -974,15 +1001,15 @@ def models_list_screen(chat_id: int, page: int = 0, target_mid: int | None = Non
     text = f"<b>📋 لیست مدل‌ها ({len(models)} مورد)</b>\nصفحه {page + 1} از {total_pages}\n\n"
     buttons = []
     
-    # 2 COLUMNS per row
     for i in range(0, len(page_models), 2):
         row_models = page_models[i:i+2]
         row_buttons = []
-        for model_id in row_models:
+        for idx_offset, model_id in enumerate(row_models):
+            global_idx = start + i + idx_offset
             short_name = model_id.split("/")[-1] if "/" in model_id else model_id
             if len(short_name) > 20:
                 short_name = short_name[:17] + "..."
-            row_buttons.append((short_name, f"model_detail_temp:{model_id}"))
+            row_buttons.append((short_name, f"md_temp:{global_idx}"))
         buttons.append(row_buttons)
     
     nav_row = []
@@ -1187,7 +1214,6 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
     
     if text.lower() == "/cancel":
         result = hard_cancel(chat_id)
-        # Toast only, no buttons
         answer_callback(f"cancel_{chat_id}", result, True)
         return
 
@@ -1275,7 +1301,6 @@ def callback(query: dict[str, Any]) -> None:
     cb_mid = int(message.get("message_id", 0))
     data = query.get("data", "")
     
-    # Toast for long ops (no buttons)
     if data.startswith("test_prov_model:") or data.startswith("test_model:"):
         answer_callback(query["id"], "⏳ در حال تست...", False)
     elif data.startswith("view_output:"):
@@ -1296,6 +1321,17 @@ def callback(query: dict[str, Any]) -> None:
             models_screen(chat_id, cb_mid)
         elif data == "providers_menu":
             providers_menu(chat_id, cb_mid)
+        elif data.startswith("provider_detail:"):
+            prov_id = data.split(":", 1)[1]
+            provider_detail_screen(chat_id, prov_id, cb_mid)
+        elif data.startswith("ask_delete_provider:"):
+            prov_id = data.split(":", 1)[1]
+            ask_delete_provider_screen(chat_id, prov_id, cb_mid)
+        elif data.startswith("confirm_delete_provider:"):
+            prov_id = data.split(":", 1)[1]
+            delete_provider(prov_id)
+            answer_callback(query["id"], "🗑 Provider حذف شد.", True)
+            show(chat_id, "<b>🗑 Provider و مدل‌هایش حذف شدند.</b>", [[("◀️ پرووایدرها", "providers_menu")]], cb_mid)
         elif data.startswith("list_provider_models:"):
             prov_id = data.split(":", 1)[1]
             list_provider_models_screen(chat_id, prov_id, page=0, target_mid=cb_mid)
@@ -1304,17 +1340,30 @@ def callback(query: dict[str, Any]) -> None:
             prov_id = parts[1]
             page = int(parts[2])
             list_provider_models_screen(chat_id, prov_id, page=page, target_mid=cb_mid)
+        elif data.startswith("md:"):
+            # Short index callback: md:<prov_id>:<index>
+            parts = data.split(":")
+            prov_id = parts[1]
+            idx = int(parts[2])
+            wizard = WIZARDS.get(chat_id, {})
+            models = wizard.get("models_list", [])
+            if idx < 0 or idx >= len(models):
+                raise ValueError("مدل یافت نشد (لیست منقضی شده).")
+            model_name = models[idx]
+            model_detail_screen(chat_id, prov_id, model_name, cb_mid)
+        elif data.startswith("md_temp:"):
+            idx = int(data.split(":", 1)[1])
+            wizard = WIZARDS.get(chat_id, {})
+            models = wizard.get("models_list", [])
+            prov_id = wizard.get("prov_id", "")
+            if idx < 0 or idx >= len(models):
+                raise ValueError("مدل یافت نشد.")
+            model_name = models[idx]
+            model_detail_screen(chat_id, prov_id, model_name, cb_mid)
         elif data.startswith("model_detail:"):
             parts = data.split(":", 2)
             prov_id = parts[1]
             model_name = parts[2]
-            model_detail_screen(chat_id, prov_id, model_name, cb_mid)
-        elif data.startswith("model_detail_temp:"):
-            model_name = data.split(":", 1)[1]
-            wizard = WIZARDS.get(chat_id, {})
-            prov_id = wizard.get("prov_id", "")
-            if not prov_id:
-                raise ValueError("Provider یافت نشد.")
             model_detail_screen(chat_id, prov_id, model_name, cb_mid)
         elif data.startswith("test_prov_model:"):
             parts = data.split(":", 2)
@@ -1324,7 +1373,6 @@ def callback(query: dict[str, Any]) -> None:
             if not prov:
                 raise ValueError("Provider یافت نشد.")
             token = decrypt_token(prov["token_ciphertext"])
-            # Return to model detail screen after test
             threading.Thread(target=run_model_test_async, args=(chat_id, model_name, prov["base_url"], token, prov["provider_type"], f"model_detail:{prov_id}:{model_name}"), daemon=True).start()
         elif data.startswith("select_prov_model:"):
             parts = data.split(":", 2)
