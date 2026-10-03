@@ -14,7 +14,7 @@ permissions:
   actions: write
 
 env:
-  TRADINGAGENTS_OUTPUT_LANGUAGE: ${{ secrets.TRADINGAGENTS_OUTPUT_LANGUAGE || 'English' }}
+  TRADINGAGENTS_OUTPUT_LANGUAGE: ${{ secrets.TRADINGAGENTS_OUTPUT_LANGUAGE || 'Persian' }}
   TRADINGAGENTS_CHECKPOINT_ENABLED: ${{ secrets.TRADINGAGENTS_CHECKPOINT_ENABLED || 'true' }}
   TRADINGAGENTS_DEFAULT_ANALYSTS: ${{ secrets.TRADINGAGENTS_DEFAULT_ANALYSTS || 'market,social,news,fundamentals' }}
   TRADINGAGENTS_MAX_DEBATE_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_DEBATE_ROUNDS || '1' }}
@@ -80,7 +80,7 @@ jobs:
           set -euo pipefail
           mkdir -p .runtime/controller
           artifact_id="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
-            --jq '[.artifacts[] | select(.name=="controller-state" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
+            --jq '[.artifacts[] | select(.name=="tradingagents-controller-state" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
           if [[ -n "${artifact_id:-}" ]]; then
             gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > .runtime/controller/state.zip
             unzip -o .runtime/controller/state.zip -d .runtime/controller >/dev/null
@@ -100,13 +100,14 @@ jobs:
           BOT_STATE_PATH: ${{ github.workspace }}/.runtime/controller/bot_state.db
           GITHUB_OWNER: ${{ github.repository_owner }}
           GITHUB_REPO: ${{ github.event.repository.name }}
+          GITHUB_REF: ${{ github.event.repository.default_branch }}
         run: python bot.py
 
       - name: Save controller state
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: controller-state
+          name: tradingagents-controller-state
           path: .runtime/controller/bot_state.db
           retention-days: 90
           if-no-files-found: warn
@@ -116,7 +117,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     concurrency:
-      group: tradingagents-engine-${{ github.event.client_payload.request_id }}
+      group: tradingagents-engine-${{ github.repository }}
       cancel-in-progress: false
     steps:
       - name: Checkout repository
@@ -134,7 +135,7 @@ jobs:
       - name: Prepare runtime
         run: |
           set -euo pipefail
-          mkdir -p .runtime/run .runtime/results .runtime/cache
+          mkdir -p .runtime/run .runtime/results .runtime/cache .runtime/cache/memory
 
       - name: Restore TradingAgents state
         env:
@@ -142,12 +143,42 @@ jobs:
         run: |
           set -euo pipefail
           artifact_id="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
-            --jq '[.artifacts[] | select(.name=="engine-cache" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
+            --jq '[.artifacts[] | select(.name=="tradingagents-state" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
           if [[ -n "${artifact_id:-}" ]]; then
             gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > .runtime/state.zip
             unzip -o .runtime/state.zip -d .runtime/cache >/dev/null
             rm -f .runtime/state.zip
           fi
+
+      - name: Read request
+        env:
+          REQUEST_JSON: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          p = json.loads(os.environ.get("REQUEST_JSON") or "{}")
+          if not p.get("request_id"):
+              raise SystemExit("Missing request_id")
+          mode = str(p.get("mode") or "analysis")
+          params = p.get("params") or {}
+          out = {
+              "REQUEST_ID": str(p.get("request_id", "")),
+              "REQUEST_MODE": mode,
+              "REQUEST_CHAT_ID": str(p.get("chat_id", "")),
+              "MODEL_ID": str(p.get("model_id", "")),
+              "TICKER": str(params.get("ticker", "")),
+              "TICKERS": str(params.get("tickers", "")),
+              "ANALYSIS_DATE": str(params.get("date", "")),
+              "START_DATE": str(params.get("start", "")),
+              "END_DATE": str(params.get("end", "")),
+              "EVERY": str(params.get("every", "7")),
+              "ANALYSTS": str(params.get("analysts", "")),
+          }
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              for key, value in out.items():
+                  f.write(f"{key}<<TA_EOF\n{value}\nTA_EOF\n")
+          PY
 
       - name: Validate unattended configuration
         run: |
@@ -157,68 +188,91 @@ jobs:
           [[ -n "${TRADINGAGENTS_QUICK_THINK_LLM:-}" ]] || { echo "Missing active quick-thinking model."; exit 3; }
           [[ -n "${TRADINGAGENTS_LLM_BACKEND_URL:-}" ]] || { echo "Missing active model Base URL."; exit 3; }
 
-      - name: Run TradingAgents CLI
-        env:
-          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+      - name: Build agent command
         run: |
-          python - <<'PY'
-          import json, os, subprocess, sys
-          p = json.loads(os.environ["PAYLOAD"])
-          mode = str(p.get("mode") or "")
-          params = p.get("params") or {}
-          default_analysts = os.environ.get("TRADINGAGENTS_DEFAULT_ANALYSTS", "market,social,news,fundamentals")
-          cmd = ["tradingagents"]
-          if mode == "analysis":
-              missing = [k for k in ("ticker", "date") if not params.get(k)]
-              if missing:
-                  sys.exit("Missing params: " + ", ".join(missing))
-              cmd += ["--ticker", str(params["ticker"]), "--date", str(params["date"]),
-                      "--analysts", str(params.get("analysts") or default_analysts),
-                      "--save", "--no-show"]
-          elif mode == "backtest":
-              missing = [k for k in ("tickers", "start", "end") if not params.get(k)]
-              if missing:
-                  sys.exit("Missing params: " + ", ".join(missing))
-              cmd += ["backtest", str(params["tickers"]),
-                      "--start", str(params["start"]), "--end", str(params["end"]),
-                      "--every", str(params.get("every") or 7),
-                      "--analysts", str(params.get("analysts") or default_analysts)]
-          else:
-              sys.exit("Unsupported mode: " + mode)
-          print("Executing:", " ".join(cmd), flush=True)
-          os.makedirs(".runtime/run", exist_ok=True)
-          open(".runtime/run/marker", "w").close()
-          with open(".runtime/run/agent.log", "w", encoding="utf-8") as log:
-              proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-              for line in proc.stdout:
-                  sys.stdout.write(line)
-                  log.write(line)
-          code = proc.wait()
-          print("CLI exit code:", code, flush=True)
-          sys.exit(code)
-          PY
+          set -euo pipefail
+          mkdir -p .runtime/run
+          if [[ "$REQUEST_MODE" == "analysis" ]]; then
+            [[ -n "$TICKER" ]] || { echo "Missing ticker."; exit 2; }
+            [[ -n "$ANALYSIS_DATE" ]] || { echo "Missing analysis date."; exit 2; }
+            CMD=(tradingagents --ticker "$TICKER" --date "$ANALYSIS_DATE" --analysts "${ANALYSTS:-${TRADINGAGENTS_DEFAULT_ANALYSTS}}" --save --no-show --checkpoint)
+          elif [[ "$REQUEST_MODE" == "backtest" ]]; then
+            [[ -n "$TICKERS" ]] || { echo "Missing backtest tickers."; exit 2; }
+            [[ -n "$START_DATE" && -n "$END_DATE" ]] || { echo "Missing backtest dates."; exit 2; }
+            CMD=(tradingagents backtest "$TICKERS" --start "$START_DATE" --end "$END_DATE" --every "${EVERY:-7}" --analysts "${ANALYSTS:-${TRADINGAGENTS_DEFAULT_ANALYSTS}}")
+          else
+            echo "Unsupported mode: $REQUEST_MODE"
+            exit 2
+          fi
+          printf '%q ' "${CMD[@]}" > .runtime/run/command.txt
+          cat > .runtime/run/request.json <<EOF
+          {
+            "request_id": "${REQUEST_ID}",
+            "mode": "${REQUEST_MODE}",
+            "chat_id": "${REQUEST_CHAT_ID}",
+            "ticker": "${TICKER}",
+            "tickers": "${TICKERS}",
+            "date": "${ANALYSIS_DATE}",
+            "start": "${START_DATE}",
+            "end": "${END_DATE}",
+            "every": "${EVERY}",
+            "analysts": "${ANALYSTS}"
+          }
+          EOF
+          echo "Starting TradingAgents..."
+          echo "Request ID: ${REQUEST_ID}"
+          echo "Mode: ${REQUEST_MODE}"
+          echo "Language: ${TRADINGAGENTS_OUTPUT_LANGUAGE}"
+          "${CMD[@]}" 2>&1 | tee .runtime/run/agent.log
 
-      - name: Collect engine outputs
+      - name: Collect and merge all agent outputs
         if: always()
         run: |
           set -uo pipefail
           mkdir -p .runtime/results
-          echo "Searching for TradingAgents reports in $HOME/.tradingagents/ ..."
+          OUTDIR=".runtime/results"
+          MERGED="$OUTDIR/full_report.md"
+          : > "$MERGED"
+          echo "# 📊 گزارش کامل TradingAgents" >> "$MERGED"
+          echo "" >> "$MERGED"
+          echo "Request ID: \`${REQUEST_ID}\`" >> "$MERGED"
+          echo "Mode: \`${REQUEST_MODE}\`" >> "$MERGED"
+          echo "Language: \`${TRADINGAGENTS_OUTPUT_LANGUAGE}\`" >> "$MERGED"
+          echo "Ticker: \`${TICKER:-${TICKERS:-—}}\`" >> "$MERGED"
+          echo "Date/Range: \`${ANALYSIS_DATE:-${START_DATE:-—} → ${END_DATE:-—}}\`" >> "$MERGED"
+          echo "Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$MERGED"
+          echo "" >> "$MERGED"
+          echo "---" >> "$MERGED"
+          echo "" >> "$MERGED"
           if [[ -d "$HOME/.tradingagents" ]]; then
-            find "$HOME/.tradingagents" -type f \( -name '*.md' -o -name '*.txt' -o -name '*.json' \) -newer .runtime/run/marker 2>/dev/null | while read -r f; do
-              cp -f "$f" ".runtime/results/$(basename "$f")" || true
+            find "$HOME/.tradingagents" -type f \( -name '*.md' -o -name '*.txt' -o -name '*.json' \) 2>/dev/null | sort | while read -r f; do
+              base=$(basename "$f")
+              cp -f "$f" "$OUTDIR/$base" || true
+              echo "" >> "$MERGED"
+              echo "---" >> "$MERGED"
+              echo "" >> "$MERGED"
+              echo "## 📎 $base" >> "$MERGED"
+              echo "" >> "$MERGED"
+              echo '```' >> "$MERGED"
+              cat "$f" >> "$MERGED"
+              echo "" >> "$MERGED"
+              echo '```' >> "$MERGED"
             done
           fi
-          # Cleanup: never send python code or databases as a report
-          find .runtime/results -type f \( -name "*.py" -o -name "*.db" -o -name "*.zip" -o -name "*.yml" \) -delete || true
-          echo "Collected files for Telegram:"
-          ls -la .runtime/results || true
+          if [[ -f .runtime/run/agent.log ]]; then
+            cp -f .runtime/run/agent.log "$OUTDIR/agent.log"
+          fi
+          echo ""
+          echo "=== Collected files ==="
+          ls -la "$OUTDIR"
+          echo "=== Merged report size ==="
+          wc -c "$MERGED"
 
       - name: Save TradingAgents state
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: engine-cache
+          name: tradingagents-state
           path: .runtime/cache/
           retention-days: 90
           if-no-files-found: warn
@@ -227,7 +281,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: engine-run-${{ github.run_id }}
+          name: tradingagents-run-${{ github.run_id }}
           path: .runtime/run/
           retention-days: 90
           if-no-files-found: warn
@@ -236,7 +290,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: engine-results-${{ github.run_id }}
+          name: tradingagents-results-${{ github.run_id }}
           path: .runtime/results/
           retention-days: 90
           if-no-files-found: warn
