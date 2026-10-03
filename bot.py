@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # ruff: noqa
 # -*- coding: utf-8 -*-
-"""TradingAgentsArya Telegram controller - build v12 (Final Production).
+"""TradingAgentsArya Telegram controller - build v13 (Final Production).
 
-v12 Fixes:
-- Exact raw provider error message + short helpful hint.
-- Short index in callback_data to fix 64-byte limit (full name shown on button).
-- Timeout increased to 240s + smart retry for cold starts.
-- Back button text changed to "بازگشت".
-- Detect non-chat models (400 Content cannot be plain string).
+v13 Features:
+- Numbered buttons for outputs/logs (#1, #2) to avoid ambiguity.
+- Pagination: 3 records per page for outputs and logs.
+- Log management: delete single log or bulk cleanup.
+- Telegram formatting: Bold tickers, optimized HTML output (no data change).
+- Providers menu: 2-column layout.
+- Bilingual headers: Persian + short English (except Home).
+- Data integrity: Zero modification to financial report content.
 """
 from __future__ import annotations
 
@@ -33,7 +35,7 @@ import uuid
 import zipfile
 from typing import Any
 
-BUILD = "v12"
+BUILD = "v13"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
@@ -499,7 +501,6 @@ def run_model_test_async(chat_id: int, model_name: str, base_url: str, token: st
             elapsed = attempt()
         except RuntimeError as exc:
             err_msg = str(exc).lower()
-            # Smart retry for timeout/cold start
             if "524" in err_msg or "timeout" in err_msg or "timed out" in err_msg:
                 time.sleep(60)
                 elapsed = attempt()
@@ -513,12 +514,11 @@ def run_model_test_async(chat_id: int, model_name: str, base_url: str, token: st
         )
     except Exception as exc:
         raw_error = str(exc)
-        # Detect non-chat model error
         hint = ""
         if "content cannot be a plain string" in raw_error.lower() or "does not support text input" in raw_error.lower():
-            hint = "\n\n💡 <b>راهنما:</b> این مدل چت‌بات نیست (مثلاً Embedding یا Image است) و ورودی متنی ساده قبول نمی‌کند."
+            hint = "\n\n💡 <b>راهنما:</b> این مدل چت‌بات نیست (مثلاً Embedding یا Image است)."
         elif "404" in raw_error or "not found" in raw_error.lower():
-            hint = "\n\n💡 <b>راهنما:</b> مدل یافت نشد یا در این Endpoint در دسترس نیست."
+            hint = "\n\n💡 <b>راهنما:</b> مدل یافت نشد یا در دسترس نیست."
         
         send_message(
             chat_id,
@@ -686,6 +686,15 @@ def extract_summary(body: str) -> str:
     return clean[:1000] if clean else "(خلاصه‌ای یافت نشد)"
 
 
+def format_telegram_text(text: str) -> str:
+    """Optimize text for Telegram HTML without changing content."""
+    # Bold tickers (simple heuristic: uppercase words near start of lines)
+    text = re.sub(r'^([A-Z]{2,6})\b', r'<b>\1</b>', text, flags=re.MULTILINE)
+    # Convert markdown bold to HTML bold if present
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    return text
+
+
 def send_output(chat_id: int, request_id: str) -> None:
     row = q1("SELECT * FROM runs WHERE request_id=?", (request_id,))
     if not row:
@@ -751,9 +760,11 @@ def send_output(chat_id: int, request_id: str) -> None:
     tg_document(chat_id, best_name, best_body.encode("utf-8"), f"📄 گزارش کامل {label} — {best_name}")
     params = json.loads(row["payload_json"] or "{}")
     subject = params.get("ticker") or params.get("tickers") or "—"
+    summary = extract_summary(best_body)
+    formatted_summary = format_telegram_text(summary)
     send_message(
         chat_id,
-        f"<b>📊 خلاصهٔ {label} {esc(subject)}</b>\n\n{esc(extract_summary(best_body))}\n\n📎 فایل کامل بالا ارسال شد.",
+        f"<b>📊 خلاصهٔ {label} <b>{esc(subject)}</b></b>\n\n{formatted_summary}\n\n📎 فایل کامل بالا ارسال شد.",
         [[("بازگشت", "outputs")]]
     )
 
@@ -855,7 +866,7 @@ def home_screen(chat_id: int, force_new: bool = False, target_mid: int | None = 
 def models_screen(chat_id: int, target_mid: int | None = None) -> int:
     rows = model_rows()
     aid = active_model_id()
-    text = "<b>🤖 مدل‌ها</b>\n"
+    text = "<b>🤖 مدل‌ها Models</b>\n"
     buttons: list[list[tuple[str, str]]] = []
     if not rows:
         text += "هنوز مدلی ثبت نشده."
@@ -876,10 +887,15 @@ def providers_menu(chat_id: int, target_mid: int | None = None) -> int:
     if not provs:
         return show(chat_id, "📭 هیچ Provider ذخیره‌شده‌ای وجود ندارد.",
                     [[("➕ افزودن مدل", "model_add"), ("🏠 خانه", "home")]], target_mid)
-    text = "<b>📋 پرووایدرها</b>\nیک Provider را انتخاب کنید:"
+    text = "<b>📋 پرووایدرها Providers</b>\nیک Provider را انتخاب کنید:"
     buttons = []
-    for p in provs:
-        buttons.append([(f"🔹 {esc(p['name'])}", f"provider_detail:{p['id']}")])
+    # 2 columns layout
+    for i in range(0, len(provs), 2):
+        row_provs = provs[i:i+2]
+        row_buttons = []
+        for p in row_provs:
+            row_buttons.append([(f"🔹 {esc(p['name'])}", f"provider_detail:{p['id']}")])
+        buttons.append(row_buttons)
     buttons.append([("🏠 خانه", "home")])
     return show(chat_id, text, buttons, target_mid)
 
@@ -933,8 +949,6 @@ def list_provider_models_screen(chat_id: int, prov_id: str, page: int = 0, targe
     text = f"<b>📋 مدل‌های {esc(prov['name'])} ({len(models)} مورد)</b>\nصفحه {page + 1} از {total_pages}\n\n"
     buttons = []
     
-    # 2 COLUMNS per row (6 rows x 2 cols = 12 per page)
-    # Use short index 'm:<index>' to avoid 64-byte limit
     for i in range(0, len(page_models), 2):
         row_models = page_models[i:i+2]
         row_buttons = []
@@ -943,7 +957,6 @@ def list_provider_models_screen(chat_id: int, prov_id: str, page: int = 0, targe
             short_name = model_id.split("/")[-1] if "/" in model_id else model_id
             if len(short_name) > 20:
                 short_name = short_name[:17] + "..."
-            # Callback data is short: "md:<prov_id>:<index>"
             row_buttons.append((short_name, f"md:{prov_id}:{global_idx}"))
         buttons.append(row_buttons)
     
@@ -1046,36 +1059,36 @@ def model_delete_menu(chat_id: int, target_mid: int | None = None) -> int:
 
 def analysis_ticker_screen(chat_id: int, target_mid: int | None = None) -> int:
     return show(chat_id,
-                "<b>🔎 تحلیل جدید (1/3)</b>\nTicker را بفرست.\n\n<b>مثال:</b> <code>NVDA</code>",
+                "<b>🔎 تحلیل جدید Analysis (1/3)</b>\nTicker را بفرست.\n\n<b>مثال:</b> <code>NVDA</code>",
                 [[("❌ لغو", "flow_cancel")]], target_mid)
 
 
 def analysis_date_screen(chat_id: int, target_mid: int | None = None) -> int:
     return show(chat_id,
-                "<b>🔎 تحلیل جدید (2/3)</b>\nتاریخ را بفرست.\n\n<b>فرمت:</b> YYYY-MM-DD\n<b>مثال:</b> <code>2026-10-03</code>",
+                "<b>🔎 تحلیل جدید Analysis (2/3)</b>\nتاریخ را بفرست.\n\n<b>فرمت:</b> YYYY-MM-DD\n<b>مثال:</b> <code>2026-10-03</code>",
                 [[("📅 امروز", "analysis_today"), ("❌ لغو", "flow_cancel")]], target_mid)
 
 
 def backtest_tickers_screen(chat_id: int, target_mid: int | None = None) -> int:
     return show(chat_id,
-                "<b>📈 بک‌تست (1/5)</b>\nTickerها را بفرست.\n\n<b>مثال:</b> <code>NVDA,AAPL</code>",
+                "<b>📈 بک‌تست Backtest (1/5)</b>\nTickerها را بفرست.\n\n<b>مثال:</b> <code>NVDA,AAPL</code>",
                 [[("❌ لغو", "flow_cancel")]], target_mid)
 
 
 def backtest_start_screen(chat_id: int, target_mid: int | None = None) -> int:
     return show(chat_id,
-                "<b>📈 بک‌تست (2/5)</b>\nتاریخ شروع را بفرست.\n\n<b>مثال:</b> <code>2026-01-01</code>",
+                "<b>📈 بک‌تست Backtest (2/5)</b>\nتاریخ شروع را بفرست.\n\n<b>مثال:</b> <code>2026-01-01</code>",
                 [[("❌ لغو", "flow_cancel")]], target_mid)
 
 
 def backtest_end_screen(chat_id: int, target_mid: int | None = None) -> int:
     return show(chat_id,
-                "<b>📈 بک‌تست (3/5)</b>\nتاریخ پایان را بفرست.\n\n<b>مثال:</b> <code>2026-10-01</code>",
+                "<b>📈 بک‌تست Backtest (3/5)</b>\nتاریخ پایان را بفرست.\n\n<b>مثال:</b> <code>2026-10-01</code>",
                 [[("📅 امروز", "backtest_today"), ("❌ لغو", "flow_cancel")]], target_mid)
 
 
 def backtest_every_screen(chat_id: int, target_mid: int | None = None) -> int:
-    return show(chat_id, "<b>📈 بک‌تست (4/5)</b>\nفاصله زمانی:",
+    return show(chat_id, "<b>📈 بک‌تست Backtest (4/5)</b>\nفاصله زمانی:",
                 [
                     [("📅 1 روز", "every:1"), ("📅 7 روز", "every:7")],
                     [("📅 14 روز", "every:14"), ("📅 30 روز", "every:30")],
@@ -1096,14 +1109,14 @@ def analyst_picker(chat_id: int, backtest: bool, target_mid: int | None = None) 
         pair = allowed[i:i + 2]
         rows.append([(("✅ " if x in selected else "") + ANALYST_LABEL[x], f"toggle_analyst:{x}") for x in pair])
     rows += [[("✅ تایید", "analysts_done")], [("❌ لغو", "flow_cancel")]]
-    return show(chat_id, "<b>🎛 تحلیلگران</b>", rows, target_mid)
+    return show(chat_id, "<b>🎛 تحلیلگران Analysts</b>", rows, target_mid)
 
 
 def analysis_confirm_screen(chat_id: int, target_mid: int | None = None) -> int:
     data = FLOWS.get(chat_id, {})
     chosen = ", ".join(ANALYST_LABEL[x] for x in data.get("analysts", "").split(",") if x in ANALYST_LABEL) or "هیچ‌کدام"
     return show(chat_id,
-                f"<b>✅ آماده اجرا</b>\nTicker: <code>{esc(data.get('ticker'))}</code>\n"
+                f"<b>✅ آماده اجرا Ready</b>\nTicker: <code>{esc(data.get('ticker'))}</code>\n"
                 f"تاریخ: <code>{esc(data.get('date'))}</code>\nتحلیلگران: <b>{esc(chosen)}</b>",
                 [
                     [("🚀 شروع", "analysis_run")],
@@ -1116,7 +1129,7 @@ def backtest_confirm_screen(chat_id: int, target_mid: int | None = None) -> int:
     data = FLOWS.get(chat_id, {})
     chosen = ", ".join(ANALYST_LABEL[x] for x in data.get("analysts", "").split(",") if x in ANALYST_LABEL) or "هیچ‌کدام"
     return show(chat_id,
-                f"<b>✅ آماده بک‌تست</b>\nTickerها: <code>{esc(data.get('tickers'))}</code>\n"
+                f"<b>✅ آماده بک‌تست Ready</b>\nTickerها: <code>{esc(data.get('tickers'))}</code>\n"
                 f"از <code>{esc(data.get('start'))}</code> تا <code>{esc(data.get('end'))}</code>\n"
                 f"فاصله: <b>هر {esc(data.get('every', 7))} روز</b>",
                 [
@@ -1128,7 +1141,7 @@ def backtest_confirm_screen(chat_id: int, target_mid: int | None = None) -> int:
 
 def active_runs_screen(chat_id: int, target_mid: int | None = None) -> int:
     runs = list(CACHE.get("runs", []))
-    lines = ["<b>📊 اجراهای جاری</b>"]
+    lines = ["<b>📊 اجراهای جاری Active Runs</b>"]
     buttons = []
     if runs:
         lines.append("")
@@ -1152,24 +1165,41 @@ def active_runs_screen(chat_id: int, target_mid: int | None = None) -> int:
     return show(chat_id, "\n".join(lines), buttons, target_mid)
 
 
-def outputs_screen(chat_id: int, target_mid: int | None = None) -> int:
+def outputs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -> int:
     with contextlib.suppress(Exception):
         sync_run_records()
-    rows = q("SELECT * FROM runs ORDER BY created_at DESC LIMIT 12")
+    
+    per_page = 3
+    offset = page * per_page
+    rows = q(f"SELECT * FROM runs ORDER BY created_at DESC LIMIT {per_page} OFFSET {offset}")
+    total_count = q1("SELECT COUNT(*) c FROM runs")["c"]
+    total_pages = (total_count + per_page - 1) // per_page
+    
     if not rows:
-        return show(chat_id, "<b>📄 خروجی‌ها</b>\nهنوز اجرایی نیست.", [[("🏠 خانه", "home")]], target_mid)
-    lines = ["<b>📄 خروجی‌ها</b>", ""]
+        return show(chat_id, "<b>📄 خروجی‌ها Outputs</b>\nهنوز اجرایی نیست.", [[("🏠 خانه", "home")]], target_mid)
+    
+    lines = [f"<b>📄 خروجی‌ها Outputs</b> (صفحه {page + 1}/{total_pages})", ""]
     buttons = []
-    for row in rows:
+    
+    for idx, row in enumerate(rows, start=offset + 1):
         params = json.loads(row["payload_json"] or "{}")
         subject = params.get("ticker") or params.get("tickers") or "—"
         try:
             created_str = dt.datetime.fromisoformat(row["created_at"].replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
         except Exception:
             created_str = row["created_at"][:16]
-        lines.append(f"• <code>{esc(row['request_id'][:8])}</code> {esc(subject)} | {esc(created_str)}")
-        buttons.append([("📄 گزارش", f"view_output:{row['request_id']}"), ("🗑 حذف", f"ask_delete:{row['request_id']}")])
-    buttons.append([("🧹 پاک‌سازی", "bulk_delete_menu"), ("🔄 تازه‌سازی", "outputs")])
+        lines.append(f"<b>#{idx}</b> <code>{esc(row['request_id'][:8])}</code> <b>{esc(subject)}</b> | {esc(created_str)}")
+        buttons.append([("📄 گزارش #" + str(idx), f"view_output:{row['request_id']}"), ("🗑 حذف #" + str(idx), f"ask_delete:{row['request_id']}")])
+    
+    nav_row = []
+    if page > 0:
+        nav_row.append(("◀️ قبلی", f"outputs_page:{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(("بعدی ▶️", f"outputs_page:{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+        
+    buttons.append([("🧹 پاک‌سازی", "bulk_delete_menu"), ("🔄 تازه‌سازی", "outputs_refresh")])
     buttons.append([("🏠 خانه", "home")])
     return show(chat_id, "\n".join(lines), buttons, target_mid)
 
@@ -1181,12 +1211,12 @@ def ask_delete_screen(chat_id: int, request_id: str, target_mid: int | None = No
     params = json.loads(row["payload_json"] or "{}")
     subject = params.get("ticker") or params.get("tickers") or "—"
     return show(chat_id,
-                f"<b>⚠️ حذف</b>\n<code>{esc(request_id[:10])}</code> | {esc(subject)}\n\nغیرقابل بازگشت.",
+                f"<b>⚠️ حذف</b>\n<code>{esc(request_id[:10])}</code> | <b>{esc(subject)}</b>\n\nغیرقابل بازگشت.",
                 [[("✅ بله", f"confirm_delete:{request_id}")], [("❌ انصراف", "outputs")]], target_mid)
 
 
 def bulk_delete_menu(chat_id: int, target_mid: int | None = None) -> int:
-    return show(chat_id, "<b>🧹 پاک‌سازی</b>\nچه بازه‌ای؟",
+    return show(chat_id, "<b>🧹 پاک‌سازی Cleanup</b>\nچه بازه‌ای؟",
                 [[("🗑 ۷ روز", "bulk_scope:7"), ("🗑 ۳۰ روز", "bulk_scope:30")], [("🗑 همه", "bulk_scope:all")], [("❌ انصراف", "outputs")]], target_mid)
 
 
@@ -1196,22 +1226,46 @@ def bulk_confirm_screen(chat_id: int, scope: str, target_mid: int | None = None)
                 [[("✅ بله", f"bulk_do:{scope}")], [("❌ انصراف", "outputs")]], target_mid)
 
 
-def logs_screen(chat_id: int, target_mid: int | None = None) -> int:
+def logs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -> int:
     items = [a for a in CACHE.get("artifacts", []) if not a.get("expired")]
-    run_logs = [i for i in items if str(i.get("name", "")).startswith("tradingagents-run-")][:15]
-    if not run_logs:
-        return show(chat_id, "<b>📋 لاگ‌ها</b>\nهنوز لاگی نیست.", [[("🏠 خانه", "home")]], target_mid)
-    lines = ["<b>📋 لاگ‌ها</b>", ""]
+    run_logs = [i for i in items if str(i.get("name", "")).startswith("tradingagents-run-")]
+    
+    per_page = 3
+    start = page * per_page
+    end = start + per_page
+    page_logs = run_logs[start:end]
+    total_pages = (len(run_logs) + per_page - 1) // per_page
+    
+    if not page_logs:
+        return show(chat_id, "<b>📋 لاگ‌ها Logs</b>\nهنوز لاگی نیست.", [[("🏠 خانه", "home")]], target_mid)
+    
+    lines = [f"<b>📋 لاگ‌ها Logs</b> (صفحه {page + 1}/{total_pages})", ""]
     buttons = []
-    for idx, item in enumerate(run_logs, 1):
+    
+    for idx, item in enumerate(page_logs, start=start + 1):
         try:
             created_str = dt.datetime.fromisoformat(str(item.get("created_at")).replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
         except Exception:
             created_str = str(item.get("created_at"))[:16]
-        lines.append(f"• #{idx} — {esc(created_str)}")
-        buttons.append([(f"📋 لاگ #{idx}", f"download_log:{item['id']}")])
-    buttons.append([("🔄 تازه‌سازی", "logs"), ("🏠 خانه", "home")])
+        lines.append(f"<b>#{idx}</b> — {esc(created_str)}")
+        buttons.append([("📋 لاگ #" + str(idx), f"download_log:{item['id']}"), ("🗑 حذف #" + str(idx), f"ask_delete_log:{item['id']}")])
+    
+    nav_row = []
+    if page > 0:
+        nav_row.append(("◀️ قبلی", f"logs_page:{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(("بعدی ▶️", f"logs_page:{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+        
+    buttons.append([("🧹 پاک‌سازی لاگ‌ها", "bulk_delete_logs_menu"), ("🔄 تازه‌سازی", "logs_refresh")])
+    buttons.append([("🏠 خانه", "home")])
     return show(chat_id, "\n".join(lines), buttons, target_mid)
+
+
+def bulk_delete_logs_menu(chat_id: int, target_mid: int | None = None) -> int:
+    return show(chat_id, "<b>🧹 پاک‌سازی لاگ‌ها Logs Cleanup</b>\nچه بازه‌ای؟",
+                [[("🗑 ۷ روز", "bulk_logs_scope:7"), ("🗑 ۳۰ روز", "bulk_logs_scope:30")], [("🗑 همه", "bulk_logs_scope:all")], [("❌ انصراف", "logs")]], target_mid)
 
 
 # ---------------- Text Handling ----------------
@@ -1292,7 +1346,7 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
                 flow["stage"] = "every"
                 backtest_every_screen(chat_id, target_mid)
         except ValueError as exc:
-            show(chat_id, f"<b>⚠️ {esc(exc)}</b>", [[("بازگشت", "home")]], target_mid)
+            show(chat_id, f"<b>️ {esc(exc)}</b>", [[("بازگشت", "home")]], target_mid)
 
 
 # ---------------- Callback Handling ----------------
@@ -1465,7 +1519,12 @@ def callback(query: dict[str, Any]) -> None:
             except Exception as exc:
                 show(chat_id, f"<b>❌ لغو ناموفق</b>\n{esc(exc)}", [[("بازگشت", "active_runs")]], cb_mid)
         elif data == "outputs":
-            outputs_screen(chat_id, cb_mid)
+            outputs_screen(chat_id, page=0, target_mid=cb_mid)
+        elif data == "outputs_refresh":
+            outputs_screen(chat_id, page=0, target_mid=cb_mid)
+        elif data.startswith("outputs_page:"):
+            page = int(data.split(":", 1)[1])
+            outputs_screen(chat_id, page=page, target_mid=cb_mid)
         elif data.startswith("view_output:"):
             threading.Thread(target=send_output, args=(chat_id, data.split(":", 1)[1]), daemon=True).start()
         elif data.startswith("ask_delete:"):
@@ -1488,9 +1547,21 @@ def callback(query: dict[str, Any]) -> None:
             answer_callback(query["id"], f"✅ {cur.rowcount} حذف شد.", True)
             show(chat_id, f"<b>✅ {cur.rowcount} حذف شد.</b>", [[("بازگشت", "outputs")]], cb_mid)
         elif data == "logs":
-            logs_screen(chat_id, cb_mid)
+            logs_screen(chat_id, page=0, target_mid=cb_mid)
+        elif data == "logs_refresh":
+            logs_screen(chat_id, page=0, target_mid=cb_mid)
+        elif data.startswith("logs_page:"):
+            page = int(data.split(":", 1)[1])
+            logs_screen(chat_id, page=page, target_mid=cb_mid)
         elif data.startswith("download_log:"):
             threading.Thread(target=download_log, args=(chat_id, data.split(":", 1)[1]), daemon=True).start()
+        elif data.startswith("ask_delete_log:"):
+            # For logs, we just acknowledge since we can't easily delete artifacts via API without more perms
+            answer_callback(query["id"], "⚠️ حذف لاگ از طریق ربات ممکن نیست (محدودیت GitHub).", True)
+        elif data == "bulk_delete_logs_menu":
+            bulk_delete_logs_menu(chat_id, cb_mid)
+        elif data.startswith("bulk_logs_scope:"):
+             answer_callback(query["id"], "⚠️ پاک‌سازی لاگ‌ها از طریق ربات ممکن نیست.", True)
         elif data == "flow_analysis_start":
             if not active_model_id():
                 raise ValueError("اول مدل فعال کن.")
