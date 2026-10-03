@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # ruff: noqa
 # -*- coding: utf-8 -*-
-"""TradingAgentsArya Telegram controller - build v11 (Final Stable).
+"""TradingAgentsArya Telegram controller - build v12 (Final Production).
 
-Fixes in v11:
-- FIXED: BUTTON_DATA_INVALID (64 byte limit) by using short indices for models.
-- UI: Model list is now 2 columns x 6 rows (12 items/page).
-- NEW: Delete Provider feature with confirmation.
-- UX: All error messages have a [Back] button, not [Home].
-- UX: Toast notifications have no buttons.
-- /cancel hard-stops everything immediately.
+v12 Fixes:
+- Exact raw provider error message + short helpful hint.
+- Short index in callback_data to fix 64-byte limit (full name shown on button).
+- Timeout increased to 240s + smart retry for cold starts.
+- Back button text changed to "بازگشت".
+- Detect non-chat models (400 Content cannot be plain string).
 """
 from __future__ import annotations
 
@@ -34,7 +33,7 @@ import uuid
 import zipfile
 from typing import Any
 
-BUILD = "v11"
+BUILD = "v12"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
@@ -466,12 +465,12 @@ def add_model_from_provider(prov_id: str, model_name: str) -> str:
     return model_id
 
 
-# ---------------- Smart Model Test (Truly Async) ----------------
+# ---------------- Smart Model Test (Async + Raw Error) ----------------
 def run_model_test_async(chat_id: int, model_name: str, base_url: str, token: str, provider_type: str, return_to: str):
     try:
         started = time.monotonic()
         
-        def attempt(timeout=180):
+        def attempt(timeout=240):
             if provider_type == "anthropic":
                 endpoint = base_url if base_url.endswith("/messages") else base_url + "/v1/messages"
                 status, _, raw = http_json(endpoint, "POST",
@@ -500,8 +499,9 @@ def run_model_test_async(chat_id: int, model_name: str, base_url: str, token: st
             elapsed = attempt()
         except RuntimeError as exc:
             err_msg = str(exc).lower()
+            # Smart retry for timeout/cold start
             if "524" in err_msg or "timeout" in err_msg or "timed out" in err_msg:
-                time.sleep(120)
+                time.sleep(60)
                 elapsed = attempt()
             else:
                 raise
@@ -509,14 +509,21 @@ def run_model_test_async(chat_id: int, model_name: str, base_url: str, token: st
         send_message(
             chat_id,
             f"<b>✅ تست موفق</b>\nمدل: <code>{esc(model_name)}</code>\nزمان پاسخ: <b>{elapsed:.1f}s</b>",
-            [[("◀️ بازگشت", return_to)]]
+            [[("بازگشت", return_to)]]
         )
     except Exception as exc:
         raw_error = str(exc)
+        # Detect non-chat model error
+        hint = ""
+        if "content cannot be a plain string" in raw_error.lower() or "does not support text input" in raw_error.lower():
+            hint = "\n\n💡 <b>راهنما:</b> این مدل چت‌بات نیست (مثلاً Embedding یا Image است) و ورودی متنی ساده قبول نمی‌کند."
+        elif "404" in raw_error or "not found" in raw_error.lower():
+            hint = "\n\n💡 <b>راهنما:</b> مدل یافت نشد یا در این Endpoint در دسترس نیست."
+        
         send_message(
             chat_id,
-            f"<b>❌ تست ناموفق</b>\nمدل: <code>{esc(model_name)}</code>\n\n<code>{esc(raw_error[:3500])}</code>",
-            [[("◀️ بازگشت", return_to)]]
+            f"<b>❌ تست ناموفق</b>\nمدل: <code>{esc(model_name)}</code>\n\n<code>{esc(raw_error[:3000])}</code>{hint}",
+            [[("بازگشت", return_to)]]
         )
 
 
@@ -682,7 +689,7 @@ def extract_summary(body: str) -> str:
 def send_output(chat_id: int, request_id: str) -> None:
     row = q1("SELECT * FROM runs WHERE request_id=?", (request_id,))
     if not row:
-        send_message(chat_id, "❌ این اجرا پیدا نشد.", [[("◀️ خروجی‌ها", "outputs")]])
+        send_message(chat_id, "❌ این اجرا پیدا نشد.", [[("بازگشت", "outputs")]])
         return
     if not row["workflow_run_id"]:
         with contextlib.suppress(Exception):
@@ -690,7 +697,7 @@ def send_output(chat_id: int, request_id: str) -> None:
         row = q1("SELECT * FROM runs WHERE request_id=?", (request_id,))
     run_id = row["workflow_run_id"]
     if not run_id:
-        send_message(chat_id, "⏳ هنوز Run ID ثبت نشده.", [[("◀️ خروجی‌ها", "outputs")]])
+        send_message(chat_id, "⏳ هنوز Run ID ثبت نشده.", [[("بازگشت", "outputs")]])
         return
     try:
         data = gh("GET", f"/actions/runs/{run_id}/artifacts") or {}
@@ -704,11 +711,11 @@ def send_output(chat_id: int, request_id: str) -> None:
             if pick:
                 break
         if not pick:
-            send_message(chat_id, "📭 هنوز Artifact خروجی ساخته نشده.", [[("◀️ خروجی‌ها", "outputs")]])
+            send_message(chat_id, "📭 هنوز Artifact خروجی ساخته نشده.", [[("بازگشت", "outputs")]])
             return
         raw = gh_bytes(f"/actions/artifacts/{pick['id']}/zip")
     except Exception as exc:
-        send_message(chat_id, f"❌ دریافت خروجی ناموفق: {esc(exc)}", [[("◀️ خروجی‌ها", "outputs")]])
+        send_message(chat_id, f"❌ دریافت خروجی ناموفق: {esc(exc)}", [[("بازگشت", "outputs")]])
         return
     zf = zipfile.ZipFile(io.BytesIO(raw))
     scored = []
@@ -735,7 +742,7 @@ def send_output(chat_id: int, request_id: str) -> None:
             score += 2
         scored.append((score, name, body))
     if not scored:
-        send_message(chat_id, "📭 گزارش متنی پیدا نشد.", [[("◀️ خروجی‌ها", "outputs")]])
+        send_message(chat_id, "📭 گزارش متنی پیدا نشد.", [[("بازگشت", "outputs")]])
         return
     scored.sort(key=lambda item: -item[0])
     best_name = scored[0][1].replace("/", "_")
@@ -747,7 +754,7 @@ def send_output(chat_id: int, request_id: str) -> None:
     send_message(
         chat_id,
         f"<b>📊 خلاصهٔ {label} {esc(subject)}</b>\n\n{esc(extract_summary(best_body))}\n\n📎 فایل کامل بالا ارسال شد.",
-        [[("◀️ خروجی‌ها", "outputs")]]
+        [[("بازگشت", "outputs")]]
     )
 
 
@@ -755,7 +762,7 @@ def download_log(chat_id: int, artifact_id: str) -> None:
     try:
         raw = gh_bytes(f"/actions/artifacts/{artifact_id}/zip")
     except Exception as exc:
-        send_message(chat_id, f"❌ دانلود لاگ ناموفق: {esc(exc)}", [[("◀️ لاگ‌ها", "logs")]])
+        send_message(chat_id, f"❌ دانلود لاگ ناموفق: {esc(exc)}", [[("بازگشت", "logs")]])
         return
     zf = zipfile.ZipFile(io.BytesIO(raw))
     log_name = None
@@ -764,7 +771,7 @@ def download_log(chat_id: int, artifact_id: str) -> None:
             log_name = name
             break
     if not log_name:
-        send_message(chat_id, "📭 فایل لاگ پیدا نشد.", [[("◀️ لاگ‌ها", "logs")]])
+        send_message(chat_id, "📭 فایل لاگ پیدا نشد.", [[("بازگشت", "logs")]])
         return
     body = zf.read(log_name).decode("utf-8", "replace")
     tg_document(chat_id, "agent.log", body.encode("utf-8"), "📋 لاگ خام اجرا")
@@ -880,20 +887,20 @@ def providers_menu(chat_id: int, target_mid: int | None = None) -> int:
 def provider_detail_screen(chat_id: int, prov_id: str, target_mid: int | None = None) -> int:
     prov = get_provider(prov_id)
     if not prov:
-        return show(chat_id, "❌ Provider یافت نشد.", [[("◀️ پرووایدرها", "providers_menu")]], target_mid)
+        return show(chat_id, "❌ Provider یافت نشد.", [[("بازگشت", "providers_menu")]], target_mid)
     return show(chat_id,
                 f"<b>🔹 {esc(prov['name'])}</b>\nType: <code>{esc(prov['provider_type'])}</code>\nURL: <code>{esc(prov['base_url'])}</code>",
                 [
                     [("📋 لیست مدل‌ها", f"list_provider_models:{prov_id}")],
                     [("🗑 حذف این Provider", f"ask_delete_provider:{prov_id}")],
-                    [("◀️ بازگشت", "providers_menu")],
+                    [("بازگشت", "providers_menu")],
                 ], target_mid)
 
 
 def ask_delete_provider_screen(chat_id: int, prov_id: str, target_mid: int | None = None) -> int:
     prov = get_provider(prov_id)
     if not prov:
-        return show(chat_id, "❌ Provider یافت نشد.", [[("◀️ پرووایدرها", "providers_menu")]], target_mid)
+        return show(chat_id, "❌ Provider یافت نشد.", [[("بازگشت", "providers_menu")]], target_mid)
     count = q1("SELECT COUNT(*) c FROM models WHERE provider_id=?", (prov_id,))["c"]
     return show(chat_id,
                 f"<b>⚠️ حذف Provider</b>\n\nآیا مطمئنی می‌خواهی <b>{esc(prov['name'])}</b> و <b>{count}</b> مدل مرتبط با آن را حذف کنی؟\n\nاین عمل غیرقابل بازگشت است.",
@@ -906,16 +913,15 @@ def ask_delete_provider_screen(chat_id: int, prov_id: str, target_mid: int | Non
 def list_provider_models_screen(chat_id: int, prov_id: str, page: int = 0, target_mid: int | None = None) -> int:
     prov = get_provider(prov_id)
     if not prov:
-        return show(chat_id, "❌ Provider یافت نشد.", [[("◀️ پرووایدرها", "providers_menu")]], target_mid)
+        return show(chat_id, "❌ Provider یافت نشد.", [[("بازگشت", "providers_menu")]], target_mid)
     
     token = decrypt_token(prov["token_ciphertext"])
     models = fetch_models_list(prov["base_url"], token)
     
     if not models:
         return show(chat_id, f"📭 لیست مدل‌ها برای <b>{esc(prov['name'])}</b> دریافت نشد.",
-                    [[("✏️ ورود دستی", f"manual_model_for_prov:{prov_id}"), ("◀️ پرووایدرها", "providers_menu")]], target_mid)
+                    [[("✏️ ورود دستی", f"manual_model_for_prov:{prov_id}"), ("بازگشت", "providers_menu")]], target_mid)
     
-    # Store full list in memory to use short indices in buttons
     WIZARDS[chat_id] = {"stage": "provider_models", "prov_id": prov_id, "models_list": models}
     
     per_page = 12
@@ -949,7 +955,7 @@ def list_provider_models_screen(chat_id: int, prov_id: str, page: int = 0, targe
     if nav_row:
         buttons.append(nav_row)
     
-    buttons.append([("✏️ ورود دستی", f"manual_model_for_prov:{prov_id}"), ("◀️ پرووایدرها", "providers_menu")])
+    buttons.append([("✏️ ورود دستی", f"manual_model_for_prov:{prov_id}"), ("بازگشت", "providers_menu")])
     return show(chat_id, text, buttons, target_mid)
 
 
@@ -959,7 +965,7 @@ def model_detail_screen(chat_id: int, prov_id: str, model_name: str, target_mid:
                 [
                     [("🧪 تست اتصال", f"test_prov_model:{prov_id}:{model_name}")],
                     [("✅ انتخاب و فعال‌سازی", f"select_prov_model:{prov_id}:{model_name}")],
-                    [("◀️ بازگشت به لیست", f"list_provider_models:{prov_id}")],
+                    [("بازگشت", f"list_provider_models:{prov_id}")],
                 ], target_mid)
 
 
@@ -990,7 +996,7 @@ def models_list_screen(chat_id: int, page: int = 0, target_mid: int | None = Non
     
     if not models:
         return show(chat_id, "📭 لیست مدل‌ها خالی است.",
-                    [[("✏️ ورود دستی", "wizard_manual_model"), ("◀️ مدل‌ها", "models")]], target_mid)
+                    [[("✏️ ورود دستی", "wizard_manual_model"), ("بازگشت", "models")]], target_mid)
     
     per_page = 12
     start = page * per_page
@@ -1020,21 +1026,21 @@ def models_list_screen(chat_id: int, page: int = 0, target_mid: int | None = Non
     if nav_row:
         buttons.append(nav_row)
     
-    buttons.append([("✏️ ورود دستی", "wizard_manual_model"), ("◀️ مدل‌ها", "models")])
+    buttons.append([("✏️ ورود دستی", "wizard_manual_model"), ("بازگشت", "models")])
     return show(chat_id, text, buttons, target_mid)
 
 
 def model_test_menu(chat_id: int, target_mid: int | None = None) -> int:
     buttons = [[(f"🧪 {r['name']}", f"test_model:{r['id']}")] for r in model_rows()]
-    buttons.append([("◀️ مدل‌ها", "models")])
+    buttons.append([("بازگشت", "models")])
     return show(chat_id,
-                "<b>🧪 تست اتصال</b>\nTimeout: ۱۸۰ ثانیه + Retry هوشمند.",
+                "<b>🧪 تست اتصال</b>\nTimeout: ۲۴۰ ثانیه + Retry هوشمند.",
                 buttons, target_mid)
 
 
 def model_delete_menu(chat_id: int, target_mid: int | None = None) -> int:
     buttons = [[(f"🗑 {r['name']}", f"delete_model:{r['id']}")] for r in model_rows()]
-    buttons.append([("◀️ مدل‌ها", "models")])
+    buttons.append([("بازگشت", "models")])
     return show(chat_id, "<b>🗑 حذف مدل</b>\nمدل را انتخاب کن.", buttons, target_mid)
 
 
@@ -1171,7 +1177,7 @@ def outputs_screen(chat_id: int, target_mid: int | None = None) -> int:
 def ask_delete_screen(chat_id: int, request_id: str, target_mid: int | None = None) -> int:
     row = q1("SELECT * FROM runs WHERE request_id=?", (request_id,))
     if not row:
-        return show(chat_id, "❌ پیدا نشد.", [[("◀️ خروجی‌ها", "outputs")]], target_mid)
+        return show(chat_id, "❌ پیدا نشد.", [[("بازگشت", "outputs")]], target_mid)
     params = json.loads(row["payload_json"] or "{}")
     subject = params.get("ticker") or params.get("tickers") or "—"
     return show(chat_id,
@@ -1254,7 +1260,7 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
                      f"<b>✅ مدل ذخیره شد</b>\n<code>{esc(text)}</code>",
                      [[("🧪 تست", f"test_model:{model_id}"), ("🏠 خانه", "home")]], target_mid)
         except ValueError as exc:
-            show(chat_id, f"<b>⚠️ {esc(exc)}</b>", [[("◀️ بازگشت", "models")]], target_mid)
+            show(chat_id, f"<b>⚠️ {esc(exc)}</b>", [[("بازگشت", "models")]], target_mid)
         return
 
     if chat_id in FLOWS:
@@ -1286,7 +1292,7 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
                 flow["stage"] = "every"
                 backtest_every_screen(chat_id, target_mid)
         except ValueError as exc:
-            show(chat_id, f"<b>⚠️ {esc(exc)}</b>", [[("◀️ بازگشت", "home")]], target_mid)
+            show(chat_id, f"<b>⚠️ {esc(exc)}</b>", [[("بازگشت", "home")]], target_mid)
 
 
 # ---------------- Callback Handling ----------------
@@ -1331,7 +1337,7 @@ def callback(query: dict[str, Any]) -> None:
             prov_id = data.split(":", 1)[1]
             delete_provider(prov_id)
             answer_callback(query["id"], "🗑 Provider حذف شد.", True)
-            show(chat_id, "<b>🗑 Provider و مدل‌هایش حذف شدند.</b>", [[("◀️ پرووایدرها", "providers_menu")]], cb_mid)
+            show(chat_id, "<b>🗑 Provider و مدل‌هایش حذف شدند.</b>", [[("بازگشت", "providers_menu")]], cb_mid)
         elif data.startswith("list_provider_models:"):
             prov_id = data.split(":", 1)[1]
             list_provider_models_screen(chat_id, prov_id, page=0, target_mid=cb_mid)
@@ -1341,7 +1347,6 @@ def callback(query: dict[str, Any]) -> None:
             page = int(parts[2])
             list_provider_models_screen(chat_id, prov_id, page=page, target_mid=cb_mid)
         elif data.startswith("md:"):
-            # Short index callback: md:<prov_id>:<index>
             parts = data.split(":")
             prov_id = parts[1]
             idx = int(parts[2])
@@ -1410,7 +1415,7 @@ def callback(query: dict[str, Any]) -> None:
             token = decrypt_token(prov["token_ciphertext"])
             models = fetch_models_list(prov["base_url"], token)
             if not models:
-                show(chat_id, "📭 لیست خالی.", [[("✏️ دستی", "wizard_manual_model"), ("◀️ بازگشت", "models")]], cb_mid)
+                show(chat_id, "📭 لیست خالی.", [[("✏️ دستی", "wizard_manual_model"), ("بازگشت", "models")]], cb_mid)
             else:
                 wizard["models_list"] = models
                 wizard["stage"] = "model_list"
@@ -1435,7 +1440,7 @@ def callback(query: dict[str, Any]) -> None:
             write_active_model_secrets(row)
             set_active_model(row["id"])
             answer_callback(query["id"], "⚡ فعال شد!", True)
-            show(chat_id, f"<b>⚡ فعال شد</b>\n<code>{esc(row['name'])}</code>", [[("◀️ مدل‌ها", "models")]], cb_mid)
+            show(chat_id, f"<b>⚡ فعال شد</b>\n<code>{esc(row['name'])}</code>", [[("بازگشت", "models")]], cb_mid)
         elif data == "model_delete_menu":
             if not admin(user_id):
                 raise ValueError("فقط Admin.")
@@ -1448,7 +1453,7 @@ def callback(query: dict[str, Any]) -> None:
             if active_model_id() == model_id:
                 set_active_model("")
             answer_callback(query["id"], "🗑 حذف شد.", True)
-            show(chat_id, "<b>🗑 حذف شد.</b>", [[("◀️ مدل‌ها", "models")]], cb_mid)
+            show(chat_id, "<b>🗑 حذف شد.</b>", [[("بازگشت", "models")]], cb_mid)
         elif data == "active_runs":
             active_runs_screen(chat_id, cb_mid)
         elif data.startswith("cancelw:"):
@@ -1456,9 +1461,9 @@ def callback(query: dict[str, Any]) -> None:
             try:
                 cancel_run(run_id)
                 answer_callback(query["id"], "🛑 لغو شد.", True)
-                show(chat_id, f"<b>🛑 لغو شد</b>\nRun: {run_id}", [[("◀️ اجراها", "active_runs")]], cb_mid)
+                show(chat_id, f"<b>🛑 لغو شد</b>\nRun: {run_id}", [[("بازگشت", "active_runs")]], cb_mid)
             except Exception as exc:
-                show(chat_id, f"<b>❌ لغو ناموفق</b>\n{esc(exc)}", [[("◀️ اجراها", "active_runs")]], cb_mid)
+                show(chat_id, f"<b>❌ لغو ناموفق</b>\n{esc(exc)}", [[("بازگشت", "active_runs")]], cb_mid)
         elif data == "outputs":
             outputs_screen(chat_id, cb_mid)
         elif data.startswith("view_output:"):
@@ -1468,7 +1473,7 @@ def callback(query: dict[str, Any]) -> None:
         elif data.startswith("confirm_delete:"):
             db("DELETE FROM runs WHERE request_id=?", (data.split(":", 1)[1],))
             answer_callback(query["id"], "✅ حذف شد.", True)
-            show(chat_id, "<b>✅ حذف شد.</b>", [[("◀️ خروجی‌ها", "outputs")]], cb_mid)
+            show(chat_id, "<b>✅ حذف شد.</b>", [[("بازگشت", "outputs")]], cb_mid)
         elif data == "bulk_delete_menu":
             bulk_delete_menu(chat_id, cb_mid)
         elif data.startswith("bulk_scope:"):
@@ -1481,7 +1486,7 @@ def callback(query: dict[str, Any]) -> None:
                 cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=int(scope))).isoformat()
                 cur = db("DELETE FROM runs WHERE created_at < ?", (cutoff,))
             answer_callback(query["id"], f"✅ {cur.rowcount} حذف شد.", True)
-            show(chat_id, f"<b>✅ {cur.rowcount} حذف شد.</b>", [[("◀️ خروجی‌ها", "outputs")]], cb_mid)
+            show(chat_id, f"<b>✅ {cur.rowcount} حذف شد.</b>", [[("بازگشت", "outputs")]], cb_mid)
         elif data == "logs":
             logs_screen(chat_id, cb_mid)
         elif data.startswith("download_log:"):
@@ -1574,7 +1579,7 @@ def callback(query: dict[str, Any]) -> None:
             answer_callback(query["id"], f"🚀 {label} در صف!", True)
             show(chat_id, f"<b>🚀 در صف</b>\n<code>{esc(request_id[:10])}</code>", [[("📊 اجراها", "active_runs"), ("🏠 خانه", "home")]], cb_mid)
     except Exception as exc:
-        show(chat_id, f"<b>❌ {esc(exc)}</b>", [[("◀️ بازگشت", "home")]], cb_mid)
+        show(chat_id, f"<b>❌ {esc(exc)}</b>", [[("بازگشت", "home")]], cb_mid)
 
 
 # ---------------- Polling ----------------
