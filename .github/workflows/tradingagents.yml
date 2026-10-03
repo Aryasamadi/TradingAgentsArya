@@ -205,6 +205,20 @@ jobs:
             exit 2
           fi
           printf '%q ' "${CMD[@]}" > .runtime/run/command.txt
+          cat > .runtime/run/request.json <<EOF
+          {
+            "request_id": "${REQUEST_ID}",
+            "mode": "${REQUEST_MODE}",
+            "chat_id": "${REQUEST_CHAT_ID}",
+            "ticker": "${TICKER}",
+            "tickers": "${TICKERS}",
+            "date": "${ANALYSIS_DATE}",
+            "start": "${START_DATE}",
+            "end": "${END_DATE}",
+            "every": "${EVERY}",
+            "analysts": "${ANALYSTS}"
+          }
+          EOF
           echo "Starting TradingAgents..."
           echo "Request ID: ${REQUEST_ID}"
           echo "Mode: ${REQUEST_MODE}"
