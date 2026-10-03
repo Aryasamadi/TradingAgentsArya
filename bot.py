@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 # ruff: noqa
 # -*- coding: utf-8 -*-
-"""TradingAgentsArya Telegram controller - build v9 (Perfect UI/UX).
+"""TradingAgentsArya Telegram controller - build v10 (Final Corrected).
 
-v9 features:
-- FIXED: Callbacks edit the exact message clicked (no more top/bottom mismatch).
-- NEW: Fetch models list from provider (/v1/models) with pagination (6 per page).
-- NEW: Test & Select model directly from the list.
-- NEW: Smart retry for 524/timeout errors (wait 120s, retry once).
-- UX: Popup alerts for status updates (Testing..., Saved, Error).
-- CLEAN: Removed verbose "stored URL" messages; simple, clear feedback.
+v10 Final Features:
+- Model list: 12 buttons per page (2 rows x 6), ONLY model names.
+- Click model name -> Detail screen with [Test] [Select] buttons.
+- Test success: Clean "✅ Success (X.Xs)" message.
+- Test failure: EXACT raw provider error message (no modification).
+- Test runs in background thread; bot never blocks.
+- Result sent as NEW message (never lost).
+- Toast (top bar) for status, Alert (center) for confirmations.
+- /cancel command: hard cancel all flows & running engines.
+- Provider storage: save URL/Token permanently, switch between providers.
+- Smart retry for 524/timeout (wait 120s, retry once).
 """
 from __future__ import annotations
 
@@ -34,7 +38,7 @@ import uuid
 import zipfile
 from typing import Any
 
-BUILD = "v9"
+BUILD = "v10"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
@@ -65,8 +69,16 @@ DB.executescript(
         message_id INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS providers (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        provider_type TEXT NOT NULL,
+        base_url TEXT NOT NULL,
+        token_ciphertext BLOB,
+        created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS models (
-        id TEXT PRIMARY KEY, name TEXT NOT NULL, provider TEXT NOT NULL,
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, provider_id TEXT NOT NULL,
         base_url TEXT NOT NULL, token_ciphertext BLOB,
         enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
     );
@@ -83,6 +95,7 @@ for stmt in (
     "ALTER TABLE runs ADD COLUMN workflow_run_id INTEGER",
     "ALTER TABLE runs ADD COLUMN conclusion TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE runs ADD COLUMN notified INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE models ADD COLUMN provider_id TEXT",
 ):
     with contextlib.suppress(sqlite3.OperationalError):
         DB.execute(stmt)
@@ -159,12 +172,13 @@ def http_json(url: str, method: str = "GET", data: Any = None, headers: dict | N
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
-            return resp.status, (json.loads(raw) if raw else None)
+            return resp.status, (json.loads(raw) if raw else None), raw
     except urllib.error.HTTPError as exc:
         body_bytes = b""
         with contextlib.suppress(Exception):
             body_bytes = exc.read()
-        raise RuntimeError(f"HTTP {exc.code} — {body_bytes.decode('utf-8', 'replace')[:400]}") from exc
+        # Return raw body for error display
+        raise RuntimeError(body_bytes.decode("utf-8", "replace") or f"HTTP {exc.code}") from exc
 
 
 def gh(method: str, path: str, data: Any = None, timeout: int = 30):
@@ -175,7 +189,7 @@ def gh(method: str, path: str, data: Any = None, timeout: int = 30):
         "X-GitHub-Api-Version": "2026-03-10",
         "Accept": "application/vnd.github+json",
     }
-    status, obj = http_json(GH + path, method, data, headers, timeout=timeout)
+    status, obj, _ = http_json(GH + path, method, data, headers, timeout=timeout)
     if status >= 300:
         raise RuntimeError(f"GitHub API error {status}")
     return obj
@@ -198,7 +212,7 @@ def gh_bytes(path: str) -> bytes:
 
 
 def tg(method: str, payload: dict | None = None):
-    _, obj = http_json(f"{TG}/{method}", "POST", payload or {}, timeout=65)
+    _, obj, _ = http_json(f"{TG}/{method}", "POST", payload or {}, timeout=65)
     if not isinstance(obj, dict) or not obj.get("ok"):
         raise RuntimeError(f"Telegram API {method} failed")
     return obj.get("result")
@@ -225,11 +239,12 @@ def tg_document(chat_id: int, filename: str, data: bytes, caption: str) -> None:
 
 
 def answer_callback(query_id: str, text: str = "", alert: bool = False) -> None:
+    """alert=False -> Toast (top bar), alert=True -> Popup (center)."""
     with contextlib.suppress(Exception):
         tg("answerCallbackQuery", {"callback_query_id": query_id, "text": text[:200], "show_alert": alert})
 
 
-# ---------------- UI Core (Fixed: Edit clicked message) ----------------
+# ---------------- UI Core ----------------
 def inline(rows: list[list[tuple[str, str]]]) -> list[list[dict[str, str]]]:
     out = []
     for row in rows:
@@ -281,7 +296,6 @@ def ui_message(chat_id: int) -> int:
 
 
 def show(chat_id: int, text: str, rows: list[list[tuple[str, str]]], target_mid: int | None = None) -> int:
-    """Edit the target message (usually the one clicked). If fails, send new."""
     mid = target_mid or ui_message(chat_id)
     if mid and edit_message(chat_id, mid, text, rows):
         remember_ui(chat_id, mid)
@@ -317,7 +331,21 @@ def chat_endpoint(base_url: str) -> str:
     return base_url + "/chat/completions"
 
 
-def infer_provider(base_url: str) -> str:
+def infer_provider_name(base_url: str) -> str:
+    host = (urllib.parse.urlparse(base_url).hostname or "").lower()
+    mapping = {
+        "api.openai.com": "OpenAI", "api.anthropic.com": "Anthropic",
+        "generativelanguage.googleapis.com": "Google", "api.x.ai": "xAI",
+        "api.deepseek.com": "DeepSeek", "openrouter.ai": "OpenRouter",
+        "integrate.api.nvidia.com": "Nvidia", "vyceai.com": "VyceAI",
+    }
+    for needle, name in mapping.items():
+        if needle in host:
+            return name
+    return host.split(".")[0].capitalize() if host else "Custom"
+
+
+def infer_provider_type(base_url: str) -> str:
     host = (urllib.parse.urlparse(base_url).hostname or "").lower()
     mapping = [
         ("api.openai.com", "openai"), ("api.anthropic.com", "anthropic"),
@@ -345,7 +373,7 @@ def infer_provider(base_url: str) -> str:
     return "openai_compatible"
 
 
-# ---------------- Model Storage & Secrets ----------------
+# ---------------- Storage & Secrets ----------------
 PROVIDER_SECRET = {
     "openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY", "google": "GOOGLE_API_KEY",
     "azure": "AZURE_OPENAI_API_KEY", "xai": "XAI_API_KEY", "deepseek": "DEEPSEEK_API_KEY",
@@ -379,6 +407,17 @@ def decrypt_token(ciphertext) -> str:
         raise RuntimeError("کلید رمزگشایی تغییر کرده؛ مدل را دوباره اضافه کن.") from exc
 
 
+def save_provider(name: str, provider_type: str, base_url: str, token: str) -> str:
+    prov_id = "p_" + uuid.uuid4().hex[:12]
+    db("INSERT INTO providers(id,name,provider_type,base_url,token_ciphertext,created_at) VALUES(?,?,?,?,?,?)",
+       (prov_id, name, provider_type, base_url, encrypt_token(token), now()))
+    return prov_id
+
+
+def get_provider(prov_id: str):
+    return q1("SELECT * FROM providers WHERE id=?", (prov_id,))
+
+
 def model_rows():
     return q("SELECT * FROM models WHERE enabled=1 ORDER BY name COLLATE NOCASE")
 
@@ -401,49 +440,52 @@ def github_secret(name: str, value: str) -> None:
 
 
 def write_active_model_secrets(row) -> None:
-    provider = row["provider"]
-    token = decrypt_token(row["token_ciphertext"])
-    if provider in PROVIDER_SECRET and PROVIDER_SECRET[provider] and token:
-        github_secret(PROVIDER_SECRET[provider], token)
-    github_secret("TRADINGAGENTS_LLM_PROVIDER", provider)
+    prov = get_provider(row["provider_id"])
+    if not prov:
+        return
+    provider_type = prov["provider_type"]
+    token = decrypt_token(prov["token_ciphertext"])
+    if provider_type in PROVIDER_SECRET and PROVIDER_SECRET[provider_type] and token:
+        github_secret(PROVIDER_SECRET[provider_type], token)
+    github_secret("TRADINGAGENTS_LLM_PROVIDER", provider_type)
     github_secret("TRADINGAGENTS_DEEP_THINK_LLM", row["name"])
     github_secret("TRADINGAGENTS_QUICK_THINK_LLM", row["name"])
-    github_secret("TRADINGAGENTS_LLM_BACKEND_URL", strip_known_suffix(row["base_url"]))
+    github_secret("TRADINGAGENTS_LLM_BACKEND_URL", strip_known_suffix(prov["base_url"]))
     github_secret("TRADINGAGENTS_CHECKPOINT_ENABLED", "true")
 
 
-def add_model(name: str, provider: str, base_url: str, token: str) -> str:
+def add_model_from_provider(prov_id: str, model_name: str) -> str:
+    prov = get_provider(prov_id)
+    if not prov:
+        raise ValueError("Provider یافت نشد.")
     model_id = "m_" + uuid.uuid4().hex[:12]
-    db("INSERT INTO models(id,name,provider,base_url,token_ciphertext,enabled,created_at) VALUES(?,?,?,?,?,1,?)",
-       (model_id, name, provider, base_url, encrypt_token(token), now()))
+    db("INSERT INTO models(id,name,provider_id,base_url,token_ciphertext,enabled,created_at) VALUES(?,?,?,?,?,1,?)",
+       (model_id, model_name, prov_id, prov["base_url"], prov["token_ciphertext"], now()))
     row = q1("SELECT * FROM models WHERE id=?", (model_id,))
     write_active_model_secrets(row)
     set_active_model(model_id)
     return model_id
 
 
-# ---------------- Smart Model Test (with Retry) ----------------
-def post_model_test(model, timeout: int = 180) -> float:
-    provider = model["provider"]
-    base_url = model["base_url"].rstrip("/")
-    token = decrypt_token(model["token_ciphertext"])
-    name = model["name"]
+# ---------------- Smart Model Test (Threaded) ----------------
+def run_model_test_threaded(chat_id: int, model_name: str, base_url: str, token: str, provider_type: str):
+    """Runs in a separate thread. Sends result as a NEW message."""
     endpoint = ""
-    
-    def attempt():
-        nonlocal endpoint
+    try:
         started = time.monotonic()
-        try:
-            if provider == "anthropic":
+        
+        def attempt(timeout=180):
+            nonlocal endpoint
+            if provider_type == "anthropic":
                 endpoint = base_url if base_url.endswith("/messages") else base_url + "/v1/messages"
-                status, _ = http_json(endpoint, "POST",
-                                      {"model": name, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply OK only."}]},
+                status, _, raw = http_json(endpoint, "POST",
+                                      {"model": model_name, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply OK only."}]},
                                       {"x-api-key": token, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
                                       timeout=timeout)
-            elif provider == "google":
-                endpoint = base_url + "/models/" + urllib.parse.quote(name, safe="") + ":generateContent"
+            elif provider_type == "google":
+                endpoint = base_url + "/models/" + urllib.parse.quote(model_name, safe="") + ":generateContent"
                 endpoint += ("&" if "?" in endpoint else "?") + urllib.parse.urlencode({"key": token})
-                status, _ = http_json(endpoint, "POST",
+                status, _, raw = http_json(endpoint, "POST",
                                       {"contents": [{"parts": [{"text": "Reply OK only."}]}], "generationConfig": {"maxOutputTokens": 8}},
                                       {"Content-Type": "application/json"}, timeout=timeout)
             else:
@@ -451,39 +493,50 @@ def post_model_test(model, timeout: int = 180) -> float:
                 headers = {"Content-Type": "application/json"}
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
-                status, _ = http_json(endpoint, "POST",
-                                      {"model": name, "messages": [{"role": "user", "content": "Reply OK only."}], "max_tokens": 8},
+                status, _, raw = http_json(endpoint, "POST",
+                                      {"model": model_name, "messages": [{"role": "user", "content": "Reply OK only."}], "max_tokens": 8},
                                       headers, timeout=timeout)
             if status < 200 or status >= 300:
-                raise RuntimeError(f"HTTP {status}")
+                # Raise with raw body for exact error display
+                raise RuntimeError(raw or f"HTTP {status}")
             return time.monotonic() - started
-        except Exception as exc:
-            raise RuntimeError(f"{exc}\nEndpoint: {endpoint}\nModel: {name}") from exc
 
-    try:
-        return attempt()
-    except RuntimeError as exc:
-        err_msg = str(exc).lower()
-        if "524" in err_msg or "timeout" in err_msg or "timed out" in err_msg:
-            # Smart retry: wait 120s for cold start / cloudflare timeout
-            time.sleep(120)
-            return attempt()
-        raise
+        try:
+            elapsed = attempt()
+        except RuntimeError as exc:
+            err_msg = str(exc).lower()
+            if "524" in err_msg or "timeout" in err_msg or "timed out" in err_msg:
+                time.sleep(120)
+                elapsed = attempt()
+            else:
+                raise
+        
+        # SUCCESS: Clean message
+        send_message(
+            chat_id,
+            f"<b>✅ تست موفق</b>\nمدل: <code>{esc(model_name)}</code>\nزمان پاسخ: <b>{elapsed:.1f}s</b>",
+            [[("🏠 خانه", "home")]]
+        )
+    except Exception as exc:
+        # FAILURE: Exact raw provider message
+        raw_error = str(exc)
+        send_message(
+            chat_id,
+            f"<b>❌ تست ناموفق</b>\nمدل: <code>{esc(model_name)}</code>\n\n<code>{esc(raw_error[:4000])}</code>",
+            [[("🏠 خانه", "home")]]
+        )
 
 
-# ---------------- Fetch Models List (New Feature) ----------------
+# ---------------- Fetch Models List ----------------
 def fetch_models_list(base_url: str, token: str) -> list[str]:
-    """Fetch available models from provider's /v1/models endpoint."""
     endpoint = base_url.rstrip("/") + "/models"
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    
     try:
-        status, data = http_json(endpoint, "GET", headers=headers, timeout=30)
+        status, data, _ = http_json(endpoint, "GET", headers=headers, timeout=30)
         if status >= 300 or not data:
             return []
-        
         models = []
         if isinstance(data, dict) and "data" in data:
             for item in data["data"]:
@@ -495,7 +548,6 @@ def fetch_models_list(base_url: str, token: str) -> list[str]:
                     models.append(item["id"])
                 elif isinstance(item, str):
                     models.append(item)
-        
         return sorted(list(set(models)))
     except Exception:
         return []
@@ -584,6 +636,41 @@ def worker_loop() -> None:
 
 def cancel_run(run_id: int) -> None:
     gh("POST", f"/actions/runs/{run_id}/cancel", timeout=15)
+
+
+# ---------------- Hard Cancel (/cancel) ----------------
+def hard_cancel(chat_id: int) -> str:
+    cancelled_flows = 0
+    cancelled_engines = 0
+    
+    if chat_id in WIZARDS:
+        WIZARDS.pop(chat_id, None)
+        cancelled_flows += 1
+    if chat_id in FLOWS:
+        FLOWS.pop(chat_id, None)
+        cancelled_flows += 1
+    
+    try:
+        runs = fetch_active_runs()
+        for run in runs:
+            try:
+                cancel_run(run["id"])
+                cancelled_engines += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    
+    db("UPDATE runs SET status='cancelled', conclusion='cancelled_by_user', updated_at=? WHERE chat_id=? AND status NOT IN " + str(TERMINAL), (now(), chat_id))
+    
+    parts = []
+    if cancelled_flows:
+        parts.append(f"{cancelled_flows} فرآیند محلی")
+    if cancelled_engines:
+        parts.append(f"{cancelled_engines} اجرای Engine")
+    if not parts:
+        return "هیچ فرآیند فعالی برای لغو وجود نداشت."
+    return "✅ لغو شد: " + " و ".join(parts)
 
 
 # ---------------- Output Viewer ----------------
@@ -777,14 +864,84 @@ def models_screen(chat_id: int, target_mid: int | None = None) -> int:
         text += "هنوز مدلی ثبت نشده."
     for row in rows:
         mark = "✅ " if row["id"] == aid else ""
-        text += f"\n{mark}<b>{esc(row['name'])}</b> <code>{esc(row['provider'])}</code>"
-        buttons.append([(f"⚡ فعال‌سازی {row['name']}", f"activate:{row['id']}")])
+        text += f"\n{mark}<b>{esc(row['name'])}</b>"
+        buttons.append([(f"⚡ فعال‌سازی", f"activate:{row['id']}")])
     buttons += [
-        [("➕ افزودن مدل", "model_add"), ("🧪 تست اتصال", "model_test_menu")],
+        [("➕ افزودن مدل", "model_add"), ("🔄 سوئیچ Provider", "switch_provider_menu")],
         [("🗑 حذف مدل", "model_delete_menu")],
         [("🏠 خانه", "home")],
     ]
     return show(chat_id, text, buttons, target_mid)
+
+
+def switch_provider_menu(chat_id: int, target_mid: int | None = None) -> int:
+    provs = q("SELECT * FROM providers ORDER BY name")
+    if not provs:
+        return show(chat_id, "📭 هیچ Provider ذخیره‌شده‌ای وجود ندارد.\nابتدا یک مدل اضافه کنید.",
+                    [[("➕ افزودن مدل", "model_add"), ("🏠 خانه", "home")]], target_mid)
+    text = "<b>🔄 سوئیچ Provider</b>\nیک Provider را انتخاب کنید تا مدل‌های آن لیست شوند:"
+    buttons = []
+    for p in provs:
+        buttons.append([(f"🔹 {esc(p['name'])}", f"list_provider_models:{p['id']}")])
+    buttons.append([("🏠 خانه", "home")])
+    return show(chat_id, text, buttons, target_mid)
+
+
+def list_provider_models_screen(chat_id: int, prov_id: str, page: int = 0, target_mid: int | None = None) -> int:
+    prov = get_provider(prov_id)
+    if not prov:
+        return show(chat_id, "❌ Provider یافت نشد.", [[("🏠 خانه", "home")]], target_mid)
+    
+    token = decrypt_token(prov["token_ciphertext"])
+    models = fetch_models_list(prov["base_url"], token)
+    
+    if not models:
+        return show(chat_id, f"📭 لیست مدل‌ها برای <b>{esc(prov['name'])}</b> دریافت نشد.\nلطفاً Model ID را دستی وارد کنید.",
+                    [[("✏️ ورود دستی", f"manual_model_for_prov:{prov_id}"), ("◀️ بازگشت", "switch_provider_menu")]], target_mid)
+    
+    WIZARDS[chat_id] = {"stage": "provider_models", "prov_id": prov_id, "models_list": models}
+    
+    per_page = 12
+    start = page * per_page
+    end = start + per_page
+    page_models = models[start:end]
+    total_pages = (len(models) + per_page - 1) // per_page
+    
+    text = f"<b>📋 مدل‌های {esc(prov['name'])} ({len(models)} مورد)</b>\nصفحه {page + 1} از {total_pages}\n\n"
+    buttons = []
+    
+    # 2 rows x 6 columns = 12 buttons per page
+    for i in range(0, len(page_models), 6):
+        row_models = page_models[i:i+6]
+        row_buttons = []
+        for model_id in row_models:
+            short_name = model_id.split("/")[-1] if "/" in model_id else model_id
+            if len(short_name) > 16:
+                short_name = short_name[:13] + "..."
+            row_buttons.append((short_name, f"model_detail:{prov_id}:{model_id}"))
+        buttons.append(row_buttons)
+    
+    nav_row = []
+    if page > 0:
+        nav_row.append(("◀️ قبلی", f"prov_models_page:{prov_id}:{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(("بعدی ▶️", f"prov_models_page:{prov_id}:{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+    
+    buttons.append([("✏️ ورود دستی", f"manual_model_for_prov:{prov_id}"), ("◀️ بازگشت", "switch_provider_menu")])
+    return show(chat_id, text, buttons, target_mid)
+
+
+def model_detail_screen(chat_id: int, prov_id: str, model_name: str, target_mid: int | None = None) -> int:
+    short_name = model_name.split("/")[-1] if "/" in model_name else model_name
+    return show(chat_id,
+                f"<b>📋 جزئیات مدل</b>\n\nModel: <code>{esc(model_name)}</code>\n\nیک عملیات را انتخاب کنید:",
+                [
+                    [("🧪 تست اتصال", f"test_prov_model:{prov_id}:{model_name}")],
+                    [("✅ انتخاب و فعال‌سازی", f"select_prov_model:{prov_id}:{model_name}")],
+                    [("◀️ بازگشت به لیست", f"list_provider_models:{prov_id}")],
+                ], target_mid)
 
 
 def wizard_url_screen(chat_id: int, target_mid: int | None = None) -> int:
@@ -801,7 +958,8 @@ def wizard_token_screen(chat_id: int, target_mid: int | None = None) -> int:
 
 
 def wizard_model_manual_screen(chat_id: int, target_mid: int | None = None) -> int:
-    provider = WIZARDS.get(chat_id, {}).get("provider", "")
+    wizard = WIZARDS.get(chat_id, {})
+    provider = wizard.get("provider_name", "Custom")
     return show(chat_id,
                 f"<b>➕ افزودن مدل (3 از 3)</b>\nModel ID دقیق را بفرست.\n"
                 f"<b>Provider:</b> <code>{esc(provider)}</code>\n\n"
@@ -812,11 +970,12 @@ def wizard_model_manual_screen(chat_id: int, target_mid: int | None = None) -> i
 def models_list_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -> int:
     wizard = WIZARDS.get(chat_id, {})
     models = wizard.get("models_list", [])
+    
     if not models:
         return show(chat_id, "📭 لیست مدل‌ها خالی است یا دریافت نشد.\nلطفاً Model ID را دستی وارد کن.",
                     [[("✏️ ورود دستی", "wizard_manual_model"), ("◀️ بازگشت", "models")]], target_mid)
     
-    per_page = 6
+    per_page = 12
     start = page * per_page
     end = start + per_page
     page_models = models[start:end]
@@ -825,12 +984,15 @@ def models_list_screen(chat_id: int, page: int = 0, target_mid: int | None = Non
     text = f"<b>📋 لیست مدل‌ها ({len(models)} مورد)</b>\nصفحه {page + 1} از {total_pages}\n\n"
     buttons = []
     
-    for model_id in page_models:
-        short_name = model_id.split("/")[-1] if "/" in model_id else model_id
-        buttons.append([
-            (f"🧪 {short_name[:20]}", f"test_list_model:{model_id}"),
-            (f"✅ انتخاب", f"select_list_model:{model_id}")
-        ])
+    for i in range(0, len(page_models), 6):
+        row_models = page_models[i:i+6]
+        row_buttons = []
+        for model_id in row_models:
+            short_name = model_id.split("/")[-1] if "/" in model_id else model_id
+            if len(short_name) > 16:
+                short_name = short_name[:13] + "..."
+            row_buttons.append((short_name, f"model_detail_temp:{model_id}"))
+        buttons.append(row_buttons)
     
     nav_row = []
     if page > 0:
@@ -1047,6 +1209,12 @@ def logs_screen(chat_id: int, target_mid: int | None = None) -> int:
 # ---------------- Text Handling ----------------
 def handle_text(chat_id: int, text: str, target_mid: int) -> None:
     text = text.strip()
+    
+    if text.lower() == "/cancel":
+        result = hard_cancel(chat_id)
+        send_message(chat_id, f"<b>🛑 /cancel</b>\n{esc(result)}", [[("🏠 خانه", "home")]])
+        return
+
     if text.startswith("/start"):
         WIZARDS.pop(chat_id, None)
         FLOWS.pop(chat_id, None)
@@ -1059,7 +1227,8 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
         try:
             if stage == "url":
                 item["url"] = clean_base_url(text)
-                item["provider"] = infer_provider(item["url"])
+                item["provider_type"] = infer_provider_type(item["url"])
+                item["provider_name"] = infer_provider_name(item["url"])
                 item["stage"] = "token"
                 wizard_token_screen(chat_id, target_mid)
             elif stage == "token":
@@ -1071,12 +1240,13 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
             elif stage == "model_manual":
                 if not text:
                     raise ValueError("Model ID نمی‌تواند خالی باشد.")
-                model_id = add_model(text, item["provider"], item["url"], item.get("token", ""))
+                prov_id = save_provider(item["provider_name"], item["provider_type"], item["url"], item["token"])
+                model_id = add_model_from_provider(prov_id, text)
                 WIZARDS.pop(chat_id, None)
                 answer_callback(f"temp_{chat_id}", "✅ مدل ذخیره و فعال شد!", True)
                 show(chat_id,
                      f"<b>✅ مدل ذخیره و فعال شد</b>\nModel: <code>{esc(text)}</code>\n"
-                     f"Provider: <code>{esc(item['provider'])}</code>",
+                     f"Provider: <code>{esc(item['provider_name'])}</code>",
                      [[("🧪 تست اتصال", f"test_model:{model_id}"), ("🏠 خانه", "home")]], target_mid)
         except ValueError as exc:
             show(chat_id, f"<b>⚠️ {esc(exc)}</b>\n\nدوباره تلاش کن:", [[("❌ لغو", "wizard_cancel")]], target_mid)
@@ -1127,15 +1297,14 @@ def callback(query: dict[str, Any]) -> None:
     cb_mid = int(message.get("message_id", 0))
     data = query.get("data", "")
     
-    # Immediate feedback for long operations
-    if data.startswith("test_model:") or data.startswith("test_list_model:"):
-        answer_callback(query["id"], " در حال تست اتصال... (ممکن است تا ۳ دقیقه طول بکشد)", True)
+    if data.startswith("test_prov_model:") or data.startswith("test_model:") or data.startswith("test_list_model:"):
+        answer_callback(query["id"], "⏳ در حال تست اتصال...", False)
     elif data.startswith("view_output:"):
-        answer_callback(query["id"], "📄 در حال آماده‌سازی خروجی...", True)
+        answer_callback(query["id"], "📄 در حال آماده‌سازی خروجی...", False)
     elif data.startswith("download_log:"):
-        answer_callback(query["id"], "📋 در حال دانلود لاگ...", True)
+        answer_callback(query["id"], "📋 در حال دانلود لاگ...", False)
     elif data == "fetch_models_list":
-        answer_callback(query["id"], "📋 در حال دریافت لیست مدل‌ها...", True)
+        answer_callback(query["id"], "📋 در حال دریافت لیست مدل‌ها...", False)
     else:
         answer_callback(query["id"])
 
@@ -1146,6 +1315,51 @@ def callback(query: dict[str, Any]) -> None:
             home_screen(chat_id, target_mid=cb_mid)
         elif data == "models":
             models_screen(chat_id, cb_mid)
+        elif data == "switch_provider_menu":
+            switch_provider_menu(chat_id, cb_mid)
+        elif data.startswith("list_provider_models:"):
+            prov_id = data.split(":", 1)[1]
+            list_provider_models_screen(chat_id, prov_id, page=0, target_mid=cb_mid)
+        elif data.startswith("prov_models_page:"):
+            parts = data.split(":")
+            prov_id = parts[1]
+            page = int(parts[2])
+            list_provider_models_screen(chat_id, prov_id, page=page, target_mid=cb_mid)
+        elif data.startswith("model_detail:"):
+            parts = data.split(":", 2)
+            prov_id = parts[1]
+            model_name = parts[2]
+            model_detail_screen(chat_id, prov_id, model_name, cb_mid)
+        elif data.startswith("model_detail_temp:"):
+            model_name = data.split(":", 1)[1]
+            wizard = WIZARDS.get(chat_id, {})
+            prov_id = wizard.get("prov_id_temp", "")
+            model_detail_screen(chat_id, prov_id, model_name, cb_mid)
+        elif data.startswith("test_prov_model:"):
+            parts = data.split(":", 2)
+            prov_id = parts[1]
+            model_name = parts[2]
+            prov = get_provider(prov_id)
+            if not prov:
+                raise ValueError("Provider یافت نشد.")
+            token = decrypt_token(prov["token_ciphertext"])
+            threading.Thread(target=run_model_test_threaded, args=(chat_id, model_name, prov["base_url"], token, prov["provider_type"]), daemon=True).start()
+        elif data.startswith("select_prov_model:"):
+            parts = data.split(":", 2)
+            prov_id = parts[1]
+            model_name = parts[2]
+            model_id = add_model_from_provider(prov_id, model_name)
+            answer_callback(query["id"], "✅ مدل انتخاب و فعال شد!", True)
+            show(chat_id,
+                 f"<b>✅ مدل ذخیره و فعال شد</b>\nModel: <code>{esc(model_name)}</code>",
+                 [[("🧪 تست اتصال", f"test_model:{model_id}"), ("🏠 خانه", "home")]], cb_mid)
+        elif data.startswith("manual_model_for_prov:"):
+            prov_id = data.split(":", 1)[1]
+            prov = get_provider(prov_id)
+            if not prov:
+                raise ValueError("Provider یافت نشد.")
+            WIZARDS[chat_id] = {"stage": "model_manual", "prov_id": prov_id, "url": prov["base_url"], "token": decrypt_token(prov["token_ciphertext"]), "provider_name": prov["name"], "provider_type": prov["provider_type"]}
+            wizard_model_manual_screen(chat_id, cb_mid)
         elif data == "model_add":
             if not admin(user_id):
                 raise ValueError("فقط Admin می‌تواند مدل اضافه کند.")
@@ -1167,6 +1381,7 @@ def callback(query: dict[str, Any]) -> None:
                      [[("✏️ ورود دستی", "wizard_manual_model"), ("◀️ بازگشت", "models")]], cb_mid)
             else:
                 wizard["models_list"] = models
+                wizard["prov_id_temp"] = wizard.get("prov_id", "")
                 wizard["stage"] = "model_list"
                 models_list_screen(chat_id, page=0, target_mid=cb_mid)
         elif data.startswith("models_page:"):
@@ -1175,31 +1390,21 @@ def callback(query: dict[str, Any]) -> None:
         elif data.startswith("test_list_model:"):
             model_name = data.split(":", 1)[1]
             wizard = WIZARDS.get(chat_id, {})
-            # Create a temporary model row for testing
-            temp_id = "temp_" + uuid.uuid4().hex[:8]
-            db("INSERT INTO models(id,name,provider,base_url,token_ciphertext,enabled,created_at) VALUES(?,?,?,?,?,0,?)",
-               (temp_id, model_name, wizard.get("provider", ""), wizard.get("url", ""), encrypt_token(wizard.get("token", "")), now()))
-            row = q1("SELECT * FROM models WHERE id=?", (temp_id,))
-            try:
-                elapsed = post_model_test(row)
-                db("DELETE FROM models WHERE id=?", (temp_id,))
-                show(chat_id,
-                     f"<b>✅ تست موفق</b>\nمدل: <code>{esc(model_name)}</code>\nزمان پاسخ: <b>{elapsed:.1f}s</b>",
-                     [[("✅ انتخاب این مدل", f"select_list_model:{model_name}"), ("◀️ لیست مدل‌ها", "models_page:0")]], cb_mid)
-            except Exception as exc:
-                db("DELETE FROM models WHERE id=?", (temp_id,))
-                show(chat_id,
-                     f"<b>❌ تست ناموفق</b>\nمدل: <code>{esc(model_name)}</code>\n\n{esc(str(exc)[:300])}",
-                     [[("🧪 تست دوباره", f"test_list_model:{model_name}"), ("◀️ لیست مدل‌ها", "models_page:0")]], cb_mid)
+            url = wizard.get("url", "")
+            token = wizard.get("token", "")
+            ptype = wizard.get("provider_type", "openai_compatible")
+            threading.Thread(target=run_model_test_threaded, args=(chat_id, model_name, url, token, ptype), daemon=True).start()
         elif data.startswith("select_list_model:"):
             model_name = data.split(":", 1)[1]
             wizard = WIZARDS.get(chat_id, {})
-            model_id = add_model(model_name, wizard.get("provider", ""), wizard.get("url", ""), wizard.get("token", ""))
+            prov_id = wizard.get("prov_id_temp")
+            if not prov_id:
+                prov_id = save_provider(wizard.get("provider_name", "Custom"), wizard.get("provider_type", "openai_compatible"), wizard.get("url", ""), wizard.get("token", ""))
+            model_id = add_model_from_provider(prov_id, model_name)
             WIZARDS.pop(chat_id, None)
             answer_callback(query["id"], "✅ مدل انتخاب و فعال شد!", True)
             show(chat_id,
-                 f"<b>✅ مدل ذخیره و فعال شد</b>\nModel: <code>{esc(model_name)}</code>\n"
-                 f"Provider: <code>{esc(wizard.get('provider', ''))}</code>",
+                 f"<b>✅ مدل ذخیره و فعال شد</b>\nModel: <code>{esc(model_name)}</code>",
                  [[("🧪 تست اتصال", f"test_model:{model_id}"), ("🏠 خانه", "home")]], cb_mid)
         elif data == "model_test_menu":
             model_test_menu(chat_id, cb_mid)
@@ -1208,16 +1413,11 @@ def callback(query: dict[str, Any]) -> None:
             row = q1("SELECT * FROM models WHERE id=? AND enabled=1", (model_id,))
             if not row:
                 raise ValueError("مدل پیدا نشد.")
-            try:
-                elapsed = post_model_test(row)
-                show(chat_id,
-                     f"<b>✅ تست موفق</b>\nمدل: <code>{esc(row['name'])}</code>\n"
-                     f"Provider: <code>{esc(row['provider'])}</code>\nزمان پاسخ: <b>{elapsed:.1f}s</b>",
-                     [[("🧪 تست دوباره", f"test_model:{model_id}"), ("◀️ مدل‌ها", "models")]], cb_mid)
-            except Exception as exc:
-                show(chat_id,
-                     f"<b>❌ تست ناموفق</b>\nمدل: <code>{esc(row['name'])}</code>\n\n{esc(str(exc)[:300])}",
-                     [[("🧪 تست دوباره", f"test_model:{model_id}"), ("◀️ مدل‌ها", "models")]], cb_mid)
+            prov = get_provider(row["provider_id"])
+            if not prov:
+                raise ValueError("Provider یافت نشد.")
+            token = decrypt_token(prov["token_ciphertext"])
+            threading.Thread(target=run_model_test_threaded, args=(chat_id, row["name"], prov["base_url"], token, prov["provider_type"]), daemon=True).start()
         elif data.startswith("activate:"):
             row = q1("SELECT * FROM models WHERE id=? AND enabled=1", (data.split(":", 1)[1],))
             if not row:
@@ -1369,6 +1569,8 @@ def callback(query: dict[str, Any]) -> None:
             show(chat_id,
                  f"<b>🚀 {label} در صف اجرا قرار گرفت</b>\nشناسه: <code>{esc(request_id[:10])}</code>",
                  [[("📊 اجراهای جاری", "active_runs"), ("🏠 خانه", "home")]], cb_mid)
+        elif data == "noop":
+            pass
     except Exception as exc:
         show(chat_id, f"<b>❌ خطا</b>\n{esc(exc)}", [[("🏠 خانه", "home")]], cb_mid)
 
