@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # ruff: noqa
 # -*- coding: utf-8 -*-
-"""TradingAgentsArya Telegram controller - build v7.
+"""TradingAgentsArya Telegram controller - build v8.
 
-UI rule (final):
-- /start opens a NEW menu message; old menus are left completely untouched.
-- Every button edits the single active menu message.
-- The bot is stateless per message: all data comes from SQLite/GitHub,
-  so any menu (old or new) always shows the current reality.
+v8 changes:
+- Base URL is stored EXACTLY as the user typed it (no silent rewriting).
+- Suffix normalization happens only at use-time (test endpoint / engine secret).
+- Error messages show both the stored URL and the endpoint actually tried.
+- Model test timeout raised to 180s for slow providers (Nvidia etc).
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ import uuid
 import zipfile
 from typing import Any
 
-BUILD = "v7"
+BUILD = "v8"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
@@ -50,6 +50,7 @@ WORKFLOW = "tradingagents.yml"
 ANALYST_ORDER = ["market", "social", "news", "fundamentals"]
 ANALYST_LABEL = {"market": "📊 Market", "social": "💬 Sentiment", "news": "📰 News", "fundamentals": "💰 Fundamentals"}
 TERMINAL = ("success", "failure", "cancelled")
+KNOWN_SUFFIXES = ("/chat/completions", "/completions", "/messages", "/generateContent")
 
 DB = sqlite3.connect(STATE_PATH, check_same_thread=False)
 DB.row_factory = sqlite3.Row
@@ -278,7 +279,6 @@ def ui_message(chat_id: int) -> int:
 
 
 def show(chat_id: int, text: str, rows: list[list[tuple[str, str]]]) -> int:
-    """Render onto the single active menu message; create one only if needed."""
     mid = ui_message(chat_id)
     if mid and edit_message(chat_id, mid, text, rows):
         remember_ui(chat_id, mid)
@@ -286,6 +286,35 @@ def show(chat_id: int, text: str, rows: list[list[tuple[str, str]]]) -> int:
     new_mid = send_message(chat_id, text, rows)
     remember_ui(chat_id, new_mid)
     return new_mid
+
+
+# ---------------- URL handling (store as-typed, normalize only at use-time) ----------------
+def clean_base_url(value: str) -> str:
+    """Store EXACTLY what the user typed (trimmed). No silent rewriting."""
+    value = value.strip()
+    if not value.startswith(("http://", "https://")):
+        raise ValueError("Base URL باید با http:// یا https:// شروع شود.")
+    value = value.rstrip("/")
+    if not value:
+        raise ValueError("Base URL معتبر نیست.")
+    return value
+
+
+def strip_known_suffix(url: str) -> str:
+    """Used only when handing the URL to the engine (it builds its own path)."""
+    for suffix in KNOWN_SUFFIXES:
+        if url.lower().endswith(suffix.lower()):
+            return url[: -len(suffix)].rstrip("/")
+    return url
+
+
+def chat_endpoint(base_url: str) -> str:
+    """Endpoint for the tiny connectivity test: use user's path if complete."""
+    low = base_url.lower()
+    for suffix in KNOWN_SUFFIXES:
+        if low.endswith(suffix):
+            return base_url
+    return base_url + "/chat/completions"
 
 
 # ---------------- models ----------------
@@ -320,19 +349,6 @@ def decrypt_token(ciphertext) -> str:
         return SecretBox(crypt_key()).decrypt(bytes(ciphertext)).decode("utf-8")
     except Exception as exc:
         raise RuntimeError("کلید رمزگشایی تغییر کرده؛ مدل را دوباره اضافه کن.") from exc
-
-
-def normalize_base_url(value: str) -> str:
-    value = value.strip()
-    if not value.startswith(("http://", "https://")):
-        raise ValueError("Base URL باید با http:// یا https:// شروع شود.")
-    value = value.rstrip("/")
-    for suffix in ("/chat/completions", "/completions", "/messages", "/generateContent"):
-        if value.lower().endswith(suffix.lower()):
-            value = value[: -len(suffix)].rstrip("/")
-    if not value:
-        raise ValueError("Base URL معتبر نیست.")
-    return value
 
 
 def infer_provider(base_url: str) -> str:
@@ -392,7 +408,8 @@ def write_active_model_secrets(row) -> None:
     github_secret("TRADINGAGENTS_LLM_PROVIDER", provider)
     github_secret("TRADINGAGENTS_DEEP_THINK_LLM", row["name"])
     github_secret("TRADINGAGENTS_QUICK_THINK_LLM", row["name"])
-    github_secret("TRADINGAGENTS_LLM_BACKEND_URL", row["base_url"])
+    # Engine builds its own path, so hand it the base without completion suffix.
+    github_secret("TRADINGAGENTS_LLM_BACKEND_URL", strip_known_suffix(row["base_url"]))
     github_secret("TRADINGAGENTS_CHECKPOINT_ENABLED", "true")
 
 
@@ -406,11 +423,12 @@ def add_model(name: str, provider: str, base_url: str, token: str) -> str:
     return model_id
 
 
-def post_model_test(model, timeout: int = 120) -> float:
+def post_model_test(model, timeout: int = 180) -> float:
     provider = model["provider"]
     base_url = model["base_url"].rstrip("/")
     token = decrypt_token(model["token_ciphertext"])
     name = model["name"]
+    endpoint = ""
     started = time.monotonic()
     try:
         if provider == "anthropic":
@@ -426,7 +444,7 @@ def post_model_test(model, timeout: int = 120) -> float:
                                   {"contents": [{"parts": [{"text": "Reply OK only."}]}], "generationConfig": {"maxOutputTokens": 8}},
                                   {"Content-Type": "application/json"}, timeout=timeout)
         else:
-            endpoint = base_url if base_url.endswith("/chat/completions") else base_url + "/chat/completions"
+            endpoint = chat_endpoint(base_url)
             headers = {"Content-Type": "application/json"}
             if token:
                 headers["Authorization"] = f"Bearer {token}"
@@ -436,7 +454,10 @@ def post_model_test(model, timeout: int = 120) -> float:
         if status < 200 or status >= 300:
             raise RuntimeError(f"HTTP {status}")
     except Exception as exc:
-        raise RuntimeError(f"{exc}\nProvider: {provider}\nURL: {base_url}\nModel: {name}") from exc
+        raise RuntimeError(
+            f"{exc}\nProvider: {provider}\nBase URL (ذخیره‌شده): {base_url}\n"
+            f"Endpoint تست‌شده: {endpoint}\nModel: {name}"
+        ) from exc
     return time.monotonic() - started
 
 
@@ -728,7 +749,7 @@ def models_screen(chat_id: int) -> int:
 
 def wizard_url_screen(chat_id: int) -> int:
     return show(chat_id,
-                "<b>➕ افزودن مدل (1 از 3)</b>\nBase URL را دقیقاً همان‌طور که هست بفرست.\n\n"
+                "<b>➕ افزودن مدل (1 از 3)</b>\nBase URL را دقیقاً همان‌طور که هست بفرست؛ بدون هیچ تغییری ذخیره می‌شود.\n\n"
                 "<b>مثال‌ها:</b>\n• <code>https://vyceai.com/v1</code>\n• <code>https://integrate.api.nvidia.com/v1</code>\n"
                 "• <code>https://openrouter.ai/api/v1</code>\n\n❌ نامعتبر: بدون http:// یا https://",
                 [[("❌ لغو", "wizard_cancel")]])
@@ -757,7 +778,7 @@ def model_test_menu(chat_id: int) -> int:
     buttons = [[(f"🧪 {r['name']}", f"test_model:{r['id']}")] for r in model_rows()]
     buttons.append([("◀️ مدل‌ها", "models")])
     return show(chat_id,
-                "<b>🧪 تست اتصال</b>\nیک درخواست بسیار کوچک واقعی به API؛ TradingAgents اجرا نمی‌شود.\nTimeout: ۱۲۰ ثانیه.",
+                "<b>🧪 تست اتصال</b>\nیک درخواست بسیار کوچک واقعی به API؛ TradingAgents اجرا نمی‌شود.\nTimeout: ۱۸۰ ثانیه.",
                 buttons)
 
 
@@ -918,7 +939,7 @@ def bulk_delete_menu(chat_id: int) -> int:
     return show(chat_id,
                 "<b>🧹 پاک‌سازی تاریخچه</b>\nچه بازه‌ای پاک شود؟\n⚠️ فقط رکوردهای محلی؛ Artifacts گیت‌هاب دست‌نخورده می‌مانند.",
                 [
-                    [("🗑 ۷ روز گذشته", "bulk_scope:7"), ("🗑 ۰ روز گذشته", "bulk_scope:30")],
+                    [("🗑 ۷ روز گذشته", "bulk_scope:7"), ("🗑 ۳۰ روز گذشته", "bulk_scope:30")],
                     [("🗑 همه", "bulk_scope:all")],
                     [("❌ انصراف", "outputs")],
                 ])
@@ -967,7 +988,7 @@ def handle_text(chat_id: int, text: str) -> None:
         stage = item.get("stage")
         try:
             if stage == "url":
-                item["url"] = normalize_base_url(text)
+                item["url"] = clean_base_url(text)
                 item["provider"] = infer_provider(item["url"])
                 item["stage"] = "token"
                 wizard_token_screen(chat_id)
@@ -984,7 +1005,7 @@ def handle_text(chat_id: int, text: str) -> None:
                 WIZARDS.pop(chat_id, None)
                 show(chat_id,
                      f"<b>✅ مدل ذخیره و فعال شد</b>\nModel: <code>{esc(text)}</code>\n"
-                     f"Provider: <code>{esc(item['provider'])}</code>",
+                     f"Provider: <code>{esc(item['provider'])}</code>\nBase URL: <code>{esc(item['url'])}</code>",
                      [[("🧪 تست اتصال", f"test_model:{model_id}"), ("🏠 خانه", "home")]])
         except ValueError as exc:
             show(chat_id, f"<b>⚠️ {esc(exc)}</b>\n\nدوباره تلاش کن:", [[("❌ لغو", "wizard_cancel")]])
