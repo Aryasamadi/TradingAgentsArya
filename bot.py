@@ -1,14 +1,13 @@
-# ruff: noqa: RUF001, RUF002, RUF003
 #!/usr/bin/env python3
+# ruff: noqa
 # -*- coding: utf-8 -*-
-"""TradingAgentsArya Telegram controller - build v6.
+"""TradingAgentsArya Telegram controller - build v7.
 
 UI rule (final):
-- /start creates ONE new menu message and closes the previous menu
-  (its buttons are removed so stale clicks are impossible).
-- Every other button EDITS the single active menu message.
-- No screen ever opens a second message; reports/logs are delivered
-  as separate documents (that is content, not navigation).
+- /start opens a NEW menu message; old menus are left completely untouched.
+- Every button edits the single active menu message.
+- The bot is stateless per message: all data comes from SQLite/GitHub,
+  so any menu (old or new) always shows the current reality.
 """
 from __future__ import annotations
 
@@ -33,7 +32,7 @@ import uuid
 import zipfile
 from typing import Any
 
-BUILD = "v6"
+BUILD = "v7"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
@@ -276,19 +275,6 @@ def remember_ui(chat_id: int, message_id: int) -> None:
 def ui_message(chat_id: int) -> int:
     row = q1("SELECT message_id FROM ui WHERE chat_id=?", (chat_id,))
     return int(row[0]) if row else 0
-
-
-def close_menu(chat_id: int, message_id: int) -> None:
-    """Deactivate an old menu: clear its buttons so stale clicks die."""
-    if not message_id:
-        return
-    with contextlib.suppress(Exception):
-        tg("editMessageText", {
-            "chat_id": chat_id, "message_id": message_id,
-            "text": "📴 این منو بسته شد؛ منوی فعال، پیام جدیدتر است.",
-            "parse_mode": "HTML",
-            "reply_markup": {"inline_keyboard": []},
-        })
 
 
 def show(chat_id: int, text: str, rows: list[list[tuple[str, str]]]) -> int:
@@ -701,20 +687,24 @@ def format_run_time(iso_str: str) -> str:
         return ""
 
 
-# ---------------- screens (all edit the single active menu) ----------------
-def home_screen(chat_id: int) -> int:
+# ---------------- screens ----------------
+def home_screen(chat_id: int, force_new: bool = False) -> int:
     aid = active_model_id()
     mrow = q1("SELECT name FROM models WHERE id=?", (aid,)) if aid else None
     model_line = f"مدل فعال: <b>{esc(mrow['name'])}</b>" if mrow else "مدل فعال: <b>تنظیم نشده</b>"
     busy = q1("SELECT COUNT(*) c FROM runs WHERE status NOT IN " + str(TERMINAL))["c"]
     live = f"\n🟡 اجرای فعال: <b>{busy}</b>" if busy else ""
-    return show(chat_id,
-                f"<b>🤖 TradingAgentsArya</b>\n{model_line}{live}\nیک گزینه را انتخاب کن.\n<code>build {BUILD}</code>",
-                [
-                    [("🚀 تحلیل جدید", "flow_analysis_start"), ("📈 بک‌تست", "flow_backtest_start")],
-                    [("🤖 مدل‌ها", "models"), ("📊 اجراهای جاری", "active_runs")],
-                    [("📄 خروجی‌ها", "outputs"), ("📋 لاگ‌ها", "logs")],
-                ])
+    text = (f"<b>🤖 TradingAgentsArya</b>\n{model_line}{live}\nیک گزینه را انتخاب کن.\n<code>build {BUILD}</code>")
+    rows = [
+        [("🚀 تحلیل جدید", "flow_analysis_start"), ("📈 بک‌تست", "flow_backtest_start")],
+        [("🤖 مدل‌ها", "models"), ("📊 اجراهای جاری", "active_runs")],
+        [("📄 خروجی‌ها", "outputs"), ("📋 لاگ‌ها", "logs")],
+    ]
+    if force_new:
+        new_mid = send_message(chat_id, text, rows)
+        remember_ui(chat_id, new_mid)
+        return new_mid
+    return show(chat_id, text, rows)
 
 
 def models_screen(chat_id: int) -> int:
@@ -928,7 +918,7 @@ def bulk_delete_menu(chat_id: int) -> int:
     return show(chat_id,
                 "<b>🧹 پاک‌سازی تاریخچه</b>\nچه بازه‌ای پاک شود؟\n⚠️ فقط رکوردهای محلی؛ Artifacts گیت‌هاب دست‌نخورده می‌مانند.",
                 [
-                    [("🗑 ۷ روز گذشته", "bulk_scope:7"), ("🗑 ۳۰ روز گذشته", "bulk_scope:30")],
+                    [("🗑 ۷ روز گذشته", "bulk_scope:7"), ("🗑 ۰ روز گذشته", "bulk_scope:30")],
                     [("🗑 همه", "bulk_scope:all")],
                     [("❌ انصراف", "outputs")],
                 ])
@@ -969,10 +959,7 @@ def handle_text(chat_id: int, text: str) -> None:
     if text.startswith("/start"):
         WIZARDS.pop(chat_id, None)
         FLOWS.pop(chat_id, None)
-        old = ui_message(chat_id)
-        close_menu(chat_id, old)
-        remember_ui(chat_id, 0)
-        home_screen(chat_id)
+        home_screen(chat_id, force_new=True)
         return
 
     if chat_id in WIZARDS:
