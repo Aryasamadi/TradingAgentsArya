@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 # ruff: noqa
 # -*- coding: utf-8 -*-
-"""TradingAgentsArya Telegram controller - build v10 (Final Corrected).
+"""TradingAgentsArya Telegram controller - build v10 (Final Fixed).
 
-v10 Final Features:
-- Model list: 12 buttons per page (2 rows x 6), ONLY model names.
-- Click model name -> Detail screen with [Test] [Select] buttons.
-- Test success: Clean "✅ Success (X.Xs)" message.
-- Test failure: EXACT raw provider error message (no modification).
-- Test runs in background thread; bot never blocks.
-- Result sent as NEW message (never lost).
-- Toast (top bar) for status, Alert (center) for confirmations.
-- /cancel command: hard cancel all flows & running engines.
-- Provider storage: save URL/Token permanently, switch between providers.
-- Smart retry for 524/timeout (wait 120s, retry once).
+Fixes:
+- Model list: VERTICAL layout (1 model per row, 12 per page).
+- Provider saved immediately when URL+Token entered (not on model select).
+- Button renamed: "📋 پرووایدرها" (not "سوئیچ").
+- Error "Provider یافت نشد" fixed by saving provider early.
+- Test success: clean message. Test failure: exact raw provider error.
+- /cancel command, threaded tests, toast notifications.
 """
 from __future__ import annotations
 
@@ -177,7 +173,6 @@ def http_json(url: str, method: str = "GET", data: Any = None, headers: dict | N
         body_bytes = b""
         with contextlib.suppress(Exception):
             body_bytes = exc.read()
-        # Return raw body for error display
         raise RuntimeError(body_bytes.decode("utf-8", "replace") or f"HTTP {exc.code}") from exc
 
 
@@ -239,7 +234,6 @@ def tg_document(chat_id: int, filename: str, data: bytes, caption: str) -> None:
 
 
 def answer_callback(query_id: str, text: str = "", alert: bool = False) -> None:
-    """alert=False -> Toast (top bar), alert=True -> Popup (center)."""
     with contextlib.suppress(Exception):
         tg("answerCallbackQuery", {"callback_query_id": query_id, "text": text[:200], "show_alert": alert})
 
@@ -469,7 +463,6 @@ def add_model_from_provider(prov_id: str, model_name: str) -> str:
 
 # ---------------- Smart Model Test (Threaded) ----------------
 def run_model_test_threaded(chat_id: int, model_name: str, base_url: str, token: str, provider_type: str):
-    """Runs in a separate thread. Sends result as a NEW message."""
     endpoint = ""
     try:
         started = time.monotonic()
@@ -497,7 +490,6 @@ def run_model_test_threaded(chat_id: int, model_name: str, base_url: str, token:
                                       {"model": model_name, "messages": [{"role": "user", "content": "Reply OK only."}], "max_tokens": 8},
                                       headers, timeout=timeout)
             if status < 200 or status >= 300:
-                # Raise with raw body for exact error display
                 raise RuntimeError(raw or f"HTTP {status}")
             return time.monotonic() - started
 
@@ -511,14 +503,12 @@ def run_model_test_threaded(chat_id: int, model_name: str, base_url: str, token:
             else:
                 raise
         
-        # SUCCESS: Clean message
         send_message(
             chat_id,
             f"<b>✅ تست موفق</b>\nمدل: <code>{esc(model_name)}</code>\nزمان پاسخ: <b>{elapsed:.1f}s</b>",
             [[("🏠 خانه", "home")]]
         )
     except Exception as exc:
-        # FAILURE: Exact raw provider message
         raw_error = str(exc)
         send_message(
             chat_id,
@@ -638,7 +628,6 @@ def cancel_run(run_id: int) -> None:
     gh("POST", f"/actions/runs/{run_id}/cancel", timeout=15)
 
 
-# ---------------- Hard Cancel (/cancel) ----------------
 def hard_cancel(chat_id: int) -> str:
     cancelled_flows = 0
     cancelled_engines = 0
@@ -867,19 +856,19 @@ def models_screen(chat_id: int, target_mid: int | None = None) -> int:
         text += f"\n{mark}<b>{esc(row['name'])}</b>"
         buttons.append([(f"⚡ فعال‌سازی", f"activate:{row['id']}")])
     buttons += [
-        [("➕ افزودن مدل", "model_add"), ("🔄 سوئیچ Provider", "switch_provider_menu")],
+        [("➕ افزودن مدل", "model_add"), ("📋 پرووایدرها", "providers_menu")],
         [("🗑 حذف مدل", "model_delete_menu")],
         [("🏠 خانه", "home")],
     ]
     return show(chat_id, text, buttons, target_mid)
 
 
-def switch_provider_menu(chat_id: int, target_mid: int | None = None) -> int:
+def providers_menu(chat_id: int, target_mid: int | None = None) -> int:
     provs = q("SELECT * FROM providers ORDER BY name")
     if not provs:
         return show(chat_id, "📭 هیچ Provider ذخیره‌شده‌ای وجود ندارد.\nابتدا یک مدل اضافه کنید.",
                     [[("➕ افزودن مدل", "model_add"), ("🏠 خانه", "home")]], target_mid)
-    text = "<b>🔄 سوئیچ Provider</b>\nیک Provider را انتخاب کنید تا مدل‌های آن لیست شوند:"
+    text = "<b>📋 پرووایدرها</b>\nیک Provider را انتخاب کنید تا مدل‌های آن لیست شوند:"
     buttons = []
     for p in provs:
         buttons.append([(f"🔹 {esc(p['name'])}", f"list_provider_models:{p['id']}")])
@@ -897,7 +886,7 @@ def list_provider_models_screen(chat_id: int, prov_id: str, page: int = 0, targe
     
     if not models:
         return show(chat_id, f"📭 لیست مدل‌ها برای <b>{esc(prov['name'])}</b> دریافت نشد.\nلطفاً Model ID را دستی وارد کنید.",
-                    [[("✏️ ورود دستی", f"manual_model_for_prov:{prov_id}"), ("◀️ بازگشت", "switch_provider_menu")]], target_mid)
+                    [[("✏️ ورود دستی", f"manual_model_for_prov:{prov_id}"), ("◀️ بازگشت", "providers_menu")]], target_mid)
     
     WIZARDS[chat_id] = {"stage": "provider_models", "prov_id": prov_id, "models_list": models}
     
@@ -910,16 +899,12 @@ def list_provider_models_screen(chat_id: int, prov_id: str, page: int = 0, targe
     text = f"<b>📋 مدل‌های {esc(prov['name'])} ({len(models)} مورد)</b>\nصفحه {page + 1} از {total_pages}\n\n"
     buttons = []
     
-    # 2 rows x 6 columns = 12 buttons per page
-    for i in range(0, len(page_models), 6):
-        row_models = page_models[i:i+6]
-        row_buttons = []
-        for model_id in row_models:
-            short_name = model_id.split("/")[-1] if "/" in model_id else model_id
-            if len(short_name) > 16:
-                short_name = short_name[:13] + "..."
-            row_buttons.append((short_name, f"model_detail:{prov_id}:{model_id}"))
-        buttons.append(row_buttons)
+    # VERTICAL layout: 1 model per row
+    for model_id in page_models:
+        short_name = model_id.split("/")[-1] if "/" in model_id else model_id
+        if len(short_name) > 25:
+            short_name = short_name[:22] + "..."
+        buttons.append([(short_name, f"model_detail:{prov_id}:{model_id}")])
     
     nav_row = []
     if page > 0:
@@ -929,12 +914,11 @@ def list_provider_models_screen(chat_id: int, prov_id: str, page: int = 0, targe
     if nav_row:
         buttons.append(nav_row)
     
-    buttons.append([("✏️ ورود دستی", f"manual_model_for_prov:{prov_id}"), ("◀️ بازگشت", "switch_provider_menu")])
+    buttons.append([("✏️ ورود دستی", f"manual_model_for_prov:{prov_id}"), ("◀️ بازگشت", "providers_menu")])
     return show(chat_id, text, buttons, target_mid)
 
 
 def model_detail_screen(chat_id: int, prov_id: str, model_name: str, target_mid: int | None = None) -> int:
-    short_name = model_name.split("/")[-1] if "/" in model_name else model_name
     return show(chat_id,
                 f"<b>📋 جزئیات مدل</b>\n\nModel: <code>{esc(model_name)}</code>\n\nیک عملیات را انتخاب کنید:",
                 [
@@ -970,6 +954,7 @@ def wizard_model_manual_screen(chat_id: int, target_mid: int | None = None) -> i
 def models_list_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -> int:
     wizard = WIZARDS.get(chat_id, {})
     models = wizard.get("models_list", [])
+    prov_id = wizard.get("prov_id", "")
     
     if not models:
         return show(chat_id, "📭 لیست مدل‌ها خالی است یا دریافت نشد.\nلطفاً Model ID را دستی وارد کن.",
@@ -984,15 +969,12 @@ def models_list_screen(chat_id: int, page: int = 0, target_mid: int | None = Non
     text = f"<b>📋 لیست مدل‌ها ({len(models)} مورد)</b>\nصفحه {page + 1} از {total_pages}\n\n"
     buttons = []
     
-    for i in range(0, len(page_models), 6):
-        row_models = page_models[i:i+6]
-        row_buttons = []
-        for model_id in row_models:
-            short_name = model_id.split("/")[-1] if "/" in model_id else model_id
-            if len(short_name) > 16:
-                short_name = short_name[:13] + "..."
-            row_buttons.append((short_name, f"model_detail_temp:{model_id}"))
-        buttons.append(row_buttons)
+    # VERTICAL layout
+    for model_id in page_models:
+        short_name = model_id.split("/")[-1] if "/" in model_id else model_id
+        if len(short_name) > 25:
+            short_name = short_name[:22] + "..."
+        buttons.append([(short_name, f"model_detail_temp:{model_id}")])
     
     nav_row = []
     if page > 0:
@@ -1171,7 +1153,7 @@ def bulk_delete_menu(chat_id: int, target_mid: int | None = None) -> int:
     return show(chat_id,
                 "<b>🧹 پاک‌سازی تاریخچه</b>\nچه بازه‌ای پاک شود؟\n⚠️ فقط رکوردهای محلی؛ Artifacts گیت‌هاب دست‌نخورده می‌مانند.",
                 [
-                    [("🗑 ۷ روز گذشته", "bulk_scope:7"), ("🗑 ۳۰ روز گذشته", "bulk_scope:30")],
+                    [("🗑  روز گذشته", "bulk_scope:7"), ("🗑 ۰ روز گذشته", "bulk_scope:30")],
                     [("🗑 همه", "bulk_scope:all")],
                     [("❌ انصراف", "outputs")],
                 ], target_mid)
@@ -1235,12 +1217,17 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
                 if len(text) < 3:
                     raise ValueError("Token خیلی کوتاه است (حداقل ۳ کاراکتر).")
                 item["token"] = text
+                # SAVE PROVIDER IMMEDIATELY when token is entered
+                prov_id = save_provider(item["provider_name"], item["provider_type"], item["url"], item["token"])
+                item["prov_id"] = prov_id
                 item["stage"] = "model"
                 wizard_model_manual_screen(chat_id, target_mid)
             elif stage == "model_manual":
                 if not text:
                     raise ValueError("Model ID نمی‌تواند خالی باشد.")
-                prov_id = save_provider(item["provider_name"], item["provider_type"], item["url"], item["token"])
+                prov_id = item.get("prov_id")
+                if not prov_id:
+                    raise ValueError("Provider یافت نشد. لطفاً از اول شروع کنید.")
                 model_id = add_model_from_provider(prov_id, text)
                 WIZARDS.pop(chat_id, None)
                 answer_callback(f"temp_{chat_id}", "✅ مدل ذخیره و فعال شد!", True)
@@ -1315,8 +1302,8 @@ def callback(query: dict[str, Any]) -> None:
             home_screen(chat_id, target_mid=cb_mid)
         elif data == "models":
             models_screen(chat_id, cb_mid)
-        elif data == "switch_provider_menu":
-            switch_provider_menu(chat_id, cb_mid)
+        elif data == "providers_menu":
+            providers_menu(chat_id, cb_mid)
         elif data.startswith("list_provider_models:"):
             prov_id = data.split(":", 1)[1]
             list_provider_models_screen(chat_id, prov_id, page=0, target_mid=cb_mid)
@@ -1333,7 +1320,9 @@ def callback(query: dict[str, Any]) -> None:
         elif data.startswith("model_detail_temp:"):
             model_name = data.split(":", 1)[1]
             wizard = WIZARDS.get(chat_id, {})
-            prov_id = wizard.get("prov_id_temp", "")
+            prov_id = wizard.get("prov_id", "")
+            if not prov_id:
+                raise ValueError("Provider یافت نشد. لطفاً از اول شروع کنید.")
             model_detail_screen(chat_id, prov_id, model_name, cb_mid)
         elif data.startswith("test_prov_model:"):
             parts = data.split(":", 2)
@@ -1373,15 +1362,19 @@ def callback(query: dict[str, Any]) -> None:
             wizard_model_manual_screen(chat_id, cb_mid)
         elif data == "fetch_models_list":
             wizard = WIZARDS.get(chat_id, {})
-            url = wizard.get("url", "")
-            token = wizard.get("token", "")
-            models = fetch_models_list(url, token)
+            prov_id = wizard.get("prov_id", "")
+            if not prov_id:
+                raise ValueError("Provider یافت نشد. لطفاً از اول شروع کنید.")
+            prov = get_provider(prov_id)
+            if not prov:
+                raise ValueError("Provider یافت نشد.")
+            token = decrypt_token(prov["token_ciphertext"])
+            models = fetch_models_list(prov["base_url"], token)
             if not models:
                 show(chat_id, "📭 لیست مدل‌ها دریافت نشد.\nلطفاً Model ID را دستی وارد کن.",
                      [[("✏️ ورود دستی", "wizard_manual_model"), ("◀️ بازگشت", "models")]], cb_mid)
             else:
                 wizard["models_list"] = models
-                wizard["prov_id_temp"] = wizard.get("prov_id", "")
                 wizard["stage"] = "model_list"
                 models_list_screen(chat_id, page=0, target_mid=cb_mid)
         elif data.startswith("models_page:"):
@@ -1390,16 +1383,20 @@ def callback(query: dict[str, Any]) -> None:
         elif data.startswith("test_list_model:"):
             model_name = data.split(":", 1)[1]
             wizard = WIZARDS.get(chat_id, {})
-            url = wizard.get("url", "")
-            token = wizard.get("token", "")
-            ptype = wizard.get("provider_type", "openai_compatible")
-            threading.Thread(target=run_model_test_threaded, args=(chat_id, model_name, url, token, ptype), daemon=True).start()
+            prov_id = wizard.get("prov_id", "")
+            if not prov_id:
+                raise ValueError("Provider یافت نشد. لطفاً از اول شروع کنید.")
+            prov = get_provider(prov_id)
+            if not prov:
+                raise ValueError("Provider یافت نشد.")
+            token = decrypt_token(prov["token_ciphertext"])
+            threading.Thread(target=run_model_test_threaded, args=(chat_id, model_name, prov["base_url"], token, prov["provider_type"]), daemon=True).start()
         elif data.startswith("select_list_model:"):
             model_name = data.split(":", 1)[1]
             wizard = WIZARDS.get(chat_id, {})
-            prov_id = wizard.get("prov_id_temp")
+            prov_id = wizard.get("prov_id", "")
             if not prov_id:
-                prov_id = save_provider(wizard.get("provider_name", "Custom"), wizard.get("provider_type", "openai_compatible"), wizard.get("url", ""), wizard.get("token", ""))
+                raise ValueError("Provider یافت نشد. لطفاً از اول شروع کنید.")
             model_id = add_model_from_provider(prov_id, model_name)
             WIZARDS.pop(chat_id, None)
             answer_callback(query["id"], "✅ مدل انتخاب و فعال شد!", True)
