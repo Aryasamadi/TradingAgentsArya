@@ -205,20 +205,6 @@ jobs:
             exit 2
           fi
           printf '%q ' "${CMD[@]}" > .runtime/run/command.txt
-          cat > .runtime/run/request.json <<EOF
-          {
-            "request_id": "${REQUEST_ID}",
-            "mode": "${REQUEST_MODE}",
-            "chat_id": "${REQUEST_CHAT_ID}",
-            "ticker": "${TICKER}",
-            "tickers": "${TICKERS}",
-            "date": "${ANALYSIS_DATE}",
-            "start": "${START_DATE}",
-            "end": "${END_DATE}",
-            "every": "${EVERY}",
-            "analysts": "${ANALYSTS}"
-          }
-          EOF
           echo "Starting TradingAgents..."
           echo "Request ID: ${REQUEST_ID}"
           echo "Mode: ${REQUEST_MODE}"
@@ -243,7 +229,6 @@ jobs:
           echo "Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$MERGED"
           echo "" >> "$MERGED"
           echo "---" >> "$MERGED"
-          echo "" >> "$MERGED"
           if [[ -d "$HOME/.tradingagents" ]]; then
             find "$HOME/.tradingagents" -type f \( -name '*.md' -o -name '*.txt' -o -name '*.json' \) 2>/dev/null | sort | while read -r f; do
               base=$(basename "$f")
@@ -253,20 +238,16 @@ jobs:
               echo "" >> "$MERGED"
               echo "## 📎 $base" >> "$MERGED"
               echo "" >> "$MERGED"
-              echo '```' >> "$MERGED"
               cat "$f" >> "$MERGED"
               echo "" >> "$MERGED"
-              echo '```' >> "$MERGED"
             done
           fi
           if [[ -f .runtime/run/agent.log ]]; then
             cp -f .runtime/run/agent.log "$OUTDIR/agent.log"
           fi
-          echo ""
           echo "=== Collected files ==="
-          ls -la "$OUTDIR"
-          echo "=== Merged report size ==="
-          wc -c "$MERGED"
+          ls -la "$OUTDIR" || true
+          wc -c "$MERGED" || true
 
       - name: Save TradingAgents state
         if: always()
