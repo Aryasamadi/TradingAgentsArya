@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 # ruff: noqa
 # -*- coding: utf-8 -*-
-"""TradingAgentsArya Telegram controller - build v15 (Final Stable).
+"""TradingAgentsArya Telegram controller - build v16 (Final Fixed & Optimized).
 
-v15 Fixes & Features:
-- FIXED: 'not enough values to unpack' error (HTTP functions always return 3 values).
-- FIXED: Wizard no longer jumps to home on error; stays on current page.
-- FIXED: Provider saved immediately after token entry with confirmation toast.
-- UI: Models menu -> 3 records per page, 2-column layout, numbered buttons (#1).
-- UI: Smart checkmark (✅) moves instantly on activation without page change.
-- UX: Logs menu -> Removed non-functional delete buttons; added clear guide message.
-- REPORT: Intelligent cleaning (removes settings/debug logs) + Rich summary (3500 chars).
+v16 Critical Fixes:
+- FIXED: 'not enough values to unpack' (All HTTP/GH functions return 3 values).
+- FIXED: Wizard no longer jumps to home on error (stays on page).
+- FIXED: Provider saved immediately after token with toast confirmation.
+- UI: Models menu -> 3 records/page, 2-col layout, numbered buttons (#1), smart checkmark.
+- UX: Logs menu -> Removed fake delete buttons; added clear guide.
+- REPORT: Intelligent cleaning (removes settings/debug) + Rich summary (3500 chars) + NO buttons under summary.
 """
 from __future__ import annotations
 
@@ -35,7 +34,7 @@ import uuid
 import zipfile
 from typing import Any
 
-BUILD = "v15"
+BUILD = "v16"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
@@ -169,16 +168,13 @@ def http_json(url: str, method: str = "GET", data: Any = None, headers: dict | N
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
-            # Always return 3 values
             return resp.status, (json.loads(raw) if raw else None), raw
     except urllib.error.HTTPError as exc:
         body_bytes = b""
         with contextlib.suppress(Exception):
             body_bytes = exc.read()
-        # Return 3 values even on error
         return exc.code, None, body_bytes.decode("utf-8", "replace") or f"HTTP {exc.code}"
     except Exception as exc:
-        # Return 3 values on network error
         return 0, None, str(exc)
 
 
@@ -685,7 +681,6 @@ def clean_report(raw_md: str) -> str:
     skip_section = False
     
     for line in lines:
-        # Skip run_settings JSON block
         if '"run_settings"' in line or '"version": "0.5.2"' in line:
             skip_section = True
         if skip_section and line.strip() == '}':
@@ -694,7 +689,6 @@ def clean_report(raw_md: str) -> str:
         if skip_section:
             continue
             
-        # Skip common debug headers
         if any(x in line for x in ["DEBUG", "INFO", "WARNING", "System Prompt", "Tool Call"]):
             continue
             
@@ -717,7 +711,6 @@ def extract_summary(body: str) -> str:
             if len(snippet) > 100:
                 return snippet[:3500]
     
-    # Fallback: first 3500 chars of cleaned text
     clean = re.sub(r"```[\s\S]*?```", "", body).strip()
     return clean[:3500] if clean else "(خلاصه‌ای یافت نشد)"
 
@@ -725,7 +718,6 @@ def extract_summary(body: str) -> str:
 def format_telegram_text(text: str) -> str:
     text = re.sub(r'^([A-Z]{2,6})\b', r'<b>\1</b>', text, flags=re.MULTILINE)
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    # Bold numbers and prices
     text = re.sub(r'(\$?\d+\.?\d*)', r'<b>\1</b>', text)
     return text
 
@@ -788,7 +780,6 @@ def send_output(chat_id: int, request_id: str) -> None:
     best_name = scored[0][1].replace("/", "_")
     best_body = scored[0][2]
     
-    # Clean the report before sending
     cleaned_body = clean_report(best_body)
     
     label = "تحلیل" if row["mode"] == "analysis" else "بک‌تست"
@@ -799,10 +790,10 @@ def send_output(chat_id: int, request_id: str) -> None:
     summary = extract_summary(cleaned_body)
     formatted_summary = format_telegram_text(summary)
     
+    # NO BUTTONS under the summary text
     send_message(
         chat_id,
-        f"<b>📊 خلاصهٔ {label} <b>{esc(subject)}</b></b>\n\n{formatted_summary}\n\n📎 فایل کامل بالا ارسال شد.",
-        [[("بازگشت", "outputs")]]
+        f"<b>📊 خلاصهٔ {label} <b>{esc(subject)}</b></b>\n\n{formatted_summary}\n\n📎 فایل کامل بالا ارسال شد."
     )
 
 
@@ -913,7 +904,6 @@ def models_screen(chat_id: int, page: int = 0, target_mid: int | None = None) ->
     if not page_rows:
         text += "\nهنوز مدلی ثبت نشده است. می‌توانید مدل جدید اضافه کنید."
     else:
-        # 2-column layout for up to 3 items (Row 1: 2 items, Row 2: 1 item)
         for i in range(0, len(page_rows), 2):
             row_pair = page_rows[i:i+2]
             btn_row = []
@@ -1375,7 +1365,6 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
                      f"<b>✅ مدل ذخیره شد</b>\n<code>{esc(text)}</code>",
                      [[("🧪 تست", f"test_model:{model_id}"), ("🏠 خانه", "home")]], target_mid)
         except ValueError as exc:
-            # Stay on the same page, show error
             show(chat_id, f"<b>⚠️ {esc(exc)}</b>\n\nلطفاً دوباره تلاش کنید.", [[("❌ لغو", "wizard_cancel")]], target_mid)
         return
 
@@ -1408,7 +1397,6 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
                 flow["stage"] = "every"
                 backtest_every_screen(chat_id, target_mid)
         except ValueError as exc:
-            # Stay on the same page
             show(chat_id, f"<b>⚠️ {esc(exc)}</b>\n\nلطفاً دوباره تلاش کنید.", [[("❌ لغو", "flow_cancel")]], target_mid)
 
 
@@ -1506,7 +1494,6 @@ def callback(query: dict[str, Any]) -> None:
             try:
                 model_id = add_model_from_provider(prov_id, model_name)
                 answer_callback(query["id"], "✅ مدل فعال شد!", True)
-                # Go back to models list to see the new model
                 models_screen(chat_id, page=0, target_mid=cb_mid)
             except ValueError as ve:
                 show(chat_id, f"<b>⚠️ {esc(ve)}</b>", [[("بازگشت", f"model_detail:{prov_id}:{model_name}")]], cb_mid)
@@ -1564,18 +1551,6 @@ def callback(query: dict[str, Any]) -> None:
             write_active_model_secrets(row)
             set_active_model(row["id"])
             answer_callback(query["id"], "⚡ مدل فعال شد!", True)
-            # Refresh the SAME page to move the checkmark
-            # We need to know the current page. Since we don't store it in callback easily, 
-            # we can try to infer or just refresh page 0. 
-            # Better UX: Just refresh the current message content. 
-            # But models_screen needs a page number. 
-            # Hack: If we are on page > 0, the button data would ideally carry it. 
-            # For now, let's assume page 0 or try to keep it simple.
-            # Actually, to keep the checkmark moving on the SAME page, we should re-render models_screen with the same page.
-            # Since we don't have the page in the callback data for 'activate', we default to 0.
-            # To fix this properly, we'd need to encode page in the activate button or store current page in session.
-            # Given constraints, refreshing page 0 is acceptable, or we can store 'last_models_page' in settings.
-            # Let's use a simple setting to remember last page.
             last_page = int(get_setting(f"last_models_page_{chat_id}", "0"))
             models_screen(chat_id, page=last_page, target_mid=cb_mid)
         elif data == "model_delete_menu":
@@ -1729,7 +1704,6 @@ def callback(query: dict[str, Any]) -> None:
         elif data == "noop":
             pass
     except Exception as exc:
-        # Show error on the same page, don't jump to home
         show(chat_id, f"<b>❌ خطا</b>\n{esc(exc)}", [[("بازگشت", "home")]], cb_mid)
 
 
