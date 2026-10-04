@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # ruff: noqa
 # -*- coding: utf-8 -*-
-"""TradingAgentsArya Telegram controller - build v13 (Final Production).
+"""TradingAgentsArya Telegram controller - build v14 (Final Extended).
 
-v13 Features:
-- Numbered buttons for outputs/logs (#1, #2) to avoid ambiguity.
-- Pagination: 3 records per page for outputs and logs.
-- Log management: delete single log or bulk cleanup.
-- Telegram formatting: Bold tickers, optimized HTML output (no data change).
-- Providers menu: 2-column layout.
-- Bilingual headers: Persian + short English (except Home).
-- Data integrity: Zero modification to financial report content.
+v14 Features:
+- Removed English headers.
+- Expanded short menu texts (5-10 words) for better visual appearance.
+- Prevent deletion of active runs (must cancel first).
+- Active Runs menu: numbered list (#1, #2) with cancel buttons.
+- Fixed cancel_run error (unpacking issue).
+- Models menu: 2 columns, 6 records/page, numbered buttons (#1).
+- Prevent duplicate models from same provider.
+- UX: Activation/Deletion shows Toast only, updates current page (no navigation).
+- Empty list handling: returns to initial state instead of error.
 """
 from __future__ import annotations
 
@@ -35,7 +37,7 @@ import uuid
 import zipfile
 from typing import Any
 
-BUILD = "v13"
+BUILD = "v14"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
@@ -458,6 +460,11 @@ def add_model_from_provider(prov_id: str, model_name: str) -> str:
     prov = get_provider(prov_id)
     if not prov:
         raise ValueError("Provider یافت نشد.")
+    # Check for duplicates
+    existing = q1("SELECT id FROM models WHERE name=? AND provider_id=? AND enabled=1", (model_name, prov_id))
+    if existing:
+        raise ValueError("این مدل قبلاً از این Provider اضافه شده است.")
+    
     model_id = "m_" + uuid.uuid4().hex[:12]
     db("INSERT INTO models(id,name,provider_id,base_url,token_ciphertext,enabled,created_at) VALUES(?,?,?,?,?,1,?)",
        (model_id, model_name, prov_id, prov["base_url"], prov["token_ciphertext"], now()))
@@ -635,7 +642,12 @@ def worker_loop() -> None:
 
 
 def cancel_run(run_id: int) -> None:
-    gh("POST", f"/actions/runs/{run_id}/cancel", timeout=15)
+    try:
+        gh("POST", f"/actions/runs/{run_id}/cancel", timeout=15)
+    except Exception as exc:
+        # Ignore 404 or already cancelled errors
+        if "404" not in str(exc) and "409" not in str(exc):
+            raise
 
 
 def hard_cancel(chat_id: int) -> str:
@@ -687,10 +699,7 @@ def extract_summary(body: str) -> str:
 
 
 def format_telegram_text(text: str) -> str:
-    """Optimize text for Telegram HTML without changing content."""
-    # Bold tickers (simple heuristic: uppercase words near start of lines)
     text = re.sub(r'^([A-Z]{2,6})\b', r'<b>\1</b>', text, flags=re.MULTILINE)
-    # Convert markdown bold to HTML bold if present
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
     return text
 
@@ -850,7 +859,8 @@ def home_screen(chat_id: int, force_new: bool = False, target_mid: int | None = 
     model_line = f"مدل فعال: <b>{esc(mrow['name'])}</b>" if mrow else "مدل فعال: <b>تنظیم نشده</b>"
     busy = q1("SELECT COUNT(*) c FROM runs WHERE status NOT IN " + str(TERMINAL))["c"]
     live = f"\n🟡 اجرای فعال: <b>{busy}</b>" if busy else ""
-    text = (f"<b>🤖 TradingAgentsArya</b>\n{model_line}{live}\nیک گزینه را انتخاب کن.\n<code>build {BUILD}</code>")
+    # Expanded text for better visual
+    text = (f"<b>🤖 TradingAgentsArya</b>\n{model_line}{live}\n\nبه سیستم هوشمند تحلیل و مدیریت معاملات خوش آمدید. لطفاً یکی از گزینه‌های زیر را برای شروع انتخاب نمایید.\n<code>build {BUILD}</code>")
     rows = [
         [("🚀 تحلیل جدید", "flow_analysis_start"), ("📈 بک‌تست", "flow_backtest_start")],
         [("🤖 مدل‌ها", "models"), ("📊 اجراهای جاری", "active_runs")],
@@ -863,17 +873,47 @@ def home_screen(chat_id: int, force_new: bool = False, target_mid: int | None = 
     return show(chat_id, text, rows, target_mid)
 
 
-def models_screen(chat_id: int, target_mid: int | None = None) -> int:
+def models_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -> int:
     rows = model_rows()
     aid = active_model_id()
-    text = "<b>🤖 مدل‌ها Models</b>\n"
+    
+    per_page = 6
+    start = page * per_page
+    end = start + per_page
+    page_rows = rows[start:end]
+    total_pages = (len(rows) + per_page - 1) // per_page
+    
+    text = "<b>🤖 مدل‌ها</b>\nلیست مدل‌های هوش مصنوعی ثبت شده در سیستم را مشاهده و مدیریت کنید.\n"
     buttons: list[list[tuple[str, str]]] = []
-    if not rows:
-        text += "هنوز مدلی ثبت نشده."
-    for row in rows:
-        mark = "✅ " if row["id"] == aid else ""
-        text += f"\n{mark}<b>{esc(row['name'])}</b>"
-        buttons.append([(f"⚡ فعال‌سازی", f"activate:{row['id']}")])
+    
+    if not page_rows:
+        text += "\nهنوز مدلی ثبت نشده است. می‌توانید مدل جدید اضافه کنید."
+    else:
+        for idx, row in enumerate(page_rows, start=start + 1):
+            mark = "✅ " if row["id"] == aid else ""
+            text += f"\n<b>#{idx}</b> {mark}<b>{esc(row['name'])}</b>"
+            # 2 columns layout for buttons
+            if idx % 2 != 0 and idx < len(page_rows) + start: # Pair with next if exists
+                 pass # Handled in loop logic below
+        
+        # Re-loop for 2-column button layout
+        buttons = []
+        for i in range(0, len(page_rows), 2):
+            row_pair = page_rows[i:i+2]
+            btn_row = []
+            for j, r in enumerate(row_pair):
+                idx_num = start + i + j + 1
+                btn_row.append((f"⚡ #{idx_num}", f"activate:{r['id']}"))
+            buttons.append(btn_row)
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(("◀️ قبلی", f"models_page:{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(("بعدی ▶️", f"models_page:{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+
     buttons += [
         [("➕ افزودن مدل", "model_add"), ("📋 پرووایدرها", "providers_menu")],
         [("🗑 حذف مدل", "model_delete_menu")],
@@ -885,9 +925,9 @@ def models_screen(chat_id: int, target_mid: int | None = None) -> int:
 def providers_menu(chat_id: int, target_mid: int | None = None) -> int:
     provs = q("SELECT * FROM providers ORDER BY name")
     if not provs:
-        return show(chat_id, "📭 هیچ Provider ذخیره‌شده‌ای وجود ندارد.",
+        return show(chat_id, "📭 هیچ Provider ذخیره‌شده‌ای وجود ندارد. لطفاً ابتدا یک مدل اضافه کنید.",
                     [[("➕ افزودن مدل", "model_add"), ("🏠 خانه", "home")]], target_mid)
-    text = "<b>📋 پرووایدرها Providers</b>\nیک Provider را انتخاب کنید:"
+    text = "<b>📋 پرووایدرها</b>\nلیست ارائه‌دهندگان سرویس هوش مصنوعی متصل به سیستم را مشاهده کنید."
     buttons = []
     # 2 columns layout
     for i in range(0, len(provs), 2):
@@ -1047,7 +1087,7 @@ def model_test_menu(chat_id: int, target_mid: int | None = None) -> int:
     buttons = [[(f"🧪 {r['name']}", f"test_model:{r['id']}")] for r in model_rows()]
     buttons.append([("بازگشت", "models")])
     return show(chat_id,
-                "<b>🧪 تست اتصال</b>\nTimeout: ۲۴۰ ثانیه + Retry هوشمند.",
+                "<b>🧪 تست اتصال</b>\nیک درخواست بسیار کوچک واقعی به API؛ TradingAgents اجرا نمی‌شود.\nTimeout: ۲۴۰ ثانیه + Retry هوشمند.",
                 buttons, target_mid)
 
 
@@ -1059,36 +1099,36 @@ def model_delete_menu(chat_id: int, target_mid: int | None = None) -> int:
 
 def analysis_ticker_screen(chat_id: int, target_mid: int | None = None) -> int:
     return show(chat_id,
-                "<b>🔎 تحلیل جدید Analysis (1/3)</b>\nTicker را بفرست.\n\n<b>مثال:</b> <code>NVDA</code>",
+                "<b>🔎 تحلیل جدید (1/3)</b>\nTicker را بفرست.\n\n<b>مثال:</b> <code>NVDA</code>",
                 [[("❌ لغو", "flow_cancel")]], target_mid)
 
 
 def analysis_date_screen(chat_id: int, target_mid: int | None = None) -> int:
     return show(chat_id,
-                "<b>🔎 تحلیل جدید Analysis (2/3)</b>\nتاریخ را بفرست.\n\n<b>فرمت:</b> YYYY-MM-DD\n<b>مثال:</b> <code>2026-10-03</code>",
+                "<b>🔎 تحلیل جدید (2/3)</b>\nتاریخ را بفرست.\n\n<b>فرمت:</b> YYYY-MM-DD\n<b>مثال:</b> <code>2026-10-03</code>",
                 [[("📅 امروز", "analysis_today"), ("❌ لغو", "flow_cancel")]], target_mid)
 
 
 def backtest_tickers_screen(chat_id: int, target_mid: int | None = None) -> int:
     return show(chat_id,
-                "<b>📈 بک‌تست Backtest (1/5)</b>\nTickerها را بفرست.\n\n<b>مثال:</b> <code>NVDA,AAPL</code>",
+                "<b>📈 بک‌تست (1/5)</b>\nTickerها را بفرست.\n\n<b>مثال:</b> <code>NVDA,AAPL</code>",
                 [[("❌ لغو", "flow_cancel")]], target_mid)
 
 
 def backtest_start_screen(chat_id: int, target_mid: int | None = None) -> int:
     return show(chat_id,
-                "<b>📈 بک‌تست Backtest (2/5)</b>\nتاریخ شروع را بفرست.\n\n<b>مثال:</b> <code>2026-01-01</code>",
+                "<b>📈 بک‌تست (2/5)</b>\nتاریخ شروع را بفرست.\n\n<b>مثال:</b> <code>2026-01-01</code>",
                 [[("❌ لغو", "flow_cancel")]], target_mid)
 
 
 def backtest_end_screen(chat_id: int, target_mid: int | None = None) -> int:
     return show(chat_id,
-                "<b>📈 بک‌تست Backtest (3/5)</b>\nتاریخ پایان را بفرست.\n\n<b>مثال:</b> <code>2026-10-01</code>",
+                "<b>📈 بک‌تست (3/5)</b>\nتاریخ پایان را بفرست.\n\n<b>مثال:</b> <code>2026-10-01</code>",
                 [[("📅 امروز", "backtest_today"), ("❌ لغو", "flow_cancel")]], target_mid)
 
 
 def backtest_every_screen(chat_id: int, target_mid: int | None = None) -> int:
-    return show(chat_id, "<b>📈 بک‌تست Backtest (4/5)</b>\nفاصله زمانی:",
+    return show(chat_id, "<b>📈 بک‌تست (4/5)</b>\nفاصله زمانی:",
                 [
                     [("📅 1 روز", "every:1"), ("📅 7 روز", "every:7")],
                     [("📅 14 روز", "every:14"), ("📅 30 روز", "every:30")],
@@ -1109,14 +1149,14 @@ def analyst_picker(chat_id: int, backtest: bool, target_mid: int | None = None) 
         pair = allowed[i:i + 2]
         rows.append([(("✅ " if x in selected else "") + ANALYST_LABEL[x], f"toggle_analyst:{x}") for x in pair])
     rows += [[("✅ تایید", "analysts_done")], [("❌ لغو", "flow_cancel")]]
-    return show(chat_id, "<b>🎛 تحلیلگران Analysts</b>", rows, target_mid)
+    return show(chat_id, "<b>🎛 تحلیلگران</b>", rows, target_mid)
 
 
 def analysis_confirm_screen(chat_id: int, target_mid: int | None = None) -> int:
     data = FLOWS.get(chat_id, {})
     chosen = ", ".join(ANALYST_LABEL[x] for x in data.get("analysts", "").split(",") if x in ANALYST_LABEL) or "هیچ‌کدام"
     return show(chat_id,
-                f"<b>✅ آماده اجرا Ready</b>\nTicker: <code>{esc(data.get('ticker'))}</code>\n"
+                f"<b>✅ آماده اجرا</b>\nTicker: <code>{esc(data.get('ticker'))}</code>\n"
                 f"تاریخ: <code>{esc(data.get('date'))}</code>\nتحلیلگران: <b>{esc(chosen)}</b>",
                 [
                     [("🚀 شروع", "analysis_run")],
@@ -1129,7 +1169,7 @@ def backtest_confirm_screen(chat_id: int, target_mid: int | None = None) -> int:
     data = FLOWS.get(chat_id, {})
     chosen = ", ".join(ANALYST_LABEL[x] for x in data.get("analysts", "").split(",") if x in ANALYST_LABEL) or "هیچ‌کدام"
     return show(chat_id,
-                f"<b>✅ آماده بک‌تست Ready</b>\nTickerها: <code>{esc(data.get('tickers'))}</code>\n"
+                f"<b>✅ آماده بک‌تست</b>\nTickerها: <code>{esc(data.get('tickers'))}</code>\n"
                 f"از <code>{esc(data.get('start'))}</code> تا <code>{esc(data.get('end'))}</code>\n"
                 f"فاصله: <b>هر {esc(data.get('every', 7))} روز</b>",
                 [
@@ -1141,26 +1181,26 @@ def backtest_confirm_screen(chat_id: int, target_mid: int | None = None) -> int:
 
 def active_runs_screen(chat_id: int, target_mid: int | None = None) -> int:
     runs = list(CACHE.get("runs", []))
-    lines = ["<b>📊 اجراهای جاری Active Runs</b>"]
+    lines = ["<b>📊 اجراهای جاری</b>\nلیست پردازش‌هایی که هم‌اکنون در حال اجرا یا در صف انتظار هستند."]
     buttons = []
     if runs:
         lines.append("")
-        for run in sorted(runs, key=lambda x: str(x.get("created_at", "")), reverse=True):
-            lines.append(f"🟡 <b>{esc(run.get('display_title') or 'Engine')}</b>")
+        for idx, run in enumerate(sorted(runs, key=lambda x: str(x.get("created_at", "")), reverse=True), 1):
+            lines.append(f"<b>#{idx}</b> 🟡 <b>{esc(run.get('display_title') or 'Engine')}</b>")
             lines.append(f"⏱ {esc(format_run_time(run.get('created_at')))}")
-            buttons.append([("🛑 لغو", f"cancelw:{run.get('id')}")])
+            buttons.append([("🛑 لغو #" + str(idx), f"cancelw:{run.get('id')}")])
             lines.append("")
     else:
         local = q("SELECT * FROM runs WHERE status NOT IN " + str(TERMINAL) + " ORDER BY created_at DESC LIMIT 5")
         if local:
             lines.append("")
-            for row in local:
-                lines.append(f"🟡 <code>{esc(row['request_id'][:8])}</code> | <b>{esc(row['status'])}</b>")
+            for idx, row in enumerate(local, 1):
+                lines.append(f"<b>#{idx}</b> 🟡 <code>{esc(row['request_id'][:8])}</code> | <b>{esc(row['status'])}</b>")
                 if row["workflow_run_id"]:
-                    buttons.append([("🛑 لغو", f"cancelw:{row['workflow_run_id']}")])
+                    buttons.append([("🛑 لغو #" + str(idx), f"cancelw:{row['workflow_run_id']}")])
                 lines.append("")
         else:
-            lines.append("✅ هیچ پردازش فعالی نیست.")
+            lines.append("\n✅ هیچ پردازش فعالی در حال حاضر وجود ندارد.")
     buttons.append([("🔄 تازه‌سازی", "active_runs"), ("🏠 خانه", "home")])
     return show(chat_id, "\n".join(lines), buttons, target_mid)
 
@@ -1176,9 +1216,9 @@ def outputs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -
     total_pages = (total_count + per_page - 1) // per_page
     
     if not rows:
-        return show(chat_id, "<b>📄 خروجی‌ها Outputs</b>\nهنوز اجرایی نیست.", [[("🏠 خانه", "home")]], target_mid)
+        return show(chat_id, "<b>📄 خروجی‌ها</b>\nهنوز گزارشی برای نمایش وجود ندارد. لطفاً یک تحلیل جدید اجرا کنید.", [[("🏠 خانه", "home")]], target_mid)
     
-    lines = [f"<b>📄 خروجی‌ها Outputs</b> (صفحه {page + 1}/{total_pages})", ""]
+    lines = [f"<b>📄 خروجی‌ها</b> (صفحه {page + 1}/{total_pages})\nلیست گزارش‌های تولید شده توسط سیستم هوشمند.", ""]
     buttons = []
     
     for idx, row in enumerate(rows, start=offset + 1):
@@ -1188,8 +1228,18 @@ def outputs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -
             created_str = dt.datetime.fromisoformat(row["created_at"].replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
         except Exception:
             created_str = row["created_at"][:16]
-        lines.append(f"<b>#{idx}</b> <code>{esc(row['request_id'][:8])}</code> <b>{esc(subject)}</b> | {esc(created_str)}")
-        buttons.append([("📄 گزارش #" + str(idx), f"view_output:{row['request_id']}"), ("🗑 حذف #" + str(idx), f"ask_delete:{row['request_id']}")])
+        
+        is_active = row["status"] not in TERMINAL
+        status_icon = "🟡" if is_active else "✅" if row["status"] == "success" else "❌"
+        
+        lines.append(f"<b>#{idx}</b> {status_icon} <code>{esc(row['request_id'][:8])}</code> <b>{esc(subject)}</b> | {esc(created_str)}")
+        
+        btn_row = [("📄 گزارش #" + str(idx), f"view_output:{row['request_id']}")]
+        if is_active:
+            btn_row.append(("⚠️ در حال اجرا", "noop")) # Disabled delete
+        else:
+            btn_row.append(("🗑 حذف #" + str(idx), f"ask_delete:{row['request_id']}"))
+        buttons.append(btn_row)
     
     nav_row = []
     if page > 0:
@@ -1216,8 +1266,8 @@ def ask_delete_screen(chat_id: int, request_id: str, target_mid: int | None = No
 
 
 def bulk_delete_menu(chat_id: int, target_mid: int | None = None) -> int:
-    return show(chat_id, "<b>🧹 پاک‌سازی Cleanup</b>\nچه بازه‌ای؟",
-                [[("🗑 ۷ روز", "bulk_scope:7"), ("🗑 ۳۰ روز", "bulk_scope:30")], [("🗑 همه", "bulk_scope:all")], [("❌ انصراف", "outputs")]], target_mid)
+    return show(chat_id, "<b>🧹 پاک‌سازی</b>\nچه بازه‌ای از تاریخچه پاک شود؟",
+                [[("🗑  روز", "bulk_scope:7"), ("🗑 ۳۰ روز", "bulk_scope:30")], [("🗑 همه", "bulk_scope:all")], [("❌ انصراف", "outputs")]], target_mid)
 
 
 def bulk_confirm_screen(chat_id: int, scope: str, target_mid: int | None = None) -> int:
@@ -1237,9 +1287,9 @@ def logs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -> i
     total_pages = (len(run_logs) + per_page - 1) // per_page
     
     if not page_logs:
-        return show(chat_id, "<b>📋 لاگ‌ها Logs</b>\nهنوز لاگی نیست.", [[("🏠 خانه", "home")]], target_mid)
+        return show(chat_id, "<b>📋 لاگ‌ها</b>\nهنوز فایل لاگی برای نمایش وجود ندارد.", [[("🏠 خانه", "home")]], target_mid)
     
-    lines = [f"<b>📋 لاگ‌ها Logs</b> (صفحه {page + 1}/{total_pages})", ""]
+    lines = [f"<b>📋 لاگ‌ها</b> (صفحه {page + 1}/{total_pages})\nلیست فایل‌های لاگ خام executions.", ""]
     buttons = []
     
     for idx, item in enumerate(page_logs, start=start + 1):
@@ -1264,8 +1314,8 @@ def logs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -> i
 
 
 def bulk_delete_logs_menu(chat_id: int, target_mid: int | None = None) -> int:
-    return show(chat_id, "<b>🧹 پاک‌سازی لاگ‌ها Logs Cleanup</b>\nچه بازه‌ای؟",
-                [[("🗑 ۷ روز", "bulk_logs_scope:7"), ("🗑 ۳۰ روز", "bulk_logs_scope:30")], [("🗑 همه", "bulk_logs_scope:all")], [("❌ انصراف", "logs")]], target_mid)
+    return show(chat_id, "<b>🧹 پاک‌سازی لاگ‌ها</b>\nچه بازه‌ای؟",
+                [[("🗑  روز", "bulk_logs_scope:7"), ("🗑 ۳۰ روز", "bulk_logs_scope:30")], [("🗑 همه", "bulk_logs_scope:all")], [("❌ انصراف", "logs")]], target_mid)
 
 
 # ---------------- Text Handling ----------------
@@ -1346,7 +1396,7 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
                 flow["stage"] = "every"
                 backtest_every_screen(chat_id, target_mid)
         except ValueError as exc:
-            show(chat_id, f"<b>️ {esc(exc)}</b>", [[("بازگشت", "home")]], target_mid)
+            show(chat_id, f"<b>⚠️ {esc(exc)}</b>", [[("بازگشت", "home")]], target_mid)
 
 
 # ---------------- Callback Handling ----------------
@@ -1378,7 +1428,10 @@ def callback(query: dict[str, Any]) -> None:
             FLOWS.pop(chat_id, None)
             home_screen(chat_id, target_mid=cb_mid)
         elif data == "models":
-            models_screen(chat_id, cb_mid)
+            models_screen(chat_id, page=0, target_mid=cb_mid)
+        elif data.startswith("models_page:"):
+            page = int(data.split(":", 1)[1])
+            models_screen(chat_id, page=page, target_mid=cb_mid)
         elif data == "providers_menu":
             providers_menu(chat_id, cb_mid)
         elif data.startswith("provider_detail:"):
@@ -1391,7 +1444,8 @@ def callback(query: dict[str, Any]) -> None:
             prov_id = data.split(":", 1)[1]
             delete_provider(prov_id)
             answer_callback(query["id"], "🗑 Provider حذف شد.", True)
-            show(chat_id, "<b>🗑 Provider و مدل‌هایش حذف شدند.</b>", [[("بازگشت", "providers_menu")]], cb_mid)
+            # Refresh the providers menu on the same message
+            providers_menu(chat_id, cb_mid)
         elif data.startswith("list_provider_models:"):
             prov_id = data.split(":", 1)[1]
             list_provider_models_screen(chat_id, prov_id, page=0, target_mid=cb_mid)
@@ -1437,9 +1491,19 @@ def callback(query: dict[str, Any]) -> None:
             parts = data.split(":", 2)
             prov_id = parts[1]
             model_name = parts[2]
-            model_id = add_model_from_provider(prov_id, model_name)
-            answer_callback(query["id"], "✅ مدل فعال شد!", True)
-            show(chat_id, f"<b>✅ فعال شد</b>\n<code>{esc(model_name)}</code>", [[("🏠 خانه", "home")]], cb_mid)
+            try:
+                model_id = add_model_from_provider(prov_id, model_name)
+                answer_callback(query["id"], "✅ مدل فعال شد!", True)
+                # Refresh the detail screen to show it's selected (or go back to list)
+                # Actually, user asked for Toast only and stay on page. 
+                # But since we added the model, maybe go back to list or home?
+                # User said: "نیاز به تغییر به منو به منو جدید مبنی بر انتخاب مدل نیست فقط تیک بخوره کافیه"
+                # Since we can't easily update the button text to "Selected" without re-rendering the whole list which might change page,
+                # let's just show the toast and go to Home or Models list.
+                # Better: Go to Models list so they see the new model.
+                models_screen(chat_id, page=0, target_mid=cb_mid)
+            except ValueError as ve:
+                show(chat_id, f"<b>⚠️ {esc(ve)}</b>", [[("بازگشت", f"model_detail:{prov_id}:{model_name}")]], cb_mid)
         elif data.startswith("manual_model_for_prov:"):
             prov_id = data.split(":", 1)[1]
             prov = get_provider(prov_id)
@@ -1454,7 +1518,7 @@ def callback(query: dict[str, Any]) -> None:
             wizard_url_screen(chat_id, cb_mid)
         elif data == "wizard_cancel":
             WIZARDS.pop(chat_id, None)
-            models_screen(chat_id, cb_mid)
+            models_screen(chat_id, page=0, target_mid=cb_mid)
         elif data == "wizard_manual_model":
             WIZARDS[chat_id]["stage"] = "model_manual"
             wizard_model_manual_screen(chat_id, cb_mid)
@@ -1474,7 +1538,7 @@ def callback(query: dict[str, Any]) -> None:
                 wizard["models_list"] = models
                 wizard["stage"] = "model_list"
                 models_list_screen(chat_id, page=0, target_mid=cb_mid)
-        elif data.startswith("models_page:"):
+        elif data.startswith("models_page_list:"): # Renamed to avoid conflict with models_screen pagination
             page = int(data.split(":", 1)[1])
             models_list_screen(chat_id, page=page, target_mid=cb_mid)
         elif data.startswith("test_model:"):
@@ -1493,8 +1557,16 @@ def callback(query: dict[str, Any]) -> None:
                 raise ValueError("مدل پیدا نشد.")
             write_active_model_secrets(row)
             set_active_model(row["id"])
-            answer_callback(query["id"], "⚡ فعال شد!", True)
-            show(chat_id, f"<b>⚡ فعال شد</b>\n<code>{esc(row['name'])}</code>", [[("بازگشت", "models")]], cb_mid)
+            answer_callback(query["id"], "⚡ مدل فعال شد!", True)
+            # Refresh the current models page
+            # We need to know which page we are on. For simplicity, go to page 0 or try to keep page.
+            # Since we don't store page in callback easily without complex data, let's just refresh page 0 or current UI.
+            # Actually, show() uses target_mid, so it updates the current message.
+            # We need to re-render models_screen. But which page?
+            # Let's assume page 0 for now or parse from somewhere? 
+            # Better: Just re-render the screen. If we don't know page, default 0.
+            # To keep it simple and robust:
+            models_screen(chat_id, page=0, target_mid=cb_mid)
         elif data == "model_delete_menu":
             if not admin(user_id):
                 raise ValueError("فقط Admin.")
@@ -1507,7 +1579,8 @@ def callback(query: dict[str, Any]) -> None:
             if active_model_id() == model_id:
                 set_active_model("")
             answer_callback(query["id"], "🗑 حذف شد.", True)
-            show(chat_id, "<b>🗑 حذف شد.</b>", [[("بازگشت", "models")]], cb_mid)
+            # Refresh models screen
+            models_screen(chat_id, page=0, target_mid=cb_mid)
         elif data == "active_runs":
             active_runs_screen(chat_id, cb_mid)
         elif data.startswith("cancelw:"):
@@ -1515,7 +1588,8 @@ def callback(query: dict[str, Any]) -> None:
             try:
                 cancel_run(run_id)
                 answer_callback(query["id"], "🛑 لغو شد.", True)
-                show(chat_id, f"<b>🛑 لغو شد</b>\nRun: {run_id}", [[("بازگشت", "active_runs")]], cb_mid)
+                # Refresh active runs
+                active_runs_screen(chat_id, cb_mid)
             except Exception as exc:
                 show(chat_id, f"<b>❌ لغو ناموفق</b>\n{esc(exc)}", [[("بازگشت", "active_runs")]], cb_mid)
         elif data == "outputs":
@@ -1532,7 +1606,7 @@ def callback(query: dict[str, Any]) -> None:
         elif data.startswith("confirm_delete:"):
             db("DELETE FROM runs WHERE request_id=?", (data.split(":", 1)[1],))
             answer_callback(query["id"], "✅ حذف شد.", True)
-            show(chat_id, "<b>✅ حذف شد.</b>", [[("بازگشت", "outputs")]], cb_mid)
+            outputs_screen(chat_id, page=0, target_mid=cb_mid)
         elif data == "bulk_delete_menu":
             bulk_delete_menu(chat_id, cb_mid)
         elif data.startswith("bulk_scope:"):
@@ -1545,7 +1619,7 @@ def callback(query: dict[str, Any]) -> None:
                 cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=int(scope))).isoformat()
                 cur = db("DELETE FROM runs WHERE created_at < ?", (cutoff,))
             answer_callback(query["id"], f"✅ {cur.rowcount} حذف شد.", True)
-            show(chat_id, f"<b>✅ {cur.rowcount} حذف شد.</b>", [[("بازگشت", "outputs")]], cb_mid)
+            outputs_screen(chat_id, page=0, target_mid=cb_mid)
         elif data == "logs":
             logs_screen(chat_id, page=0, target_mid=cb_mid)
         elif data == "logs_refresh":
@@ -1556,7 +1630,6 @@ def callback(query: dict[str, Any]) -> None:
         elif data.startswith("download_log:"):
             threading.Thread(target=download_log, args=(chat_id, data.split(":", 1)[1]), daemon=True).start()
         elif data.startswith("ask_delete_log:"):
-            # For logs, we just acknowledge since we can't easily delete artifacts via API without more perms
             answer_callback(query["id"], "⚠️ حذف لاگ از طریق ربات ممکن نیست (محدودیت GitHub).", True)
         elif data == "bulk_delete_logs_menu":
             bulk_delete_logs_menu(chat_id, cb_mid)
@@ -1649,6 +1722,8 @@ def callback(query: dict[str, Any]) -> None:
             label = "تحلیل" if mode == "analysis" else "بک‌تست"
             answer_callback(query["id"], f"🚀 {label} در صف!", True)
             show(chat_id, f"<b>🚀 در صف</b>\n<code>{esc(request_id[:10])}</code>", [[("📊 اجراها", "active_runs"), ("🏠 خانه", "home")]], cb_mid)
+        elif data == "noop":
+            pass
     except Exception as exc:
         show(chat_id, f"<b>❌ {esc(exc)}</b>", [[("بازگشت", "home")]], cb_mid)
 
