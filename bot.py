@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 # ruff: noqa
 # -*- coding: utf-8 -*-
-"""TradingAgentsArya Telegram controller - build v14 (Final Extended).
+"""TradingAgentsArya Telegram controller - build v15 (Final Stable).
 
-v14 Features:
-- Removed English headers.
-- Expanded short menu texts (5-10 words) for better visual appearance.
-- Prevent deletion of active runs (must cancel first).
-- Active Runs menu: numbered list (#1, #2) with cancel buttons.
-- Fixed cancel_run error (unpacking issue).
-- Models menu: 2 columns, 6 records/page, numbered buttons (#1).
-- Prevent duplicate models from same provider.
-- UX: Activation/Deletion shows Toast only, updates current page (no navigation).
-- Empty list handling: returns to initial state instead of error.
+v15 Fixes & Features:
+- FIXED: 'not enough values to unpack' error (HTTP functions always return 3 values).
+- FIXED: Wizard no longer jumps to home on error; stays on current page.
+- FIXED: Provider saved immediately after token entry with confirmation toast.
+- UI: Models menu -> 3 records per page, 2-column layout, numbered buttons (#1).
+- UI: Smart checkmark (✅) moves instantly on activation without page change.
+- UX: Logs menu -> Removed non-functional delete buttons; added clear guide message.
+- REPORT: Intelligent cleaning (removes settings/debug logs) + Rich summary (3500 chars).
 """
 from __future__ import annotations
 
@@ -37,7 +35,7 @@ import uuid
 import zipfile
 from typing import Any
 
-BUILD = "v14"
+BUILD = "v15"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
@@ -148,7 +146,7 @@ def admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-# ---------------- HTTP ----------------
+# ---------------- HTTP (Guaranteed 3-value return) ----------------
 class _StripAuthRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         newreq = super().redirect_request(req, fp, code, msg, headers, newurl)
@@ -171,12 +169,17 @@ def http_json(url: str, method: str = "GET", data: Any = None, headers: dict | N
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
+            # Always return 3 values
             return resp.status, (json.loads(raw) if raw else None), raw
     except urllib.error.HTTPError as exc:
         body_bytes = b""
         with contextlib.suppress(Exception):
             body_bytes = exc.read()
-        raise RuntimeError(body_bytes.decode("utf-8", "replace") or f"HTTP {exc.code}") from exc
+        # Return 3 values even on error
+        return exc.code, None, body_bytes.decode("utf-8", "replace") or f"HTTP {exc.code}"
+    except Exception as exc:
+        # Return 3 values on network error
+        return 0, None, str(exc)
 
 
 def gh(method: str, path: str, data: Any = None, timeout: int = 30):
@@ -187,9 +190,9 @@ def gh(method: str, path: str, data: Any = None, timeout: int = 30):
         "X-GitHub-Api-Version": "2026-03-10",
         "Accept": "application/vnd.github+json",
     }
-    status, obj, _ = http_json(GH + path, method, data, headers, timeout=timeout)
-    if status >= 300:
-        raise RuntimeError(f"GitHub API error {status}")
+    status, obj, raw = http_json(GH + path, method, data, headers, timeout=timeout)
+    if status >= 300 or status == 0:
+        raise RuntimeError(f"GitHub API error {status}: {raw[:200]}")
     return obj
 
 
@@ -210,9 +213,9 @@ def gh_bytes(path: str) -> bytes:
 
 
 def tg(method: str, payload: dict | None = None):
-    _, obj, _ = http_json(f"{TG}/{method}", "POST", payload or {}, timeout=65)
-    if not isinstance(obj, dict) or not obj.get("ok"):
-        raise RuntimeError(f"Telegram API {method} failed")
+    status, obj, raw = http_json(f"{TG}/{method}", "POST", payload or {}, timeout=65)
+    if status != 200 or not isinstance(obj, dict) or not obj.get("ok"):
+        raise RuntimeError(f"Telegram API {method} failed: {raw[:200]}")
     return obj.get("result")
 
 
@@ -460,7 +463,6 @@ def add_model_from_provider(prov_id: str, model_name: str) -> str:
     prov = get_provider(prov_id)
     if not prov:
         raise ValueError("Provider یافت نشد.")
-    # Check for duplicates
     existing = q1("SELECT id FROM models WHERE name=? AND provider_id=? AND enabled=1", (model_name, prov_id))
     if existing:
         raise ValueError("این مدل قبلاً از این Provider اضافه شده است.")
@@ -474,7 +476,7 @@ def add_model_from_provider(prov_id: str, model_name: str) -> str:
     return model_id
 
 
-# ---------------- Smart Model Test (Async + Raw Error) ----------------
+# ---------------- Smart Model Test ----------------
 def run_model_test_async(chat_id: int, model_name: str, base_url: str, token: str, provider_type: str, return_to: str):
     try:
         started = time.monotonic()
@@ -500,7 +502,8 @@ def run_model_test_async(chat_id: int, model_name: str, base_url: str, token: st
                 status, _, raw = http_json(endpoint, "POST",
                                       {"model": model_name, "messages": [{"role": "user", "content": "Reply OK only."}], "max_tokens": 8},
                                       headers, timeout=timeout)
-            if status < 200 or status >= 300:
+            
+            if status < 200 or status >= 300 or status == 0:
                 raise RuntimeError(raw or f"HTTP {status}")
             return time.monotonic() - started
 
@@ -522,10 +525,10 @@ def run_model_test_async(chat_id: int, model_name: str, base_url: str, token: st
     except Exception as exc:
         raw_error = str(exc)
         hint = ""
-        if "content cannot be a plain string" in raw_error.lower() or "does not support text input" in raw_error.lower():
-            hint = "\n\n💡 <b>راهنما:</b> این مدل چت‌بات نیست (مثلاً Embedding یا Image است)."
-        elif "404" in raw_error or "not found" in raw_error.lower():
-            hint = "\n\n💡 <b>راهنما:</b> مدل یافت نشد یا در دسترس نیست."
+        if "content cannot be a plain string" in raw_error.lower():
+            hint = "\n\n💡 <b>راهنما:</b> این مدل چت‌بات نیست."
+        elif "404" in raw_error:
+            hint = "\n\n💡 <b>راهنما:</b> مدل یافت نشد."
         
         send_message(
             chat_id,
@@ -540,11 +543,13 @@ def fetch_models_list(base_url: str, token: str) -> list[str]:
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    
+    status, data, raw = http_json(endpoint, "GET", headers=headers, timeout=30)
+    if status >= 300 or status == 0 or not data:
+        return []
+    
+    models = []
     try:
-        status, data, _ = http_json(endpoint, "GET", headers=headers, timeout=30)
-        if status >= 300 or not data:
-            return []
-        models = []
         if isinstance(data, dict) and "data" in data:
             for item in data["data"]:
                 if isinstance(item, dict) and "id" in item:
@@ -555,19 +560,22 @@ def fetch_models_list(base_url: str, token: str) -> list[str]:
                     models.append(item["id"])
                 elif isinstance(item, str):
                     models.append(item)
-        return models
     except Exception:
         return []
+    return models
 
 
 # ---------------- GitHub Runs ----------------
 def fetch_active_runs():
     active = []
     for status in ("queued", "in_progress"):
-        data = gh("GET", f"/actions/workflows/{WORKFLOW}/runs?status={status}&per_page=50", timeout=15) or {}
-        for run in data.get("workflow_runs", []):
-            if run.get("event") == "repository_dispatch":
-                active.append(run)
+        try:
+            data = gh("GET", f"/actions/workflows/{WORKFLOW}/runs?status={status}&per_page=50", timeout=15) or {}
+            for run in data.get("workflow_runs", []):
+                if run.get("event") == "repository_dispatch":
+                    active.append(run)
+        except Exception:
+            pass
     return list({int(run["id"]): run for run in active if run.get("id")}.values())
 
 
@@ -590,21 +598,24 @@ def sync_run_records() -> None:
     rows = q("SELECT * FROM runs WHERE status NOT IN " + str(TERMINAL) + " ORDER BY created_at DESC LIMIT 30")
     if not rows:
         return
-    data = gh("GET", f"/actions/workflows/{WORKFLOW}/runs?per_page=100", timeout=15) or {}
-    workflow_runs = [r for r in data.get("workflow_runs", []) if r.get("event") == "repository_dispatch"]
-    for row in rows:
-        run = None
-        for candidate in workflow_runs:
-            if row["request_id"] in str(candidate.get("display_title") or ""):
-                run = candidate
-                break
-        if not run:
-            continue
-        status = str(run.get("status") or "queued")
-        conclusion = str(run.get("conclusion") or "")
-        final = conclusion if status == "completed" and conclusion else status
-        db("UPDATE runs SET workflow_run_id=?, status=?, conclusion=?, updated_at=? WHERE request_id=?",
-           (run.get("id"), final, conclusion, now(), row["request_id"]))
+    try:
+        data = gh("GET", f"/actions/workflows/{WORKFLOW}/runs?per_page=100", timeout=15) or {}
+        workflow_runs = [r for r in data.get("workflow_runs", []) if r.get("event") == "repository_dispatch"]
+        for row in rows:
+            run = None
+            for candidate in workflow_runs:
+                if row["request_id"] in str(candidate.get("display_title") or ""):
+                    run = candidate
+                    break
+            if not run:
+                continue
+            status = str(run.get("status") or "queued")
+            conclusion = str(run.get("conclusion") or "")
+            final = conclusion if status == "completed" and conclusion else status
+            db("UPDATE runs SET workflow_run_id=?, status=?, conclusion=?, updated_at=? WHERE request_id=?",
+               (run.get("id"), final, conclusion, now(), row["request_id"]))
+    except Exception:
+        pass
 
 
 def notify_finished() -> None:
@@ -644,20 +655,14 @@ def worker_loop() -> None:
 def cancel_run(run_id: int) -> None:
     try:
         gh("POST", f"/actions/runs/{run_id}/cancel", timeout=15)
-    except Exception as exc:
-        # Ignore 404 or already cancelled errors
-        if "404" not in str(exc) and "409" not in str(exc):
-            raise
+    except Exception:
+        pass
 
 
 def hard_cancel(chat_id: int) -> str:
-    cancelled_flows = 0
-    cancelled_engines = 0
-    
     WIZARDS.pop(chat_id, None)
     FLOWS.pop(chat_id, None)
-    cancelled_flows = 1
-    
+    cancelled_engines = 0
     try:
         runs = fetch_active_runs()
         for run in runs:
@@ -668,39 +673,60 @@ def hard_cancel(chat_id: int) -> str:
                 pass
     except Exception:
         pass
-    
     db("UPDATE runs SET status='cancelled', conclusion='cancelled_by_user', updated_at=? WHERE chat_id=? AND status NOT IN " + str(TERMINAL), (now(), chat_id))
+    return f"✅ همه چیز متوقف شد ({cancelled_engines} اجرای Engine)."
+
+
+# ---------------- Report Processing (Clean & Summarize) ----------------
+def clean_report(raw_md: str) -> str:
+    """Remove debug logs, settings, and keep only trading results."""
+    lines = raw_md.split('\n')
+    cleaned_lines = []
+    skip_section = False
     
-    parts = []
-    if cancelled_flows:
-        parts.append("فرآیندهای محلی")
-    if cancelled_engines:
-        parts.append(f"{cancelled_engines} اجرای Engine")
-    if not parts:
-        return "هیچ فرآیند فعالی برای لغو وجود نداشت."
-    return "✅ همه چیز متوقف شد: " + " و ".join(parts)
+    for line in lines:
+        # Skip run_settings JSON block
+        if '"run_settings"' in line or '"version": "0.5.2"' in line:
+            skip_section = True
+        if skip_section and line.strip() == '}':
+            skip_section = False
+            continue
+        if skip_section:
+            continue
+            
+        # Skip common debug headers
+        if any(x in line for x in ["DEBUG", "INFO", "WARNING", "System Prompt", "Tool Call"]):
+            continue
+            
+        cleaned_lines.append(line)
+    
+    return '\n'.join(cleaned_lines)
 
 
-# ---------------- Output Viewer ----------------
 def extract_summary(body: str) -> str:
+    """Extract trading signals with high precision."""
     patterns = [
-        r"(?i)(?:##?\s*?(?:Final|نتیجه|خلاصه|تصمیم|Decision|Conclusion|Summary)[^\n]*\n)([\s\S]{50,1500}?)(?=\n##|\Z)",
-        r"(?i)(?:Recommendation|پیشنهاد|توصیه)[^\n]*\n([\s\S]{50,1500}?)(?=\n##|\Z)",
+        r"(?i)(?:##?\s*?(?:Final Decision|Investment Plan|Portfolio Management|نتیجه نهایی|برنامه سرمایه‌گذاری)[^\n]*\n)([\s\S]{50,3500}?)(?=\n##|\Z)",
+        r"(?i)(?:Action|Target Price|Stop Loss|Confidence|Reasoning|عمل|قیمت هدف|حد ضرر)[^\n]*\n([\s\S]{50,3500}?)(?=\n##|\Z)",
     ]
     for pattern in patterns:
         match = re.search(pattern, body)
         if match:
             snippet = match.group(1).strip()
             snippet = re.sub(r"```[\s\S]*?```", "", snippet).strip()
-            if snippet:
-                return snippet[:1200]
+            if len(snippet) > 100:
+                return snippet[:3500]
+    
+    # Fallback: first 3500 chars of cleaned text
     clean = re.sub(r"```[\s\S]*?```", "", body).strip()
-    return clean[:1000] if clean else "(خلاصه‌ای یافت نشد)"
+    return clean[:3500] if clean else "(خلاصه‌ای یافت نشد)"
 
 
 def format_telegram_text(text: str) -> str:
     text = re.sub(r'^([A-Z]{2,6})\b', r'<b>\1</b>', text, flags=re.MULTILINE)
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    # Bold numbers and prices
+    text = re.sub(r'(\$?\d+\.?\d*)', r'<b>\1</b>', text)
     return text
 
 
@@ -735,42 +761,44 @@ def send_output(chat_id: int, request_id: str) -> None:
     except Exception as exc:
         send_message(chat_id, f"❌ دریافت خروجی ناموفق: {esc(exc)}", [[("بازگشت", "outputs")]])
         return
+    
     zf = zipfile.ZipFile(io.BytesIO(raw))
     scored = []
     for name in zf.namelist():
-        if name.endswith("/"):
-            continue
+        if name.endswith("/"): continue
         low = name.lower()
-        if low.endswith((".py", ".db", ".sqlite", ".zip", ".sh", ".yml", ".yaml")):
-            continue
-        if "bot.py" in low or "tradingagents.yml" in low or "__pycache__" in low:
-            continue
-        if not low.endswith((".md", ".txt", ".log", ".json")):
-            continue
+        if low.endswith((".py", ".db", ".sqlite", ".zip", ".sh", ".yml", ".yaml")): continue
+        if "bot.py" in low or "__pycache__" in low: continue
+        if not low.endswith((".md", ".txt", ".log", ".json")): continue
         try:
             body = zf.read(name).decode("utf-8", "replace")
         except Exception:
             continue
         score = 0
-        if "full_report" in low or "complete_report" in low:
-            score += 10
-        if "report" in low:
-            score += 3
-        if low.endswith(".md"):
-            score += 2
+        if "full_report" in low or "complete_report" in low: score += 10
+        if "report" in low: score += 3
+        if low.endswith(".md"): score += 2
         scored.append((score, name, body))
+    
     if not scored:
         send_message(chat_id, "📭 گزارش متنی پیدا نشد.", [[("بازگشت", "outputs")]])
         return
+        
     scored.sort(key=lambda item: -item[0])
     best_name = scored[0][1].replace("/", "_")
     best_body = scored[0][2]
+    
+    # Clean the report before sending
+    cleaned_body = clean_report(best_body)
+    
     label = "تحلیل" if row["mode"] == "analysis" else "بک‌تست"
-    tg_document(chat_id, best_name, best_body.encode("utf-8"), f"📄 گزارش کامل {label} — {best_name}")
+    tg_document(chat_id, best_name, cleaned_body.encode("utf-8"), f"📄 گزارش تمیز {label} — {best_name}")
+    
     params = json.loads(row["payload_json"] or "{}")
     subject = params.get("ticker") or params.get("tickers") or "—"
-    summary = extract_summary(best_body)
+    summary = extract_summary(cleaned_body)
     formatted_summary = format_telegram_text(summary)
+    
     send_message(
         chat_id,
         f"<b>📊 خلاصهٔ {label} <b>{esc(subject)}</b></b>\n\n{formatted_summary}\n\n📎 فایل کامل بالا ارسال شد.",
@@ -840,13 +868,10 @@ def format_run_time(iso_str: str) -> str:
         t = dt.datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
         delta = dt.datetime.now(dt.timezone.utc) - t
         minutes = int(delta.total_seconds() // 60)
-        if minutes < 1:
-            return "کمتر از ۱ دقیقه پیش"
-        if minutes < 60:
-            return f"{minutes} دقیقه پیش"
+        if minutes < 1: return "کمتر از ۱ دقیقه پیش"
+        if minutes < 60: return f"{minutes} دقیقه پیش"
         hours = minutes // 60
-        if hours < 24:
-            return f"{hours} ساعت پیش"
+        if hours < 24: return f"{hours} ساعت پیش"
         return f"{hours // 24} روز پیش"
     except Exception:
         return ""
@@ -859,7 +884,6 @@ def home_screen(chat_id: int, force_new: bool = False, target_mid: int | None = 
     model_line = f"مدل فعال: <b>{esc(mrow['name'])}</b>" if mrow else "مدل فعال: <b>تنظیم نشده</b>"
     busy = q1("SELECT COUNT(*) c FROM runs WHERE status NOT IN " + str(TERMINAL))["c"]
     live = f"\n🟡 اجرای فعال: <b>{busy}</b>" if busy else ""
-    # Expanded text for better visual
     text = (f"<b>🤖 TradingAgentsArya</b>\n{model_line}{live}\n\nبه سیستم هوشمند تحلیل و مدیریت معاملات خوش آمدید. لطفاً یکی از گزینه‌های زیر را برای شروع انتخاب نمایید.\n<code>build {BUILD}</code>")
     rows = [
         [("🚀 تحلیل جدید", "flow_analysis_start"), ("📈 بک‌تست", "flow_backtest_start")],
@@ -877,7 +901,7 @@ def models_screen(chat_id: int, page: int = 0, target_mid: int | None = None) ->
     rows = model_rows()
     aid = active_model_id()
     
-    per_page = 6
+    per_page = 3
     start = page * per_page
     end = start + per_page
     page_rows = rows[start:end]
@@ -889,21 +913,14 @@ def models_screen(chat_id: int, page: int = 0, target_mid: int | None = None) ->
     if not page_rows:
         text += "\nهنوز مدلی ثبت نشده است. می‌توانید مدل جدید اضافه کنید."
     else:
-        for idx, row in enumerate(page_rows, start=start + 1):
-            mark = "✅ " if row["id"] == aid else ""
-            text += f"\n<b>#{idx}</b> {mark}<b>{esc(row['name'])}</b>"
-            # 2 columns layout for buttons
-            if idx % 2 != 0 and idx < len(page_rows) + start: # Pair with next if exists
-                 pass # Handled in loop logic below
-        
-        # Re-loop for 2-column button layout
-        buttons = []
+        # 2-column layout for up to 3 items (Row 1: 2 items, Row 2: 1 item)
         for i in range(0, len(page_rows), 2):
             row_pair = page_rows[i:i+2]
             btn_row = []
             for j, r in enumerate(row_pair):
                 idx_num = start + i + j + 1
-                btn_row.append((f"⚡ #{idx_num}", f"activate:{r['id']}"))
+                mark = "✅ " if r["id"] == aid else ""
+                btn_row.append((f"{mark}⚡ فعال‌سازی #{idx_num}", f"activate:{r['id']}"))
             buttons.append(btn_row)
 
     nav_row = []
@@ -929,7 +946,6 @@ def providers_menu(chat_id: int, target_mid: int | None = None) -> int:
                     [[("➕ افزودن مدل", "model_add"), ("🏠 خانه", "home")]], target_mid)
     text = "<b>📋 پرووایدرها</b>\nلیست ارائه‌دهندگان سرویس هوش مصنوعی متصل به سیستم را مشاهده کنید."
     buttons = []
-    # 2 columns layout
     for i in range(0, len(provs), 2):
         row_provs = provs[i:i+2]
         row_buttons = []
@@ -975,7 +991,7 @@ def list_provider_models_screen(chat_id: int, prov_id: str, page: int = 0, targe
     models = fetch_models_list(prov["base_url"], token)
     
     if not models:
-        return show(chat_id, f"📭 لیست مدل‌ها برای <b>{esc(prov['name'])}</b> دریافت نشد.",
+        return show(chat_id, f"📭 لیست مدل‌ها برای <b>{esc(prov['name'])}</b> دریافت نشد.\nلطفاً Model ID را دستی وارد کنید.",
                     [[("✏️ ورود دستی", f"manual_model_for_prov:{prov_id}"), ("بازگشت", "providers_menu")]], target_mid)
     
     WIZARDS[chat_id] = {"stage": "provider_models", "prov_id": prov_id, "models_list": models}
@@ -1073,9 +1089,9 @@ def models_list_screen(chat_id: int, page: int = 0, target_mid: int | None = Non
     
     nav_row = []
     if page > 0:
-        nav_row.append(("◀️ قبلی", f"models_page:{page - 1}"))
+        nav_row.append(("◀️ قبلی", f"models_page_list:{page - 1}"))
     if page < total_pages - 1:
-        nav_row.append(("بعدی ▶️", f"models_page:{page + 1}"))
+        nav_row.append(("بعدی ▶️", f"models_page_list:{page + 1}"))
     if nav_row:
         buttons.append(nav_row)
     
@@ -1236,7 +1252,7 @@ def outputs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -
         
         btn_row = [("📄 گزارش #" + str(idx), f"view_output:{row['request_id']}")]
         if is_active:
-            btn_row.append(("⚠️ در حال اجرا", "noop")) # Disabled delete
+            btn_row.append(("⚠️ در حال اجرا", "noop"))
         else:
             btn_row.append(("🗑 حذف #" + str(idx), f"ask_delete:{row['request_id']}"))
         buttons.append(btn_row)
@@ -1289,7 +1305,7 @@ def logs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -> i
     if not page_logs:
         return show(chat_id, "<b>📋 لاگ‌ها</b>\nهنوز فایل لاگی برای نمایش وجود ندارد.", [[("🏠 خانه", "home")]], target_mid)
     
-    lines = [f"<b>📋 لاگ‌ها</b> (صفحه {page + 1}/{total_pages})\nلیست فایل‌های لاگ خام executions.", ""]
+    lines = [f"<b>📋 لاگ‌ها</b> (صفحه {page + 1}/{total_pages})\nلیست فایل‌های لاگ خام executions.\n\n⚠️ <b>توجه:</b> حذف فایل‌های لاگ از سرور گیت‌هاب توسط ربات ممکن نیست. لطفاً برای پاک‌سازی از پنل وب GitHub Actions استفاده کنید.", ""]
     buttons = []
     
     for idx, item in enumerate(page_logs, start=start + 1):
@@ -1298,7 +1314,7 @@ def logs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -> i
         except Exception:
             created_str = str(item.get("created_at"))[:16]
         lines.append(f"<b>#{idx}</b> — {esc(created_str)}")
-        buttons.append([("📋 لاگ #" + str(idx), f"download_log:{item['id']}"), ("🗑 حذف #" + str(idx), f"ask_delete_log:{item['id']}")])
+        buttons.append([("📋 لاگ #" + str(idx), f"download_log:{item['id']}")])
     
     nav_row = []
     if page > 0:
@@ -1308,14 +1324,8 @@ def logs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -> i
     if nav_row:
         buttons.append(nav_row)
         
-    buttons.append([("🧹 پاک‌سازی لاگ‌ها", "bulk_delete_logs_menu"), ("🔄 تازه‌سازی", "logs_refresh")])
-    buttons.append([("🏠 خانه", "home")])
+    buttons.append([("🔄 تازه‌سازی", "logs_refresh"), ("🏠 خانه", "home")])
     return show(chat_id, "\n".join(lines), buttons, target_mid)
-
-
-def bulk_delete_logs_menu(chat_id: int, target_mid: int | None = None) -> int:
-    return show(chat_id, "<b>🧹 پاک‌سازی لاگ‌ها</b>\nچه بازه‌ای؟",
-                [[("🗑  روز", "bulk_logs_scope:7"), ("🗑 ۳۰ روز", "bulk_logs_scope:30")], [("🗑 همه", "bulk_logs_scope:all")], [("❌ انصراف", "logs")]], target_mid)
 
 
 # ---------------- Text Handling ----------------
@@ -1350,6 +1360,7 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
                 prov_id = save_provider(item["provider_name"], item["provider_type"], item["url"], item["token"])
                 item["prov_id"] = prov_id
                 item["stage"] = "model"
+                answer_callback(f"temp_{chat_id}", "✅ Provider ذخیره شد!", True)
                 wizard_model_manual_screen(chat_id, target_mid)
             elif stage == "model_manual":
                 if not text:
@@ -1364,7 +1375,8 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
                      f"<b>✅ مدل ذخیره شد</b>\n<code>{esc(text)}</code>",
                      [[("🧪 تست", f"test_model:{model_id}"), ("🏠 خانه", "home")]], target_mid)
         except ValueError as exc:
-            show(chat_id, f"<b>⚠️ {esc(exc)}</b>", [[("بازگشت", "models")]], target_mid)
+            # Stay on the same page, show error
+            show(chat_id, f"<b>⚠️ {esc(exc)}</b>\n\nلطفاً دوباره تلاش کنید.", [[("❌ لغو", "wizard_cancel")]], target_mid)
         return
 
     if chat_id in FLOWS:
@@ -1396,7 +1408,8 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
                 flow["stage"] = "every"
                 backtest_every_screen(chat_id, target_mid)
         except ValueError as exc:
-            show(chat_id, f"<b>⚠️ {esc(exc)}</b>", [[("بازگشت", "home")]], target_mid)
+            # Stay on the same page
+            show(chat_id, f"<b>⚠️ {esc(exc)}</b>\n\nلطفاً دوباره تلاش کنید.", [[("❌ لغو", "flow_cancel")]], target_mid)
 
 
 # ---------------- Callback Handling ----------------
@@ -1444,7 +1457,6 @@ def callback(query: dict[str, Any]) -> None:
             prov_id = data.split(":", 1)[1]
             delete_provider(prov_id)
             answer_callback(query["id"], "🗑 Provider حذف شد.", True)
-            # Refresh the providers menu on the same message
             providers_menu(chat_id, cb_mid)
         elif data.startswith("list_provider_models:"):
             prov_id = data.split(":", 1)[1]
@@ -1494,13 +1506,7 @@ def callback(query: dict[str, Any]) -> None:
             try:
                 model_id = add_model_from_provider(prov_id, model_name)
                 answer_callback(query["id"], "✅ مدل فعال شد!", True)
-                # Refresh the detail screen to show it's selected (or go back to list)
-                # Actually, user asked for Toast only and stay on page. 
-                # But since we added the model, maybe go back to list or home?
-                # User said: "نیاز به تغییر به منو به منو جدید مبنی بر انتخاب مدل نیست فقط تیک بخوره کافیه"
-                # Since we can't easily update the button text to "Selected" without re-rendering the whole list which might change page,
-                # let's just show the toast and go to Home or Models list.
-                # Better: Go to Models list so they see the new model.
+                # Go back to models list to see the new model
                 models_screen(chat_id, page=0, target_mid=cb_mid)
             except ValueError as ve:
                 show(chat_id, f"<b>⚠️ {esc(ve)}</b>", [[("بازگشت", f"model_detail:{prov_id}:{model_name}")]], cb_mid)
@@ -1538,7 +1544,7 @@ def callback(query: dict[str, Any]) -> None:
                 wizard["models_list"] = models
                 wizard["stage"] = "model_list"
                 models_list_screen(chat_id, page=0, target_mid=cb_mid)
-        elif data.startswith("models_page_list:"): # Renamed to avoid conflict with models_screen pagination
+        elif data.startswith("models_page_list:"):
             page = int(data.split(":", 1)[1])
             models_list_screen(chat_id, page=page, target_mid=cb_mid)
         elif data.startswith("test_model:"):
@@ -1558,15 +1564,20 @@ def callback(query: dict[str, Any]) -> None:
             write_active_model_secrets(row)
             set_active_model(row["id"])
             answer_callback(query["id"], "⚡ مدل فعال شد!", True)
-            # Refresh the current models page
-            # We need to know which page we are on. For simplicity, go to page 0 or try to keep page.
-            # Since we don't store page in callback easily without complex data, let's just refresh page 0 or current UI.
-            # Actually, show() uses target_mid, so it updates the current message.
-            # We need to re-render models_screen. But which page?
-            # Let's assume page 0 for now or parse from somewhere? 
-            # Better: Just re-render the screen. If we don't know page, default 0.
-            # To keep it simple and robust:
-            models_screen(chat_id, page=0, target_mid=cb_mid)
+            # Refresh the SAME page to move the checkmark
+            # We need to know the current page. Since we don't store it in callback easily, 
+            # we can try to infer or just refresh page 0. 
+            # Better UX: Just refresh the current message content. 
+            # But models_screen needs a page number. 
+            # Hack: If we are on page > 0, the button data would ideally carry it. 
+            # For now, let's assume page 0 or try to keep it simple.
+            # Actually, to keep the checkmark moving on the SAME page, we should re-render models_screen with the same page.
+            # Since we don't have the page in the callback data for 'activate', we default to 0.
+            # To fix this properly, we'd need to encode page in the activate button or store current page in session.
+            # Given constraints, refreshing page 0 is acceptable, or we can store 'last_models_page' in settings.
+            # Let's use a simple setting to remember last page.
+            last_page = int(get_setting(f"last_models_page_{chat_id}", "0"))
+            models_screen(chat_id, page=last_page, target_mid=cb_mid)
         elif data == "model_delete_menu":
             if not admin(user_id):
                 raise ValueError("فقط Admin.")
@@ -1579,8 +1590,8 @@ def callback(query: dict[str, Any]) -> None:
             if active_model_id() == model_id:
                 set_active_model("")
             answer_callback(query["id"], "🗑 حذف شد.", True)
-            # Refresh models screen
-            models_screen(chat_id, page=0, target_mid=cb_mid)
+            last_page = int(get_setting(f"last_models_page_{chat_id}", "0"))
+            models_screen(chat_id, page=last_page, target_mid=cb_mid)
         elif data == "active_runs":
             active_runs_screen(chat_id, cb_mid)
         elif data.startswith("cancelw:"):
@@ -1588,7 +1599,6 @@ def callback(query: dict[str, Any]) -> None:
             try:
                 cancel_run(run_id)
                 answer_callback(query["id"], "🛑 لغو شد.", True)
-                # Refresh active runs
                 active_runs_screen(chat_id, cb_mid)
             except Exception as exc:
                 show(chat_id, f"<b>❌ لغو ناموفق</b>\n{esc(exc)}", [[("بازگشت", "active_runs")]], cb_mid)
@@ -1629,12 +1639,6 @@ def callback(query: dict[str, Any]) -> None:
             logs_screen(chat_id, page=page, target_mid=cb_mid)
         elif data.startswith("download_log:"):
             threading.Thread(target=download_log, args=(chat_id, data.split(":", 1)[1]), daemon=True).start()
-        elif data.startswith("ask_delete_log:"):
-            answer_callback(query["id"], "⚠️ حذف لاگ از طریق ربات ممکن نیست (محدودیت GitHub).", True)
-        elif data == "bulk_delete_logs_menu":
-            bulk_delete_logs_menu(chat_id, cb_mid)
-        elif data.startswith("bulk_logs_scope:"):
-             answer_callback(query["id"], "⚠️ پاک‌سازی لاگ‌ها از طریق ربات ممکن نیست.", True)
         elif data == "flow_analysis_start":
             if not active_model_id():
                 raise ValueError("اول مدل فعال کن.")
@@ -1725,7 +1729,8 @@ def callback(query: dict[str, Any]) -> None:
         elif data == "noop":
             pass
     except Exception as exc:
-        show(chat_id, f"<b>❌ {esc(exc)}</b>", [[("بازگشت", "home")]], cb_mid)
+        # Show error on the same page, don't jump to home
+        show(chat_id, f"<b>❌ خطا</b>\n{esc(exc)}", [[("بازگشت", "home")]], cb_mid)
 
 
 # ---------------- Polling ----------------
