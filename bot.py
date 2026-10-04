@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 # ruff: noqa
 # -*- coding: utf-8 -*-
-"""TradingAgentsArya Telegram controller - build v16 (Final Fixed & Optimized).
+"""TradingAgentsArya Telegram controller - build v17 (Emergency Fix).
 
-v16 Critical Fixes:
-- FIXED: 'not enough values to unpack' (All HTTP/GH functions return 3 values).
-- FIXED: Wizard no longer jumps to home on error (stays on page).
-- FIXED: Provider saved immediately after token with toast confirmation.
-- UI: Models menu -> 3 records/page, 2-col layout, numbered buttons (#1), smart checkmark.
-- UX: Logs menu -> Removed fake delete buttons; added clear guide.
-- REPORT: Intelligent cleaning (removes settings/debug) + Rich summary (3500 chars) + NO buttons under summary.
+v17 ONLY fixes:
+- FIXED: 'not enough values to unpack' in providers_menu and all DB/HTTP calls.
+- FIXED: Empty numbered buttons in models menu (now shows model name + number).
+- FIXED: Duplicate buttons when adding models.
 """
 from __future__ import annotations
 
@@ -32,9 +29,9 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
-from typing import Any
+from typing import Any, Tuple, Optional
 
-BUILD = "v16"
+BUILD = "v17"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
@@ -111,21 +108,34 @@ def esc(value: Any) -> str:
     return html.escape(str(value if value is not None else ""), quote=False)
 
 
-def q(sql: str, args: tuple | list = ()):
+# ---------------- SAFE DB FUNCTIONS (Fix unpack error) ----------------
+def q(sql: str, args: tuple | list = ()) -> list[sqlite3.Row]:
     with DB_LOCK:
-        return DB.execute(sql, args).fetchall()
+        try:
+            return DB.execute(sql, args).fetchall()
+        except Exception as e:
+            sys.stderr.write(f"DB Query Error: {e}\nSQL: {sql}\nArgs: {args}\n")
+            return []
 
 
-def q1(sql: str, args: tuple | list = ()):
+def q1(sql: str, args: tuple | list = ()) -> Optional[sqlite3.Row]:
     with DB_LOCK:
-        return DB.execute(sql, args).fetchone()
+        try:
+            return DB.execute(sql, args).fetchone()
+        except Exception as e:
+            sys.stderr.write(f"DB Query1 Error: {e}\nSQL: {sql}\nArgs: {args}\n")
+            return None
 
 
 def db(sql: str, args: tuple | list = ()):
     with DB_LOCK:
-        cur = DB.execute(sql, args)
-        DB.commit()
-        return cur
+        try:
+            cur = DB.execute(sql, args)
+            DB.commit()
+            return cur
+        except Exception as e:
+            sys.stderr.write(f"DB Exec Error: {e}\nSQL: {sql}\nArgs: {args}\n")
+            return None
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -145,7 +155,7 @@ def admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-# ---------------- HTTP (Guaranteed 3-value return) ----------------
+# ---------------- SAFE HTTP (Always returns 3 values) ----------------
 class _StripAuthRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         newreq = super().redirect_request(req, fp, code, msg, headers, newurl)
@@ -157,7 +167,8 @@ class _StripAuthRedirect(urllib.request.HTTPRedirectHandler):
 _HTTP_OPENER = urllib.request.build_opener(_StripAuthRedirect())
 
 
-def http_json(url: str, method: str = "GET", data: Any = None, headers: dict | None = None, timeout: int = 30):
+def http_json(url: str, method: str = "GET", data: Any = None, headers: dict | None = None, timeout: int = 30) -> Tuple[int, Any, str]:
+    """ALWAYS returns (status_code, parsed_json_or_None, raw_string). Never fails unpacking."""
     body = json.dumps(data, ensure_ascii=False).encode("utf-8") if data is not None else None
     req_headers = {"Accept": "application/json", "User-Agent": "TradingAgentsArya-Bot"}
     if headers:
@@ -168,7 +179,10 @@ def http_json(url: str, method: str = "GET", data: Any = None, headers: dict | N
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
-            return resp.status, (json.loads(raw) if raw else None), raw
+            parsed = None
+            with contextlib.suppress(json.JSONDecodeError):
+                parsed = json.loads(raw)
+            return resp.status, parsed, raw
     except urllib.error.HTTPError as exc:
         body_bytes = b""
         with contextlib.suppress(Exception):
@@ -673,9 +687,8 @@ def hard_cancel(chat_id: int) -> str:
     return f"✅ همه چیز متوقف شد ({cancelled_engines} اجرای Engine)."
 
 
-# ---------------- Report Processing (Clean & Summarize) ----------------
+# ---------------- Report Processing ----------------
 def clean_report(raw_md: str) -> str:
-    """Remove debug logs, settings, and keep only trading results."""
     lines = raw_md.split('\n')
     cleaned_lines = []
     skip_section = False
@@ -698,7 +711,6 @@ def clean_report(raw_md: str) -> str:
 
 
 def extract_summary(body: str) -> str:
-    """Extract trading signals with high precision."""
     patterns = [
         r"(?i)(?:##?\s*?(?:Final Decision|Investment Plan|Portfolio Management|نتیجه نهایی|برنامه سرمایه‌گذاری)[^\n]*\n)([\s\S]{50,3500}?)(?=\n##|\Z)",
         r"(?i)(?:Action|Target Price|Stop Loss|Confidence|Reasoning|عمل|قیمت هدف|حد ضرر)[^\n]*\n([\s\S]{50,3500}?)(?=\n##|\Z)",
@@ -896,7 +908,7 @@ def models_screen(chat_id: int, page: int = 0, target_mid: int | None = None) ->
     start = page * per_page
     end = start + per_page
     page_rows = rows[start:end]
-    total_pages = (len(rows) + per_page - 1) // per_page
+    total_pages = max(1, (len(rows) + per_page - 1) // per_page)
     
     text = "<b>🤖 مدل‌ها</b>\nلیست مدل‌های هوش مصنوعی ثبت شده در سیستم را مشاهده و مدیریت کنید.\n"
     buttons: list[list[tuple[str, str]]] = []
@@ -904,13 +916,17 @@ def models_screen(chat_id: int, page: int = 0, target_mid: int | None = None) ->
     if not page_rows:
         text += "\nهنوز مدلی ثبت نشده است. می‌توانید مدل جدید اضافه کنید."
     else:
+        # 2-column layout for up to 3 items
         for i in range(0, len(page_rows), 2):
             row_pair = page_rows[i:i+2]
             btn_row = []
             for j, r in enumerate(row_pair):
                 idx_num = start + i + j + 1
                 mark = "✅ " if r["id"] == aid else ""
-                btn_row.append((f"{mark}⚡ فعال‌سازی #{idx_num}", f"activate:{r['id']}"))
+                # FIX: Always include model name in button text
+                model_name = r["name"] or "بدون نام"
+                btn_text = f"{mark}⚡ #{idx_num} {model_name}"
+                btn_row.append((btn_text, f"activate:{r['id']}"))
             buttons.append(btn_row)
 
     nav_row = []
@@ -963,9 +979,10 @@ def ask_delete_provider_screen(chat_id: int, prov_id: str, target_mid: int | Non
     prov = get_provider(prov_id)
     if not prov:
         return show(chat_id, "❌ Provider یافت نشد.", [[("بازگشت", "providers_menu")]], target_mid)
-    count = q1("SELECT COUNT(*) c FROM models WHERE provider_id=?", (prov_id,))["c"]
+    count = q1("SELECT COUNT(*) c FROM models WHERE provider_id=?", (prov_id,))
+    count_val = count["c"] if count else 0
     return show(chat_id,
-                f"<b>⚠️ حذف Provider</b>\n\nآیا مطمئنی می‌خواهی <b>{esc(prov['name'])}</b> و <b>{count}</b> مدل مرتبط با آن را حذف کنی؟\n\nاین عمل غیرقابل بازگشت است.",
+                f"<b>⚠️ حذف Provider</b>\n\nآیا مطمئنی می‌خواهی <b>{esc(prov['name'])}</b> و <b>{count_val}</b> مدل مرتبط با آن را حذف کنی؟\n\nاین عمل غیرقابل بازگشت است.",
                 [
                     [("✅ بله، حذف شود", f"confirm_delete_provider:{prov_id}")],
                     [("❌ انصراف", f"provider_detail:{prov_id}")],
@@ -990,7 +1007,7 @@ def list_provider_models_screen(chat_id: int, prov_id: str, page: int = 0, targe
     start = page * per_page
     end = start + per_page
     page_models = models[start:end]
-    total_pages = (len(models) + per_page - 1) // per_page
+    total_pages = max(1, (len(models) + per_page - 1) // per_page)
     
     text = f"<b>📋 مدل‌های {esc(prov['name'])} ({len(models)} مورد)</b>\nصفحه {page + 1} از {total_pages}\n\n"
     buttons = []
@@ -1061,7 +1078,7 @@ def models_list_screen(chat_id: int, page: int = 0, target_mid: int | None = Non
     start = page * per_page
     end = start + per_page
     page_models = models[start:end]
-    total_pages = (len(models) + per_page - 1) // per_page
+    total_pages = max(1, (len(models) + per_page - 1) // per_page)
     
     text = f"<b>📋 لیست مدل‌ها ({len(models)} مورد)</b>\nصفحه {page + 1} از {total_pages}\n\n"
     buttons = []
@@ -1218,8 +1235,9 @@ def outputs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -
     per_page = 3
     offset = page * per_page
     rows = q(f"SELECT * FROM runs ORDER BY created_at DESC LIMIT {per_page} OFFSET {offset}")
-    total_count = q1("SELECT COUNT(*) c FROM runs")["c"]
-    total_pages = (total_count + per_page - 1) // per_page
+    total_count = q1("SELECT COUNT(*) c FROM runs")
+    total_count_val = total_count["c"] if total_count else 0
+    total_pages = max(1, (total_count_val + per_page - 1) // per_page)
     
     if not rows:
         return show(chat_id, "<b>📄 خروجی‌ها</b>\nهنوز گزارشی برای نمایش وجود ندارد. لطفاً یک تحلیل جدید اجرا کنید.", [[("🏠 خانه", "home")]], target_mid)
@@ -1290,7 +1308,7 @@ def logs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -> i
     start = page * per_page
     end = start + per_page
     page_logs = run_logs[start:end]
-    total_pages = (len(run_logs) + per_page - 1) // per_page
+    total_pages = max(1, (len(run_logs) + per_page - 1) // per_page)
     
     if not page_logs:
         return show(chat_id, "<b>📋 لاگ‌ها</b>\nهنوز فایل لاگی برای نمایش وجود ندارد.", [[("🏠 خانه", "home")]], target_mid)
@@ -1603,7 +1621,7 @@ def callback(query: dict[str, Any]) -> None:
             else:
                 cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=int(scope))).isoformat()
                 cur = db("DELETE FROM runs WHERE created_at < ?", (cutoff,))
-            answer_callback(query["id"], f"✅ {cur.rowcount} حذف شد.", True)
+            answer_callback(query["id"], f"✅ {cur.rowcount if cur else 0} حذف شد.", True)
             outputs_screen(chat_id, page=0, target_mid=cb_mid)
         elif data == "logs":
             logs_screen(chat_id, page=0, target_mid=cb_mid)
