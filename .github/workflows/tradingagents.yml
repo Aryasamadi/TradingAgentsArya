@@ -108,7 +108,6 @@ jobs:
           GITHUB_OWNER: ${{ github.repository_owner }}
           GITHUB_REPO: ${{ github.event.repository.name }}
           GITHUB_REF: ${{ github.event.repository.default_branch }}
-          PYTHONUNBUFFERED: "1"
         run: python bot.py
 
       - name: Save controller state
@@ -116,7 +115,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tradingagents-controller-state
-          path: .runtime/controller/bot_state.db*
+          path: .runtime/controller/bot_state.db
           retention-days: 90
           if-no-files-found: warn
 
@@ -146,7 +145,7 @@ jobs:
       - name: Prepare runtime
         run: |
           set -euo pipefail
-          mkdir -p .runtime/run .runtime/raw .runtime/presentation .runtime/results .runtime/cache .runtime/cache/memory
+          mkdir -p .runtime/run .runtime/results .runtime/cache .runtime/cache/memory
 
       - name: Restore TradingAgents state
         env:
@@ -163,7 +162,7 @@ jobs:
             rm -f .runtime/state.zip
           fi
 
-      - name: Read request and model snapshot
+      - name: Read request
         env:
           REQUEST_JSON: ${{ toJSON(github.event.client_payload) }}
           BOT_STATE_KEY: ${{ secrets.BOT_STATE_KEY }}
@@ -185,64 +184,48 @@ jobs:
           def clean(value):
               return str(value if value is not None else "").replace("\n", " ").replace("\r", " ")
 
-          def add_env(key, value):
+          def write_env(key, value):
               with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
                   f.write(f"{key}={clean(value)}\n")
 
-          add_env("REQUEST_ID", payload.get("request_id"))
-          add_env("REQUEST_MODE", mode)
-          add_env("REQUEST_CHAT_ID", payload.get("chat_id"))
-          add_env("REQUEST_USER_ID", payload.get("user_id"))
-          add_env("MODEL_ID", payload.get("model_id"))
-          add_env("TICKER", params.get("ticker"))
-          add_env("TICKERS", params.get("tickers"))
-          add_env("ANALYSIS_DATE", params.get("date"))
-          add_env("START_DATE", params.get("start"))
-          add_env("END_DATE", params.get("end"))
-          add_env("EVERY", params.get("every", "7"))
-          add_env("ANALYSTS", params.get("analysts"))
+          write_env("REQUEST_ID", payload.get("request_id"))
+          write_env("REQUEST_MODE", mode)
+          write_env("REQUEST_CHAT_ID", payload.get("chat_id"))
+          write_env("MODEL_ID", payload.get("model_id"))
+          write_env("TICKER", params.get("ticker"))
+          write_env("TICKERS", params.get("tickers"))
+          write_env("ANALYSIS_DATE", params.get("date"))
+          write_env("START_DATE", params.get("start"))
+          write_env("END_DATE", params.get("end"))
+          write_env("EVERY", params.get("every", "7"))
+          write_env("ANALYSTS", params.get("analysts"))
 
           config_enc = str(payload.get("config_enc") or "")
-
           if config_enc:
               state_key = os.environ.get("BOT_STATE_KEY", "").strip()
               if not state_key:
-                  raise SystemExit("BOT_STATE_KEY is required to decrypt request model snapshot.")
+                  print("Warning: config_enc received but BOT_STATE_KEY is not set. Falling back to global secrets.")
+              else:
+                  try:
+                      from nacl.secret import SecretBox
 
-              key = hashlib.sha256(state_key.encode("utf-8")).digest()
+                      key = hashlib.sha256(state_key.encode("utf-8")).digest()
+                      decrypted = SecretBox(key).decrypt(base64.b64decode(config_enc))
+                      cfg = json.loads(decrypted.decode("utf-8"))
 
-              try:
-                  from nacl.secret import SecretBox
-              except Exception as exc:
-                  raise SystemExit(f"PyNaCl is required for encrypted model snapshot: {exc}")
+                      token = str(cfg.get("api_token") or "")
+                      if token:
+                          print(f"::add-mask::{token}")
+                          env_key = str(cfg.get("provider_env_key") or "")
+                          if env_key:
+                              write_env(env_key, token)
 
-              decrypted = SecretBox(key).decrypt(base64.b64decode(config_enc))
-              cfg = json.loads(decrypted.decode("utf-8"))
-
-              token = str(cfg.get("api_token") or "")
-              if token:
-                  print(f"::add-mask::{token}")
-                  env_key = str(cfg.get("provider_env_key") or "")
-                  if env_key:
-                      add_env(env_key, token)
-
-              add_env("TRADINGAGENTS_LLM_PROVIDER", cfg.get("provider_type"))
-              add_env("TRADINGAGENTS_DEEP_THINK_LLM", cfg.get("model_name"))
-              add_env("TRADINGAGENTS_QUICK_THINK_LLM", cfg.get("model_name"))
-              add_env("TRADINGAGENTS_LLM_BACKEND_URL", cfg.get("base_url"))
-
-          os.makedirs(".runtime/run", exist_ok=True)
-          snapshot = {
-              "request_id": str(payload.get("request_id", "")),
-              "mode": mode,
-              "chat_id": str(payload.get("chat_id", "")),
-              "user_id": str(payload.get("user_id", "")),
-              "model_id": str(payload.get("model_id", "")),
-              "params": params,
-              "config_enc_present": bool(config_enc),
-          }
-          with open(".runtime/run/request.json", "w", encoding="utf-8") as f:
-              json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                      write_env("TRADINGAGENTS_LLM_PROVIDER", cfg.get("provider_type"))
+                      write_env("TRADINGAGENTS_DEEP_THINK_LLM", cfg.get("model_name"))
+                      write_env("TRADINGAGENTS_QUICK_THINK_LLM", cfg.get("model_name"))
+                      write_env("TRADINGAGENTS_LLM_BACKEND_URL", cfg.get("base_url"))
+                  except Exception as exc:
+                      raise SystemExit(f"Failed to decrypt request model config: {exc}")
           PY
 
       - name: Validate unattended configuration
@@ -273,6 +256,21 @@ jobs:
 
           printf '%q ' "${CMD[@]}" > .runtime/run/command.txt
 
+          cat > .runtime/run/request.json <<EOF
+          {
+            "request_id": "${REQUEST_ID}",
+            "mode": "${REQUEST_MODE}",
+            "chat_id": "${REQUEST_CHAT_ID}",
+            "ticker": "${TICKER}",
+            "tickers": "${TICKERS}",
+            "date": "${ANALYSIS_DATE}",
+            "start": "${START_DATE}",
+            "end": "${END_DATE}",
+            "every": "${EVERY}",
+            "analysts": "${ANALYSTS}"
+          }
+          EOF
+
           echo "Starting TradingAgents..."
           echo "Request ID: ${REQUEST_ID}"
           echo "Mode: ${REQUEST_MODE}"
@@ -280,101 +278,537 @@ jobs:
 
           "${CMD[@]}" 2>&1 | tee .runtime/run/agent.log
 
-      - name: Freeze RAW outputs
+      - name: Install report dependencies
         if: always()
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          sudo apt-get update || true
+          sudo apt-get install -y fonts-noto-core fonts-noto-extra fonts-liberation fonts-dejavu-core || true
+          python -m pip install --disable-pip-version-check markdown playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Build clean PDF report
+        if: always()
+        continue-on-error: true
         run: |
           set -uo pipefail
-          mkdir -p .runtime/raw .runtime/presentation
-
-          if [[ -d "$HOME/.tradingagents" ]]; then
-            mkdir -p .runtime/raw/tradingagents
-            cp -r "$HOME/.tradingagents/." .runtime/raw/tradingagents/ || true
-          fi
-
-          if [[ -f .runtime/run/agent.log ]]; then
-            cp -f .runtime/run/agent.log .runtime/raw/agent.log || true
-          fi
-
-          if [[ -f .runtime/run/request.json ]]; then
-            cp -f .runtime/run/request.json .runtime/raw/request.json || true
-          fi
-
-          if [[ -f .runtime/run/command.txt ]]; then
-            cp -f .runtime/run/command.txt .runtime/raw/command.txt || true
-          fi
+          mkdir -p .runtime/results
 
           python - <<'PY'
-          import hashlib
+          import datetime
+          import html
           import json
           import os
+          import pathlib
+          import re
 
-          manifest = {"files": []}
-          raw_root = ".runtime/raw"
+          try:
+              import markdown as md_lib
+          except Exception:
+              md_lib = None
 
-          for root, dirs, files in os.walk(raw_root):
-              for name in files:
-                  path = os.path.join(root, name)
-                  rel = os.path.relpath(path, raw_root).replace(os.sep, "/")
-                  h = hashlib.sha256()
+          home = os.path.expanduser("~/.tradingagents")
+          out = pathlib.Path(".runtime/results")
+          out.mkdir(parents=True, exist_ok=True)
+
+          fields = {
+              "rating": "",
+              "action": "",
+              "entry": "",
+              "exit": "",
+              "target": "",
+              "stop": "",
+              "confidence": "",
+              "horizon": "",
+              "summary": "",
+              "decision": "",
+          }
+
+          sections = []
+          all_texts = []
+
+          skip_file_parts = (
+              "log", "debug", "trace", "checkpoint", "state", "memory",
+              "cache", "request.json", "command.txt", "agent.log",
+          )
+
+          skip_json_keys = {
+              "run_settings", "tool_calls", "tool_call", "tool_response",
+              "system_prompt", "prompt", "debug", "trace", "stack",
+              "log", "checkpoint", "memory", "state", "metadata",
+          }
+
+          important_section_words = (
+              "decision", "summary", "thesis", "analysis", "report",
+              "plan", "portfolio", "risk", "debate", "market", "social",
+              "news", "fundamental", "technical", "sentiment", "order",
+              "trade", "final", "result",
+          )
+
+          def clean_text(text):
+              text = text or ""
+              text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+              text = re.sub(r"```[\s\S]*?```", "", text)
+              cleaned = []
+              for line in text.splitlines():
+                  s = line.strip()
+                  if not s:
+                      cleaned.append(line)
+                      continue
+                  if re.match(r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b", s):
+                      continue
+                  if re.match(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}", s) and re.search(r"\b(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b", s):
+                      continue
+                  if s.startswith(("Traceback (", "    at ", "  File \"")):
+                      continue
+                  cleaned.append(line)
+              return "\n".join(cleaned).strip()
+
+          def normalize_value(value):
+              value = str(value if value is not None else "")
+              value = value.replace("`", "")
+              value = re.sub(r"[*_]{1,3}", "", value)
+              value = re.sub(r"\s+", " ", value).strip()
+              return value[:300]
+
+          def normalize_summary(value):
+              value = str(value if value is not None else "")
+              value = value.replace("`", "")
+              value = re.sub(r"[*_]{1,3}", "", value)
+              value = re.sub(r"[ \t]+", " ", value)
+              value = re.sub(r"\n{3,}", "\n\n", value)
+              return value.strip()[:2500]
+
+          def set_field(key, value):
+              value = normalize_value(value)
+              if value and not fields.get(key):
+                  fields[key] = value
+
+          def find_value(text, patterns):
+              if not text:
+                  return ""
+              for pattern in patterns:
                   try:
-                      with open(path, "rb") as f:
-                          while True:
-                              chunk = f.read(1024 * 1024)
-                              if not chunk:
-                                  break
-                              h.update(chunk)
-                      manifest["files"].append({
-                          "path": rel,
-                          "sha256": h.hexdigest(),
-                          "size": os.path.getsize(path),
-                      })
+                      match = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
+                      if match:
+                          return match.group(1)
+                  except Exception:
+                      pass
+              return ""
+
+          def extract_fields(text):
+              if not text:
+                  return
+
+              set_field("rating", find_value(text, [
+                  r"(?:final\s*rating|rating|نتیجه نهایی|نتیجه|پیشنهاد|توصیه|تصمیم)\s*[:：]?\s*([^\n]{1,220})",
+              ]))
+
+              set_field("action", find_value(text, [
+                  r"(?:action|recommendation|اقدام|سفارش|عملیات|پیشنهاد معامله)\s*[:：]?\s*([^\n]{1,220})",
+              ]))
+
+              set_field("entry", find_value(text, [
+                  r"(?:entry\s*point|entry\s*price|buy\s*price|entry|نقطه ورود|قیمت ورود|ورود)\s*[:：]?\s*([^\n]{1,220})",
+              ]))
+
+              set_field("exit", find_value(text, [
+                  r"(?:exit\s*point|exit\s*price|sell\s*price|exit|نقطه خروج|قیمت خروج|خروج)\s*[:：]?\s*([^\n]{1,220})",
+              ]))
+
+              set_field("target", find_value(text, [
+                  r"(?:price\s*target|target\s*price|target|قیمت هدف|هدف قیمتی|هدف)\s*[:：]?\s*([^\n]{1,220})",
+              ]))
+
+              set_field("stop", find_value(text, [
+                  r"(?:stop\s*loss|stop|حد ضرر|استاپ ضرر|استاپ)\s*[:：]?\s*([^\n]{1,220})",
+              ]))
+
+              set_field("confidence", find_value(text, [
+                  r"(?:confidence|level of confidence|سطح اطمینان|اطمینان)\s*[:：]?\s*([^\n]{1,220})",
+              ]))
+
+              set_field("horizon", find_value(text, [
+                  r"(?:time\s*horizon|horizon|افق زمانی|افق)\s*[:：]?\s*([^\n]{1,220})",
+              ]))
+
+          def add_section(title, body, source=""):
+              body = clean_text(body)
+              if not body or len(body) < 5:
+                  return
+              sections.append({"title": str(title), "body": body, "source": str(source)})
+              all_texts.append(body)
+
+          def walk_json(obj):
+              if isinstance(obj, dict):
+                  for key, value in obj.items():
+                      low_key = str(key).lower()
+                      if low_key in skip_json_keys:
+                          continue
+
+                      if isinstance(value, str):
+                          text = value.strip()
+                          if not text:
+                              continue
+
+                          if low_key in {"final_trade_decision", "final_decision", "decision", "trade_decision"}:
+                              if len(text) > 20 and not fields["decision"]:
+                                  fields["decision"] = text
+                              add_section("تصمیم نهایی", text, "json")
+                              extract_fields(text)
+                          elif low_key in {"executive_summary", "summary"}:
+                              if not fields["summary"]:
+                                  fields["summary"] = text
+                              add_section("خلاصه", text, "json")
+                              extract_fields(text)
+                          elif low_key in {"final_rating", "rating"}:
+                              set_field("rating", text)
+                          elif low_key in {"action", "recommendation"}:
+                              set_field("action", text)
+                          elif low_key in {"entry", "entry_price", "buy_price"}:
+                              set_field("entry", text)
+                          elif low_key in {"exit", "exit_price", "sell_price"}:
+                              set_field("exit", text)
+                          elif low_key in {"target", "target_price", "price_target"}:
+                              set_field("target", text)
+                          elif low_key in {"stop", "stop_loss"}:
+                              set_field("stop", text)
+                          elif low_key in {"confidence", "time_horizon", "horizon"}:
+                              set_field("confidence" if "confidence" in low_key else "horizon", text)
+                          elif any(word in low_key for word in important_section_words):
+                              if len(text) > 30:
+                                  add_section(str(key), text, "json")
+                              extract_fields(text)
+                          else:
+                              extract_fields(text)
+
+                      elif isinstance(value, (dict, list)):
+                          walk_json(value)
+              elif isinstance(obj, list):
+                  for item in obj:
+                      if isinstance(item, (dict, list)):
+                          walk_json(item)
+
+          text_files = []
+          json_files = []
+
+          if os.path.isdir(home):
+              for root, dirs, files in os.walk(home):
+                  dirs.sort()
+                  files.sort()
+                  for name in files:
+                      path = os.path.join(root, name)
+                      low = name.lower()
+
+                      if any(part in low for part in skip_file_parts):
+                          continue
+
+                      if low.endswith((".md", ".txt")):
+                          text_files.append(path)
+                      elif low.endswith(".json"):
+                          json_files.append(path)
+
+          for path in text_files:
+              try:
+                  with open(path, "r", encoding="utf-8", errors="replace") as f:
+                      body = f.read()
+                  body = clean_text(body)
+                  if body:
+                      extract_fields(body)
+                      add_section(os.path.basename(path), body, "file")
+              except Exception:
+                  pass
+
+          for path in json_files[:50]:
+              try:
+                  with open(path, "r", encoding="utf-8", errors="replace") as f:
+                      data = json.load(f)
+                  walk_json(data)
+              except Exception:
+                  pass
+
+          if not fields["summary"]:
+              executive_pattern = re.compile(
+                  r"(?is)(?:executive\s*summary|خلاصه اجرایی|خلاصه)\s*[:：]?\s*(.{20,2200}?)(?=\n\s*(?:investment\s*thesis|reasoning|price\s*target|time\s*horizon|stop|target|##|\Z))"
+              )
+              candidates = []
+              if fields["decision"]:
+                  candidates.append(fields["decision"])
+              candidates.extend(all_texts)
+
+              for candidate in candidates:
+                  match = executive_pattern.search(candidate or "")
+                  if match:
+                      fields["summary"] = match.group(1)
+                      break
+
+          if not fields["summary"] and fields["decision"]:
+              fields["summary"] = fields["decision"][:1800]
+          elif not fields["summary"] and all_texts:
+              fields["summary"] = all_texts[0][:1200]
+
+          fields["summary"] = normalize_summary(fields["summary"])
+          for key in ("rating", "action", "entry", "exit", "target", "stop", "confidence", "horizon"):
+              fields[key] = normalize_value(fields[key]) or "—"
+
+          def md_to_html(text):
+              text = text or ""
+              text = re.sub(r"```[\s\S]*?```", "", text)
+              text = text.replace("`", "")
+              text = re.sub(r"<[^>]+>", "", text)
+
+              if md_lib:
+                  try:
+                      return md_lib.markdown(text, extensions=["tables", "nl2br"])
                   except Exception:
                       pass
 
-          with open(os.path.join(raw_root, "manifest.json"), "w", encoding="utf-8") as f:
-              json.dump(manifest, f, ensure_ascii=False, indent=2)
+              escaped = html.escape(text)
+              escaped = escaped.replace("\n", "<br>")
+              return f"<p>{escaped}</p>"
+
+          key_rows = [
+              ("نتیجه نهایی", fields["rating"]),
+              ("اقدام / سفارش", fields["action"]),
+              ("نقطه ورود", fields["entry"]),
+              ("نقطه خروج", fields["exit"]),
+              ("هدف قیمتی", fields["target"]),
+              ("حد ضرر", fields["stop"]),
+              ("سطح اطمینان", fields["confidence"]),
+              ("افق زمانی", fields["horizon"]),
+          ]
+
+          key_html = ""
+          for label, value in key_rows:
+              key_html += f"""
+              <tr>
+                <th>{html.escape(label)}</th>
+                <td class="value">{html.escape(value)}</td>
+              </tr>
+              """
+
+          sections_html = ""
+          if fields["summary"]:
+              sections_html += f"""
+              <div class="section">
+                <h2>📌 خلاصه</h2>
+                {md_to_html(fields["summary"])}
+              </div>
+              """
+
+          if fields["decision"]:
+              sections_html += f"""
+              <div class="section">
+                <h2>🧠 تصمیم نهایی</h2>
+                {md_to_html(fields["decision"])}
+              </div>
+              """
+
+          seen_titles = set()
+          for section in sections:
+              title = str(section.get("title", "")).strip()
+              if not title or title.lower() in seen_titles:
+                  continue
+              seen_titles.add(title.lower())
+              sections_html += f"""
+              <div class="section">
+                <h2>{html.escape(title)}</h2>
+                {md_to_html(section.get("body", ""))}
+              </div>
+              """
+
+          ticker = os.environ.get("TICKER") or os.environ.get("TICKERS") or "—"
+          mode = os.environ.get("REQUEST_MODE", "")
+          date_text = os.environ.get("ANALYSIS_DATE") or f'{os.environ.get("START_DATE", "")} → {os.environ.get("END_DATE", "")}'.strip(" →") or "—"
+          generated = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+          html_doc = f"""
+          <!doctype html>
+          <html dir="rtl" lang="fa">
+          <head>
+            <meta charset="utf-8">
+            <title>TradingAgents Report</title>
+            <style>
+              @page {{
+                size: A4;
+                margin: 12mm 10mm;
+              }}
+              body {{
+                font-family: "Noto Sans Arabic", "Noto Sans", "Segoe UI", Tahoma, Arial, sans-serif;
+                direction: rtl;
+                color: #141414;
+                background: #ffffff;
+                font-size: 12px;
+                line-height: 1.95;
+                margin: 0;
+              }}
+              .container {{
+                max-width: 820px;
+                margin: 0 auto;
+              }}
+              .header {{
+                background: linear-gradient(135deg, #111827, #1f2937);
+                color: #ffffff;
+                padding: 18px;
+                border-radius: 16px;
+                margin-bottom: 16px;
+              }}
+              .header h1 {{
+                margin: 0 0 8px 0;
+                font-size: 21px;
+              }}
+              .meta {{
+                color: #d1d5db;
+                font-size: 11px;
+                line-height: 1.8;
+              }}
+              .badge {{
+                display: inline-block;
+                background: rgba(255,255,255,0.14);
+                border: 1px solid rgba(255,255,255,0.18);
+                color: #ffffff;
+                padding: 4px 10px;
+                border-radius: 999px;
+                margin-left: 6px;
+                margin-top: 6px;
+                font-size: 11px;
+              }}
+              table.keys {{
+                width: 100%;
+                border-collapse: collapse;
+                margin: 14px 0 18px 0;
+                page-break-inside: avoid;
+              }}
+              table.keys th,
+              table.keys td {{
+                border: 1px solid #d1d5db;
+                padding: 8px 10px;
+                text-align: right;
+                vertical-align: top;
+              }}
+              table.keys th {{
+                width: 170px;
+                background: #f9fafb;
+                color: #374151;
+                font-weight: bold;
+              }}
+              table.keys td.value {{
+                font-weight: bold;
+                color: #111827;
+              }}
+              .section {{
+                margin-top: 18px;
+                page-break-inside: auto;
+              }}
+              .section h2 {{
+                font-size: 15px;
+                color: #111827;
+                border-right: 5px solid #2563eb;
+                padding-right: 8px;
+                margin: 0 0 8px 0;
+              }}
+              p {{
+                margin: 6px 0;
+                text-align: justify;
+              }}
+              table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin: 10px 0;
+                font-size: 11px;
+              }}
+              th, td {{
+                border: 1px solid #d1d5db;
+                padding: 6px;
+                text-align: right;
+                vertical-align: top;
+              }}
+              th {{
+                background: #f3f4f6;
+              }}
+              code, pre {{
+                display: none !important;
+              }}
+              hr {{
+                border: none;
+                border-top: 1px solid #e5e7eb;
+                margin: 14px 0;
+              }}
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <div class="header">
+                <h1>📊 گزارش TradingAgents</h1>
+                <div class="meta">
+                  <div>نماد / نمادها: <b>{html.escape(ticker)}</b></div>
+                  <div>حالت اجرا: <b>{html.escape(mode)}</b></div>
+                  <div>تاریخ / بازه: <b>{html.escape(date_text)}</b></div>
+                  <div>زمان تولید گزارش: <b>{html.escape(generated)}</b></div>
+                </div>
+                <div>
+                  <span class="badge">نتیجه: {html.escape(fields["rating"])}</span>
+                  <span class="badge">اقدام: {html.escape(fields["action"])}</span>
+                </div>
+              </div>
+
+              <table class="keys">
+                {key_html}
+              </table>
+
+              {sections_html}
+            </div>
+          </body>
+          </html>
+          """
+
+          html_path = out / "report.html"
+          html_path.write_text(html_doc, encoding="utf-8")
+
+          pdf_ok = False
+          try:
+              from playwright.sync_api import sync_playwright
+
+              pdf_path = out / "report.pdf"
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
+                  page = browser.new_page()
+                  page.goto(html_path.absolute().as_uri(), wait_until="domcontentloaded")
+                  page.emulate_media(media="print")
+                  page.pdf(
+                      path=str(pdf_path),
+                      format="A4",
+                      print_background=True,
+                      margin={"top": "12mm", "bottom": "12mm", "left": "10mm", "right": "10mm"},
+                  )
+                  browser.close()
+              pdf_ok = pdf_path.exists()
+          except Exception as exc:
+              (out / "pdf_error.txt").write_text(str(exc), encoding="utf-8")
+
+          report = {
+              "ticker": ticker,
+              "mode": mode,
+              "date": date_text,
+              "generated": generated,
+              "rating": fields["rating"],
+              "action": fields["action"],
+              "entry": fields["entry"],
+              "exit": fields["exit"],
+              "target": fields["target"],
+              "stop": fields["stop"],
+              "confidence": fields["confidence"],
+              "horizon": fields["horizon"],
+              "summary": fields["summary"],
+              "decision": fields["decision"][:3000],
+              "has_pdf": pdf_ok,
+          }
+
+          (out / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(f"Report generated. PDF exists: {pdf_ok}")
           PY
-
-      - name: Build presentation layer
-        if: always()
-        run: |
-          set -uo pipefail
-          OUTDIR=".runtime/presentation"
-          MERGED="$OUTDIR/full_report.md"
-          mkdir -p "$OUTDIR"
-          : > "$MERGED"
-
-          echo "# 📊 گزارش TradingAgents" >> "$MERGED"
-          echo "" >> "$MERGED"
-          echo "Request ID: \`${REQUEST_ID}\`" >> "$MERGED"
-          echo "Mode: \`${REQUEST_MODE}\`" >> "$MERGED"
-          echo "Language: \`${TRADINGAGENTS_OUTPUT_LANGUAGE}\`" >> "$MERGED"
-          echo "Ticker: \`${TICKER:-${TICKERS:-—}}\`" >> "$MERGED"
-          echo "Date/Range: \`${ANALYSIS_DATE:-${START_DATE:-—} → ${END_DATE:-—}}\`" >> "$MERGED"
-          echo "Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$MERGED"
-          echo "" >> "$MERGED"
-          echo "---" >> "$MERGED"
-
-          if [[ -d .runtime/raw/tradingagents ]]; then
-            find .runtime/raw/tradingagents -type f \( -name '*.md' -o -name '*.txt' -o -name '*.json' \) -print0 2>/dev/null | sort -z | while IFS= read -r -d '' f; do
-              base=$(basename "$f")
-              echo "" >> "$MERGED"
-              echo "---" >> "$MERGED"
-              echo "" >> "$MERGED"
-              echo "## 📎 $base" >> "$MERGED"
-              echo "" >> "$MERGED"
-              cat "$f" >> "$MERGED" || true
-              echo "" >> "$MERGED"
-            done
-          fi
-
-          if [[ -f .runtime/raw/agent.log ]]; then
-            cp -f .runtime/raw/agent.log "$OUTDIR/agent.log" || true
-          fi
-
-          echo "=== Presentation files ==="
-          ls -la "$OUTDIR" || true
-          wc -c "$MERGED" || true
 
       - name: Save TradingAgents state
         if: always()
@@ -385,38 +819,11 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
-      - name: Upload run logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tradingagents-run-${{ github.run_id }}
-          path: .runtime/run/
-          retention-days: 90
-          if-no-files-found: warn
-
-      - name: Upload RAW artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tradingagents-raw-${{ github.run_id }}
-          path: .runtime/raw/
-          retention-days: 90
-          if-no-files-found: warn
-
-      - name: Upload presentation artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tradingagents-presentation-${{ github.run_id }}
-          path: .runtime/presentation/
-          retention-days: 90
-          if-no-files-found: warn
-
-      - name: Upload compatibility results artifact
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tradingagents-results-${{ github.run_id }}
-          path: .runtime/presentation/
+          path: .runtime/results/
           retention-days: 90
           if-no-files-found: warn
