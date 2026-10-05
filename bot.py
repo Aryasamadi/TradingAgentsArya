@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ruff: noqa
 # -*- coding: utf-8 -*-
-"""TradingAgentsArya Telegram controller - clean report build."""
+"""TradingAgentsArya Telegram controller - PDF report build."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ import uuid
 import zipfile
 from typing import Any, Tuple, Optional
 
-BUILD = "v18-clean"
+BUILD = "v19-pdf"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
@@ -865,6 +865,38 @@ def hard_cancel(chat_id: int) -> str:
     return f"✅ همه چیز متوقف شد ({cancelled_engines} اجرای Engine)."
 
 
+def make_summary_text(row: sqlite3.Row, info: dict[str, Any]) -> str:
+    params = json.loads(row["payload_json"] or "{}")
+    subject = params.get("ticker") or params.get("tickers") or "—"
+    label = "تحلیل" if row["mode"] == "analysis" else "بک‌تست"
+
+    lines = [f"<b>📊 گزارش {label} <code>{esc(subject)}</code></b>"]
+
+    if info.get("rating"):
+        lines.append(f"🧭 نتیجه نهایی: <b>{esc(info.get('rating'))}</b>")
+    if info.get("action"):
+        lines.append(f"🧾 اقدام / سفارش: <b>{esc(info.get('action'))}</b>")
+    if info.get("entry"):
+        lines.append(f"📥 نقطه ورود: <code>{esc(info.get('entry'))}</code>")
+    if info.get("exit"):
+        lines.append(f"📤 نقطه خروج: <code>{esc(info.get('exit'))}</code>")
+    if info.get("target"):
+        lines.append(f"🎯 هدف قیمتی: <code>{esc(info.get('target'))}</code>")
+    if info.get("stop"):
+        lines.append(f"🛑 حد ضرر: <code>{esc(info.get('stop'))}</code>")
+    if info.get("confidence"):
+        lines.append(f"📈 سطح اطمینان: <b>{esc(info.get('confidence'))}</b>")
+    if info.get("horizon"):
+        lines.append(f"⏳ افق زمانی: <b>{esc(info.get('horizon'))}</b>")
+
+    summary = str(info.get("summary") or "").strip()
+    if summary:
+        lines.append("")
+        lines.append(esc(summary[:1800]))
+
+    return "\n".join(lines)[:4096]
+
+
 def send_output(chat_id: int, request_id: str) -> None:
     row = q1("SELECT * FROM runs WHERE request_id=?", (request_id,))
     if not row:
@@ -904,50 +936,46 @@ def send_output(chat_id: int, request_id: str) -> None:
         return
 
     zf = zipfile.ZipFile(io.BytesIO(raw))
+    names = zf.namelist()
 
-    report_name = None
-    for name in zf.namelist():
-        if name.endswith("/"):
-            continue
-        if os.path.basename(name).lower() == "report.md":
-            report_name = name
+    info = {}
+    try:
+        json_name = None
+        for name in names:
+            if os.path.basename(name).lower() == "report.json":
+                json_name = name
+                break
+        if json_name:
+            info = json.loads(zf.read(json_name).decode("utf-8", "replace"))
+    except Exception:
+        info = {}
+
+    try:
+        send_message(chat_id, make_summary_text(row, info), [[("🏠 خانه", "home")]])
+    except Exception:
+        send_message(chat_id, "📊 گزارش آماده شد.", [[("🏠 خانه", "home")]])
+
+    pdf_name = None
+    for name in names:
+        if os.path.basename(name).lower() == "report.pdf":
+            pdf_name = name
             break
 
-    if not report_name:
-        scored = []
-        for name in zf.namelist():
-            if name.endswith("/"):
-                continue
-            low = name.lower()
-            if not low.endswith(".md"):
-                continue
-            if any(x in low for x in ("log", "debug", "trace", "checkpoint")):
-                continue
-
-            score = 0
-            if "report" in low:
-                score += 5
-            scored.append((score, name))
-
-        if scored:
-            scored.sort(key=lambda item: -item[0])
-            report_name = scored[0][1]
-
-    if not report_name:
-        send_message(chat_id, "📭 گزارش متنی پیدا نشد.", [[("بازگشت", "outputs")]])
+    if not pdf_name:
+        send_message(chat_id, "⚠️ فایل PDF پیدا نشد.", [[("بازگشت", "outputs")]])
         return
 
-    body = zf.read(report_name)
+    pdf_bytes = zf.read(pdf_name)
     label = "تحلیل" if row["mode"] == "analysis" else "بک‌تست"
     params = json.loads(row["payload_json"] or "{}")
     subject = params.get("ticker") or params.get("tickers") or "—"
 
-    caption = f"📄 گزارش {label} {subject}"[:1024]
+    caption = f"📄 گزارش PDF {label} {subject}"[:1024]
 
     try:
-        tg_document(chat_id, "TradingAgents_Report.md", body, caption)
+        tg_document(chat_id, "TradingAgents_Report.pdf", pdf_bytes, caption)
     except Exception as exc:
-        send_message(chat_id, f"❌ ارسال گزارش ناموفق: {esc(exc)}", [[("بازگشت", "outputs")]])
+        send_message(chat_id, f"❌ ارسال PDF ناموفق: {esc(exc)}", [[("بازگشت", "outputs")]])
 
 
 def valid_date(value: str) -> str:
@@ -1234,7 +1262,7 @@ def wizard_url_screen(chat_id: int, target_mid: int | None = None) -> int:
 def wizard_token_screen(chat_id: int, target_mid: int | None = None) -> int:
     return show(
         chat_id,
-        "<b>➕ افزودن مدل (2 از 3)</b>\nAPI Token را بفرست.\n<b>مثال:</b> <code>nvapi-...</code>",
+        "<b>➕ افزودن مدل (2 از 3)</b>\nAPI Token را بفرست.\nاگر سرویس توکن نمی‌خواهد، کلمه <code>-</code> را بفرست.",
         [[("❌ لغو", "wizard_cancel")]],
         target_mid,
     )
@@ -1581,10 +1609,13 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
                 wizard_token_screen(chat_id, target_mid)
 
             elif stage == "token":
-                if len(text) < 3:
+                if item.get("provider_type") == "ollama" and text.strip().lower() in ("-", "none", "no", "empty"):
+                    item["token"] = ""
+                elif len(text) < 3:
                     raise ValueError("Token کوتاه است.")
+                else:
+                    item["token"] = text
 
-                item["token"] = text
                 prov_id = save_provider(item["provider_name"], item["provider_type"], item["url"], item["token"])
                 item["prov_id"] = prov_id
                 item["stage"] = "model"
