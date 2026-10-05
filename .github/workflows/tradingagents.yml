@@ -1,8 +1,9 @@
 name: TradingAgents Engine + Telegram Controller
+
 run-name: >-
   ${{ github.event_name == 'repository_dispatch'
-  && format('Engine · {0}', github.event.client_payload.request_id)
-  || 'Telegram Controller' }}
+      && format('Engine · {0}', github.event.client_payload.request_id)
+      || 'Telegram Controller' }}
 
 on:
   workflow_dispatch:
@@ -26,10 +27,12 @@ env:
   TRADINGAGENTS_GOOGLE_THINKING_LEVEL: ${{ secrets.TRADINGAGENTS_GOOGLE_THINKING_LEVEL || 'medium' }}
   TRADINGAGENTS_OPENAI_REASONING_EFFORT: ${{ secrets.TRADINGAGENTS_OPENAI_REASONING_EFFORT || 'medium' }}
   TRADINGAGENTS_ANTHROPIC_EFFORT: ${{ secrets.TRADINGAGENTS_ANTHROPIC_EFFORT || 'high' }}
+
   TRADINGAGENTS_LLM_PROVIDER: ${{ secrets.TRADINGAGENTS_LLM_PROVIDER }}
   TRADINGAGENTS_DEEP_THINK_LLM: ${{ secrets.TRADINGAGENTS_DEEP_THINK_LLM }}
   TRADINGAGENTS_QUICK_THINK_LLM: ${{ secrets.TRADINGAGENTS_QUICK_THINK_LLM }}
   TRADINGAGENTS_LLM_BACKEND_URL: ${{ secrets.TRADINGAGENTS_LLM_BACKEND_URL }}
+
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
   AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
   GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
@@ -48,12 +51,14 @@ env:
   GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
   NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
   OPENAI_COMPATIBLE_API_KEY: ${{ secrets.OPENAI_COMPATIBLE_API_KEY }}
+
   AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_PROFILE: ${{ secrets.AWS_PROFILE }}
+
   OLLAMA_BASE_URL: ${{ secrets.OLLAMA_BASE_URL }}
   TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
   TYPESAFE_DEFAULT_MODEL: ${{ secrets.TYPESAFE_DEFAULT_MODEL }}
@@ -79,8 +84,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .runtime/controller
+
           artifact_id="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
             --jq '[.artifacts[] | select(.name=="tradingagents-controller-state" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
+
           if [[ -n "${artifact_id:-}" ]]; then
             gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > .runtime/controller/state.zip
             unzip -o .runtime/controller/state.zip -d .runtime/controller >/dev/null
@@ -101,6 +108,7 @@ jobs:
           GITHUB_OWNER: ${{ github.repository_owner }}
           GITHUB_REPO: ${{ github.event.repository.name }}
           GITHUB_REF: ${{ github.event.repository.default_branch }}
+          PYTHONUNBUFFERED: "1"
         run: python bot.py
 
       - name: Save controller state
@@ -108,7 +116,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tradingagents-controller-state
-          path: .runtime/controller/bot_state.db
+          path: .runtime/controller/bot_state.db*
           retention-days: 90
           if-no-files-found: warn
 
@@ -132,52 +140,109 @@ jobs:
       - name: Install TradingAgents
         run: python -m pip install -e .
 
+      - name: Install request crypto dependency
+        run: python -m pip install --disable-pip-version-check PyNaCl
+
       - name: Prepare runtime
         run: |
           set -euo pipefail
-          mkdir -p .runtime/run .runtime/results .runtime/cache .runtime/cache/memory
+          mkdir -p .runtime/run .runtime/raw .runtime/presentation .runtime/results .runtime/cache .runtime/cache/memory
 
       - name: Restore TradingAgents state
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           artifact_id="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
             --jq '[.artifacts[] | select(.name=="tradingagents-state" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
+
           if [[ -n "${artifact_id:-}" ]]; then
             gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > .runtime/state.zip
             unzip -o .runtime/state.zip -d .runtime/cache >/dev/null
             rm -f .runtime/state.zip
           fi
 
-      - name: Read request
+      - name: Read request and model snapshot
         env:
           REQUEST_JSON: ${{ toJSON(github.event.client_payload) }}
+          BOT_STATE_KEY: ${{ secrets.BOT_STATE_KEY }}
         run: |
           set -euo pipefail
           python - <<'PY'
-          import json, os
-          p = json.loads(os.environ.get("REQUEST_JSON") or "{}")
-          if not p.get("request_id"):
+          import base64
+          import hashlib
+          import json
+          import os
+
+          payload = json.loads(os.environ.get("REQUEST_JSON") or "{}")
+          if not payload.get("request_id"):
               raise SystemExit("Missing request_id")
-          mode = str(p.get("mode") or "analysis")
-          params = p.get("params") or {}
-          out = {
-              "REQUEST_ID": str(p.get("request_id", "")),
-              "REQUEST_MODE": mode,
-              "REQUEST_CHAT_ID": str(p.get("chat_id", "")),
-              "MODEL_ID": str(p.get("model_id", "")),
-              "TICKER": str(params.get("ticker", "")),
-              "TICKERS": str(params.get("tickers", "")),
-              "ANALYSIS_DATE": str(params.get("date", "")),
-              "START_DATE": str(params.get("start", "")),
-              "END_DATE": str(params.get("end", "")),
-              "EVERY": str(params.get("every", "7")),
-              "ANALYSTS": str(params.get("analysts", "")),
+
+          mode = str(payload.get("mode") or "analysis")
+          params = payload.get("params") or {}
+
+          def clean(value):
+              return str(value if value is not None else "").replace("\n", " ").replace("\r", " ")
+
+          def add_env(key, value):
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+                  f.write(f"{key}={clean(value)}\n")
+
+          add_env("REQUEST_ID", payload.get("request_id"))
+          add_env("REQUEST_MODE", mode)
+          add_env("REQUEST_CHAT_ID", payload.get("chat_id"))
+          add_env("REQUEST_USER_ID", payload.get("user_id"))
+          add_env("MODEL_ID", payload.get("model_id"))
+          add_env("TICKER", params.get("ticker"))
+          add_env("TICKERS", params.get("tickers"))
+          add_env("ANALYSIS_DATE", params.get("date"))
+          add_env("START_DATE", params.get("start"))
+          add_env("END_DATE", params.get("end"))
+          add_env("EVERY", params.get("every", "7"))
+          add_env("ANALYSTS", params.get("analysts"))
+
+          config_enc = str(payload.get("config_enc") or "")
+
+          if config_enc:
+              state_key = os.environ.get("BOT_STATE_KEY", "").strip()
+              if not state_key:
+                  raise SystemExit("BOT_STATE_KEY is required to decrypt request model snapshot.")
+
+              key = hashlib.sha256(state_key.encode("utf-8")).digest()
+
+              try:
+                  from nacl.secret import SecretBox
+              except Exception as exc:
+                  raise SystemExit(f"PyNaCl is required for encrypted model snapshot: {exc}")
+
+              decrypted = SecretBox(key).decrypt(base64.b64decode(config_enc))
+              cfg = json.loads(decrypted.decode("utf-8"))
+
+              token = str(cfg.get("api_token") or "")
+              if token:
+                  print(f"::add-mask::{token}")
+                  env_key = str(cfg.get("provider_env_key") or "")
+                  if env_key:
+                      add_env(env_key, token)
+
+              add_env("TRADINGAGENTS_LLM_PROVIDER", cfg.get("provider_type"))
+              add_env("TRADINGAGENTS_DEEP_THINK_LLM", cfg.get("model_name"))
+              add_env("TRADINGAGENTS_QUICK_THINK_LLM", cfg.get("model_name"))
+              add_env("TRADINGAGENTS_LLM_BACKEND_URL", cfg.get("base_url"))
+
+          os.makedirs(".runtime/run", exist_ok=True)
+          snapshot = {
+              "request_id": str(payload.get("request_id", "")),
+              "mode": mode,
+              "chat_id": str(payload.get("chat_id", "")),
+              "user_id": str(payload.get("user_id", "")),
+              "model_id": str(payload.get("model_id", "")),
+              "params": params,
+              "config_enc_present": bool(config_enc),
           }
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
-              for key, value in out.items():
-                  f.write(f"{key}<<TA_EOF\n{value}\nTA_EOF\n")
+          with open(".runtime/run/request.json", "w", encoding="utf-8") as f:
+              json.dump(snapshot, f, ensure_ascii=False, indent=2)
           PY
 
       - name: Validate unattended configuration
@@ -188,10 +253,11 @@ jobs:
           [[ -n "${TRADINGAGENTS_QUICK_THINK_LLM:-}" ]] || { echo "Missing active quick-thinking model."; exit 3; }
           [[ -n "${TRADINGAGENTS_LLM_BACKEND_URL:-}" ]] || { echo "Missing active model Base URL."; exit 3; }
 
-      - name: Build agent command
+      - name: Build and run agent command
         run: |
           set -euo pipefail
           mkdir -p .runtime/run
+
           if [[ "$REQUEST_MODE" == "analysis" ]]; then
             [[ -n "$TICKER" ]] || { echo "Missing ticker."; exit 2; }
             [[ -n "$ANALYSIS_DATE" ]] || { echo "Missing analysis date."; exit 2; }
@@ -204,36 +270,81 @@ jobs:
             echo "Unsupported mode: $REQUEST_MODE"
             exit 2
           fi
+
           printf '%q ' "${CMD[@]}" > .runtime/run/command.txt
-          cat > .runtime/run/request.json <<EOF
-          {
-            "request_id": "${REQUEST_ID}",
-            "mode": "${REQUEST_MODE}",
-            "chat_id": "${REQUEST_CHAT_ID}",
-            "ticker": "${TICKER}",
-            "tickers": "${TICKERS}",
-            "date": "${ANALYSIS_DATE}",
-            "start": "${START_DATE}",
-            "end": "${END_DATE}",
-            "every": "${EVERY}",
-            "analysts": "${ANALYSTS}"
-          }
-          EOF
+
           echo "Starting TradingAgents..."
           echo "Request ID: ${REQUEST_ID}"
           echo "Mode: ${REQUEST_MODE}"
           echo "Language: ${TRADINGAGENTS_OUTPUT_LANGUAGE}"
+
           "${CMD[@]}" 2>&1 | tee .runtime/run/agent.log
 
-      - name: Collect and merge all agent outputs
+      - name: Freeze RAW outputs
         if: always()
         run: |
           set -uo pipefail
-          mkdir -p .runtime/results
-          OUTDIR=".runtime/results"
+          mkdir -p .runtime/raw .runtime/presentation
+
+          if [[ -d "$HOME/.tradingagents" ]]; then
+            mkdir -p .runtime/raw/tradingagents
+            cp -r "$HOME/.tradingagents/." .runtime/raw/tradingagents/ || true
+          fi
+
+          if [[ -f .runtime/run/agent.log ]]; then
+            cp -f .runtime/run/agent.log .runtime/raw/agent.log || true
+          fi
+
+          if [[ -f .runtime/run/request.json ]]; then
+            cp -f .runtime/run/request.json .runtime/raw/request.json || true
+          fi
+
+          if [[ -f .runtime/run/command.txt ]]; then
+            cp -f .runtime/run/command.txt .runtime/raw/command.txt || true
+          fi
+
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+
+          manifest = {"files": []}
+          raw_root = ".runtime/raw"
+
+          for root, dirs, files in os.walk(raw_root):
+              for name in files:
+                  path = os.path.join(root, name)
+                  rel = os.path.relpath(path, raw_root).replace(os.sep, "/")
+                  h = hashlib.sha256()
+                  try:
+                      with open(path, "rb") as f:
+                          while True:
+                              chunk = f.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              h.update(chunk)
+                      manifest["files"].append({
+                          "path": rel,
+                          "sha256": h.hexdigest(),
+                          "size": os.path.getsize(path),
+                      })
+                  except Exception:
+                      pass
+
+          with open(os.path.join(raw_root, "manifest.json"), "w", encoding="utf-8") as f:
+              json.dump(manifest, f, ensure_ascii=False, indent=2)
+          PY
+
+      - name: Build presentation layer
+        if: always()
+        run: |
+          set -uo pipefail
+          OUTDIR=".runtime/presentation"
           MERGED="$OUTDIR/full_report.md"
+          mkdir -p "$OUTDIR"
           : > "$MERGED"
-          echo "# 📊 گزارش کامل TradingAgents" >> "$MERGED"
+
+          echo "# 📊 گزارش TradingAgents" >> "$MERGED"
           echo "" >> "$MERGED"
           echo "Request ID: \`${REQUEST_ID}\`" >> "$MERGED"
           echo "Mode: \`${REQUEST_MODE}\`" >> "$MERGED"
@@ -243,23 +354,25 @@ jobs:
           echo "Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$MERGED"
           echo "" >> "$MERGED"
           echo "---" >> "$MERGED"
-          if [[ -d "$HOME/.tradingagents" ]]; then
-            find "$HOME/.tradingagents" -type f \( -name '*.md' -o -name '*.txt' -o -name '*.json' \) 2>/dev/null | sort | while read -r f; do
+
+          if [[ -d .runtime/raw/tradingagents ]]; then
+            find .runtime/raw/tradingagents -type f \( -name '*.md' -o -name '*.txt' -o -name '*.json' \) -print0 2>/dev/null | sort -z | while IFS= read -r -d '' f; do
               base=$(basename "$f")
-              cp -f "$f" "$OUTDIR/$base" || true
               echo "" >> "$MERGED"
               echo "---" >> "$MERGED"
               echo "" >> "$MERGED"
               echo "## 📎 $base" >> "$MERGED"
               echo "" >> "$MERGED"
-              cat "$f" >> "$MERGED"
+              cat "$f" >> "$MERGED" || true
               echo "" >> "$MERGED"
             done
           fi
-          if [[ -f .runtime/run/agent.log ]]; then
-            cp -f .runtime/run/agent.log "$OUTDIR/agent.log"
+
+          if [[ -f .runtime/raw/agent.log ]]; then
+            cp -f .runtime/raw/agent.log "$OUTDIR/agent.log" || true
           fi
-          echo "=== Collected files ==="
+
+          echo "=== Presentation files ==="
           ls -la "$OUTDIR" || true
           wc -c "$MERGED" || true
 
@@ -281,11 +394,29 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
-      - name: Upload results
+      - name: Upload RAW artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tradingagents-raw-${{ github.run_id }}
+          path: .runtime/raw/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload presentation artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tradingagents-presentation-${{ github.run_id }}
+          path: .runtime/presentation/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload compatibility results artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tradingagents-results-${{ github.run_id }}
-          path: .runtime/results/
+          path: .runtime/presentation/
           retention-days: 90
           if-no-files-found: warn
