@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import base64
 import os
 
 import pytest
 
+from bot_reports import make_summary_text
 from bot_state_store import (
     StateStoreError,
     decrypt_blob,
@@ -12,7 +12,6 @@ from bot_state_store import (
     resolve_state_path,
     restore_state_if_missing,
 )
-from bot_reports import make_summary_text
 
 
 def test_default_database_path_is_independent_of_working_directory(tmp_path):
