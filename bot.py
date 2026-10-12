@@ -861,6 +861,15 @@ def dispatch_run(chat_id: int, mode: str, params: dict) -> str:
     if cur is None:
         raise RuntimeError("درخواست در پایگاه داده ثبت نشد؛ برای جلوگیری از اجرای بدون سابقه، ارسال متوقف شد.")
 
+    # Persist the numbered request before dispatching it, so a restart cannot leave
+    # a real engine execution without a matching local/remote run record.
+    if not persist_state_if_dirty():
+        db(
+            "UPDATE runs SET status='failure', conclusion='state_backup_failed', updated_at=? WHERE request_id=?",
+            (now(), request_id),
+        )
+        raise RuntimeError("پشتیبان پایدار ثبت درخواست ناموفق بود؛ اجرا آغاز نشد. چند لحظه دیگر تلاش کن.")
+
     try:
         gh("POST", "/dispatches", {"event_type": "tradingagents_run", "client_payload": payload})
     except Exception as exc:
