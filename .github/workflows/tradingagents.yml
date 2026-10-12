@@ -78,21 +78,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Restore controller state
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          mkdir -p .runtime/controller
-
-          artifact_id="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
-            --jq '[.artifacts[] | select(.name=="tradingagents-controller-state" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
-
-          if [[ -n "${artifact_id:-}" ]]; then
-            gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > .runtime/controller/state.zip
-            unzip -o .runtime/controller/state.zip -d .runtime/controller >/dev/null
-            rm -f .runtime/controller/state.zip
-          fi
+      - name: Prepare controller state directory
+        run: mkdir -p .runtime/controller
 
       - name: Install controller dependency
         run: python -m pip install --disable-pip-version-check PyNaCl
@@ -102,6 +89,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           BOT_GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
           BOT_STATE_KEY: ${{ secrets.BOT_STATE_KEY }}
+          BOT_STATE_BRANCH: bot-state
           TELEGRAM_ADMIN_IDS: ${{ secrets.TELEGRAM_ADMIN_IDS }}
           TELEGRAM_ALLOWED_USER_IDS: ${{ secrets.TELEGRAM_ALLOWED_USER_IDS }}
           BOT_STATE_PATH: ${{ github.workspace }}/.runtime/controller/bot_state.db
@@ -110,12 +98,26 @@ jobs:
           GITHUB_REF: ${{ github.event.repository.default_branch }}
         run: python bot.py
 
-      - name: Save controller state
+      - name: Encrypt controller state artifact
+        id: encrypt_controller_state
         if: always()
+        env:
+          BOT_STATE_KEY: ${{ secrets.BOT_STATE_KEY }}
+        run: |
+          set -euo pipefail
+          source='.runtime/controller/bot_state.db'
+          if [[ ! -s "$source" ]]; then
+            echo 'No controller database to archive.'
+            exit 0
+          fi
+          python bot_artifacts.py encrypt-file "$source" .runtime/controller/bot_state.db.enc
+
+      - name: Save encrypted controller state
+        if: always() && steps.encrypt_controller_state.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: tradingagents-controller-state
-          path: .runtime/controller/bot_state.db
+          path: .runtime/controller/bot_state.db.enc
           retention-days: 90
           if-no-files-found: warn
 
@@ -160,6 +162,15 @@ jobs:
             gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > .runtime/state.zip
             unzip -o .runtime/state.zip -d .runtime/cache >/dev/null
             rm -f .runtime/state.zip
+          fi
+
+      - name: Decrypt TradingAgents state artifact
+        env:
+          BOT_STATE_KEY: ${{ secrets.BOT_STATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -f .runtime/cache/state.enc ]]; then
+            python bot_artifacts.py decrypt-tree .runtime/cache state.enc
           fi
 
       - name: Read request
@@ -237,6 +248,7 @@ jobs:
           [[ -n "${TRADINGAGENTS_LLM_BACKEND_URL:-}" ]] || { echo "Missing active model Base URL."; exit 3; }
 
       - name: Build and run agent command
+        id: run_engine
         run: |
           set -euo pipefail
           mkdir -p .runtime/run
@@ -276,7 +288,7 @@ jobs:
           echo "Mode: ${REQUEST_MODE}"
           echo "Language: ${TRADINGAGENTS_OUTPUT_LANGUAGE}"
 
-          "${CMD[@]}" 2>&1 | tee .runtime/run/agent.log
+          "${CMD[@]}" > .runtime/run/agent.log 2>&1
 
       - name: Install report dependencies
         if: always()
@@ -320,10 +332,20 @@ jobs:
               "exit": "",
               "target": "",
               "stop": "",
+              "amount": "",
+              "value": "",
               "confidence": "",
               "horizon": "",
               "summary": "",
               "decision": "",
+          }
+          telegram_financial_fields = {
+              "entry": "",
+              "exit": "",
+              "target": "",
+              "stop": "",
+              "amount": "",
+              "value": "",
           }
 
           sections = []
@@ -386,6 +408,16 @@ jobs:
               if value and not fields.get(key):
                   fields[key] = value
 
+          def set_exact_field(key, value):
+              # Financial text is copied as-is; do not normalize spaces or punctuation.
+              if value is not None and value != "" and not fields.get(key):
+                  fields[key] = str(value)
+
+          def set_telegram_financial_field(key, value):
+              # Separate presentation field: preserve source characters, unlike PDF formatting.
+              if key in telegram_financial_fields and value is not None and value != "" and not telegram_financial_fields[key]:
+                  telegram_financial_fields[key] = str(value)
+
           def find_value(text, patterns):
               if not text:
                   return ""
@@ -410,21 +442,42 @@ jobs:
                   r"(?:action|recommendation|اقدام|سفارش|عملیات|پیشنهاد معامله)\s*[:：]?\s*([^\n]{1,220})",
               ]))
 
-              set_field("entry", find_value(text, [
+              entry_patterns = [
                   r"(?:entry\s*point|entry\s*price|buy\s*price|entry|نقطه ورود|قیمت ورود|ورود)\s*[:：]?\s*([^\n]{1,220})",
-              ]))
+              ]
+              set_field("entry", find_value(text, entry_patterns))
+              set_telegram_financial_field("entry", find_value(text, entry_patterns))
 
-              set_field("exit", find_value(text, [
+              exit_patterns = [
                   r"(?:exit\s*point|exit\s*price|sell\s*price|exit|نقطه خروج|قیمت خروج|خروج)\s*[:：]?\s*([^\n]{1,220})",
-              ]))
+              ]
+              set_field("exit", find_value(text, exit_patterns))
+              set_telegram_financial_field("exit", find_value(text, exit_patterns))
 
-              set_field("target", find_value(text, [
+              target_patterns = [
                   r"(?:price\s*target|target\s*price|target|قیمت هدف|هدف قیمتی|هدف)\s*[:：]?\s*([^\n]{1,220})",
-              ]))
+              ]
+              set_field("target", find_value(text, target_patterns))
+              set_telegram_financial_field("target", find_value(text, target_patterns))
 
-              set_field("stop", find_value(text, [
+              stop_patterns = [
                   r"(?:stop\s*loss|stop|حد ضرر|استاپ ضرر|استاپ)\s*[:：]?\s*([^\n]{1,220})",
-              ]))
+              ]
+              set_field("stop", find_value(text, stop_patterns))
+              set_telegram_financial_field("stop", find_value(text, stop_patterns))
+
+              amount_patterns = [
+                  r"(?:position\s*size|trade\s*size|trade\s*amount|quantity|amount\s*of\s*(?:shares|units)|حجم معامله|مقدار معامله|تعداد واحد|تعداد سهام)\s*[:：]\s*([^\n]{1,220})",
+              ]
+              value_patterns = [
+                  r"(?:notional\s*value|position\s*value|trade\s*value|value\s*of\s*position|ارزش معامله|ارزش موقعیت|ارزش پوزیشن)\s*[:：]\s*([^\n]{1,220})",
+              ]
+              amount_value = find_value(text, amount_patterns)
+              trade_value = find_value(text, value_patterns)
+              set_exact_field("amount", amount_value)
+              set_exact_field("value", trade_value)
+              set_telegram_financial_field("amount", amount_value)
+              set_telegram_financial_field("value", trade_value)
 
               set_field("confidence", find_value(text, [
                   r"(?:confidence|level of confidence|سطح اطمینان|اطمینان)\s*[:：]?\s*([^\n]{1,220})",
@@ -449,6 +502,19 @@ jobs:
                           continue
 
                       if isinstance(value, str):
+                          if low_key in {"entry", "entry_price", "buy_price"}:
+                              set_telegram_financial_field("entry", value)
+                          elif low_key in {"exit", "exit_price", "sell_price"}:
+                              set_telegram_financial_field("exit", value)
+                          elif low_key in {"target", "target_price", "price_target"}:
+                              set_telegram_financial_field("target", value)
+                          elif low_key in {"stop", "stop_loss"}:
+                              set_telegram_financial_field("stop", value)
+                          elif low_key in {"amount", "quantity", "position_size", "trade_size", "shares", "units"}:
+                              set_telegram_financial_field("amount", value)
+                          elif low_key in {"position_value", "trade_value", "notional", "notional_value"}:
+                              set_telegram_financial_field("value", value)
+
                           text = value.strip()
                           if not text:
                               continue
@@ -475,6 +541,10 @@ jobs:
                               set_field("target", text)
                           elif low_key in {"stop", "stop_loss"}:
                               set_field("stop", text)
+                          elif low_key in {"amount", "quantity", "position_size", "trade_size", "shares", "units"}:
+                              set_exact_field("amount", text)
+                          elif low_key in {"position_value", "trade_value", "notional", "notional_value"}:
+                              set_exact_field("value", text)
                           elif low_key in {"confidence", "time_horizon", "horizon"}:
                               set_field("confidence" if "confidence" in low_key else "horizon", text)
                           elif any(word in low_key for word in important_section_words):
@@ -552,6 +622,9 @@ jobs:
           fields["summary"] = normalize_summary(fields["summary"])
           for key in ("rating", "action", "entry", "exit", "target", "stop", "confidence", "horizon"):
               fields[key] = normalize_value(fields[key]) or "—"
+          for key in ("amount", "value"):
+              if fields[key] == "":
+                  fields[key] = "—"
 
           def md_to_html(text):
               text = text or ""
@@ -799,6 +872,12 @@ jobs:
               "exit": fields["exit"],
               "target": fields["target"],
               "stop": fields["stop"],
+              "amount": fields["amount"],
+              "value": fields["value"],
+              "telegram_financial_fields": {
+                  key: (value if value != "" else "—")
+                  for key, value in telegram_financial_fields.items()
+              },
               "confidence": fields["confidence"],
               "horizon": fields["horizon"],
               "summary": fields["summary"],
@@ -810,8 +889,117 @@ jobs:
           print(f"Report generated. PDF exists: {pdf_ok}")
           PY
 
-      - name: Save TradingAgents state
+      - name: Create independent Telegram summary
+        if: always() && steps.run_engine.outcome == 'success'
+        env:
+          BOT_STATE_KEY: ${{ secrets.BOT_STATE_KEY }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import urllib.parse
+          import urllib.request
+
+          out = pathlib.Path('.runtime/results')
+          out.mkdir(parents=True, exist_ok=True)
+          target = out / 'telegram_summary.json'
+          result = {"summary": ""}
+          try:
+              report = json.loads((out / 'report.json').read_text(encoding='utf-8'))
+              source = str(report.get('decision') or report.get('summary') or '').strip()
+              provider = os.environ.get('TRADINGAGENTS_LLM_PROVIDER', '').strip().lower()
+              model = os.environ.get('TRADINGAGENTS_DEEP_THINK_LLM', '').strip()
+              base = os.environ.get('TRADINGAGENTS_LLM_BACKEND_URL', '').strip().rstrip('/')
+              keys = {
+                  'openai': 'OPENAI_API_KEY',
+                  'anthropic': 'ANTHROPIC_API_KEY',
+                  'google': 'GOOGLE_API_KEY',
+                  'azure': 'AZURE_OPENAI_API_KEY',
+                  'xai': 'XAI_API_KEY',
+                  'deepseek': 'DEEPSEEK_API_KEY',
+                  'qwen': 'DASHSCOPE_API_KEY',
+                  'qwen-cn': 'DASHSCOPE_CN_API_KEY',
+                  'glm': 'ZHIPU_API_KEY',
+                  'glm-cn': 'ZHIPU_CN_API_KEY',
+                  'minimax': 'MINIMAX_API_KEY',
+                  'minimax-cn': 'MINIMAX_CN_API_KEY',
+                  'openrouter': 'OPENROUTER_API_KEY',
+                  'mistral': 'MISTRAL_API_KEY',
+                  'kimi': 'MOONSHOT_API_KEY',
+                  'groq': 'GROQ_API_KEY',
+                  'nvidia': 'NVIDIA_API_KEY',
+                  'perplexity': 'PERPLEXITY_API_KEY',
+                  'together': 'TOGETHER_API_KEY',
+                  'fireworks': 'FIREWORKS_API_KEY',
+                  'cerebras': 'CEREBRAS_API_KEY',
+                  'sambanova': 'SAMBANOVA_API_KEY',
+                  'deepinfra': 'DEEPINFRA_API_KEY',
+                  'cohere': 'COHERE_API_KEY',
+                  'openai_compatible': 'OPENAI_COMPATIBLE_API_KEY',
+                  'bedrock': 'AWS_BEARER_TOKEN_BEDROCK',
+                  'ollama': '',
+              }
+              api_key = os.environ.get(keys.get(provider, 'OPENAI_COMPATIBLE_API_KEY'), '').strip()
+              if source and model and base:
+                  prompt = (
+                      "Write a neutral explanation in at most two short sentences, using the same language "
+                      "as the source. Do not include any number, date, percentage, currency, price, entry, exit, "
+                      "target or stop value. Do not recommend buying or selling and do not add facts. Only state "
+                      "the general evidence and uncertainty described in the source. This is an independent "
+                      "ancillary Telegram summary, not a replacement for the original report. Return only the summary.\n\n"
+                      + source[:9000]
+                  )
+                  headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+                  if provider == 'anthropic':
+                      endpoint = base if base.endswith('/messages') else base + ('/messages' if base.endswith('/v1') else '/v1/messages')
+                      if api_key:
+                          headers['x-api-key'] = api_key
+                      headers['anthropic-version'] = '2023-06-01'
+                      payload = {'model': model, 'max_tokens': 140, 'temperature': 0, 'messages': [{'role':'user','content':prompt}]}
+                  elif provider == 'google':
+                      endpoint = base + '/models/' + urllib.parse.quote(model, safe='') + ':generateContent'
+                      endpoint += ('&' if '?' in endpoint else '?') + urllib.parse.urlencode({'key': api_key})
+                      payload = {'contents':[{'parts':[{'text':prompt}]}], 'generationConfig':{'maxOutputTokens':140,'temperature':0}}
+                  else:
+                      endpoint = base if base.endswith('/chat/completions') else base + '/chat/completions'
+                      if api_key:
+                          headers['Authorization'] = 'Bearer ' + api_key
+                      payload = {'model':model,'temperature':0,'max_tokens':140,'messages':[{'role':'system','content':'Follow the neutrality constraints exactly.'},{'role':'user','content':prompt}]}
+                  request = urllib.request.Request(endpoint, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), headers=headers, method='POST')
+                  with urllib.request.urlopen(request, timeout=65) as response:
+                      body = json.loads(response.read().decode('utf-8','replace'))
+                  if provider == 'anthropic':
+                      text = ''.join(str(x.get('text') or '') for x in body.get('content',[]) if x.get('type') == 'text').strip()
+                  elif provider == 'google':
+                      text = ' '.join(str(p.get('text') or '') for c in body.get('candidates',[]) for p in c.get('content',{}).get('parts',[])).strip()
+                  else:
+                      text = str(body.get('choices',[{}])[0].get('message',{}).get('content') or '').strip()
+                  forbidden_numbers = re.search(r'[0-9۰-۹٠-٩]|[$€£¥₹₿%]', text)
+                  forbidden_advice = re.search(r'(?i)\b(buy|sell|long|short|purchase|liquidate)\b|خرید|فروش|بخر|بفروش|ورود|خروج|حد ضرر|هدف قیمتی', text)
+                  if text and len(text) <= 500 and not forbidden_numbers and not forbidden_advice:
+                      result['summary'] = text
+          except Exception:
+              # Never log provider responses or credentials; the original report remains untouched.
+              pass
+          target.write_text(json.dumps(result, ensure_ascii=False), encoding='utf-8')
+          print('Independent Telegram summary file created; original agent output was not modified.')
+          PY
+
+      - name: Encrypt private engine artifacts
+        id: encrypt_private
         if: always()
+        env:
+          BOT_STATE_KEY: ${{ secrets.BOT_STATE_KEY }}
+        run: |
+          set -euo pipefail
+          python bot_artifacts.py encrypt-tree .runtime/cache state.enc
+          python bot_artifacts.py encrypt-tree .runtime/results results.enc
+
+      - name: Save TradingAgents state
+        if: always() && steps.encrypt_private.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: tradingagents-state
@@ -820,7 +1008,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Upload results
-        if: always()
+        if: always() && steps.encrypt_private.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: tradingagents-results-${{ github.run_id }}
