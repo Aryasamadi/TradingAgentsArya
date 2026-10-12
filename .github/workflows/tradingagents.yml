@@ -105,24 +105,12 @@ jobs:
           BOT_STATE_KEY: ${{ secrets.BOT_STATE_KEY }}
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import hashlib
-          import os
-          import pathlib
-          from nacl.secret import SecretBox
-
-          source = pathlib.Path('.runtime/controller/bot_state.db')
-          if not source.is_file() or source.stat().st_size == 0:
-              print('No controller database to archive.')
-              raise SystemExit(0)
-          state_key = os.environ.get('BOT_STATE_KEY', '').strip()
-          if not state_key:
-              raise SystemExit('BOT_STATE_KEY is required; plaintext state artifact is forbidden.')
-          key = hashlib.sha256(state_key.encode('utf-8')).digest()
-          encrypted = bytes(SecretBox(key).encrypt(source.read_bytes()))
-          source.with_suffix('.db.enc').write_bytes(encrypted)
-          source.unlink()
-          PY
+          source='.runtime/controller/bot_state.db'
+          if [[ ! -s "$source" ]]; then
+            echo 'No controller database to archive.'
+            exit 0
+          fi
+          python bot_artifacts.py encrypt-file "$source" .runtime/controller/bot_state.db.enc
 
       - name: Save encrypted controller state
         if: always() && steps.encrypt_controller_state.outcome == 'success'
@@ -182,29 +170,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -f .runtime/cache/state.enc ]]; then
-            python - <<'PY'
-            import hashlib
-            import io
-            import os
-            import pathlib
-            import zipfile
-            from nacl.secret import SecretBox
-
-            marker = pathlib.Path('.runtime/cache/state.enc')
-            state_key = os.environ.get('BOT_STATE_KEY', '').strip()
-            if not state_key:
-                raise SystemExit('BOT_STATE_KEY is required to restore encrypted engine state.')
-            key = hashlib.sha256(state_key.encode('utf-8')).digest()
-            plain = SecretBox(key).decrypt(marker.read_bytes())
-            with zipfile.ZipFile(io.BytesIO(plain)) as archive:
-                root = pathlib.Path('.runtime/cache').resolve()
-                for item in archive.infolist():
-                    target = (root / item.filename).resolve()
-                    if root not in target.parents and target != root:
-                        raise SystemExit('Invalid path in encrypted state archive.')
-                archive.extractall(root)
-            marker.unlink(missing_ok=True)
-            PY
+            python bot_artifacts.py decrypt-tree .runtime/cache state.enc
           fi
 
       - name: Read request
@@ -963,41 +929,8 @@ jobs:
           BOT_STATE_KEY: ${{ secrets.BOT_STATE_KEY }}
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import hashlib
-          import io
-          import os
-          import pathlib
-          import shutil
-          import zipfile
-          from nacl.secret import SecretBox
-
-          state_key = os.environ.get('BOT_STATE_KEY', '').strip()
-          if not state_key:
-              raise SystemExit('BOT_STATE_KEY is required; plaintext runtime artifacts are forbidden.')
-          key = hashlib.sha256(state_key.encode('utf-8')).digest()
-          box = SecretBox(key)
-
-          def archive_and_encrypt(directory, marker):
-              root = pathlib.Path(directory)
-              root.mkdir(parents=True, exist_ok=True)
-              buf = io.BytesIO()
-              with zipfile.ZipFile(buf, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
-                  for path in sorted(root.rglob('*')):
-                      if path.is_file() and path.name != marker:
-                          archive.write(path, path.relative_to(root).as_posix())
-              encrypted = bytes(box.encrypt(buf.getvalue()))
-              for child in list(root.iterdir()):
-                  if child.is_dir():
-                      shutil.rmtree(child)
-                  else:
-                      child.unlink()
-              (root / marker).write_bytes(encrypted)
-
-          archive_and_encrypt('.runtime/cache', 'state.enc')
-          archive_and_encrypt('.runtime/results', 'results.enc')
-          print('Runtime state and result artifacts encrypted.')
-          PY
+          python bot_artifacts.py encrypt-tree .runtime/cache state.enc
+          python bot_artifacts.py encrypt-tree .runtime/results results.enc
 
       - name: Save TradingAgents state
         if: always() && steps.encrypt_private.outcome == 'success'
