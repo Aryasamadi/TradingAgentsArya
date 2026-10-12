@@ -10,6 +10,7 @@ import contextlib
 import datetime as dt
 import hashlib
 import html
+import ipaddress
 import io
 import json
 import os
@@ -26,14 +27,34 @@ import uuid
 import zipfile
 from typing import Any, Tuple, Optional
 
-BUILD = "v19-pdf"
+from bot_reports import make_summary_text
+from bot_state_store import (
+    StateStoreError,
+    resolve_state_path,
+    restore_state_if_missing,
+    upload_state_snapshot,
+)
+
+BUILD = "v20-safe-state"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
 STATE_KEY = os.getenv("BOT_STATE_KEY", "").strip()
 OWNER = os.getenv("GITHUB_OWNER", "Aryasamadi").strip()
 REPO = os.getenv("GITHUB_REPO", "TradingAgentsArya").strip()
-STATE_PATH = os.getenv("BOT_STATE_PATH", "bot_state.db").strip() or "bot_state.db"
+STATE_BRANCH = os.getenv("BOT_STATE_BRANCH", "bot-state").strip() or "bot-state"
+STATE_PATH = resolve_state_path(os.getenv("BOT_STATE_PATH"), os.path.dirname(os.path.abspath(__file__)))
+try:
+    if STATE_PATH != ":memory:":
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    _state_restored = restore_state_if_missing(
+        STATE_PATH, OWNER, REPO, GH_TOKEN, STATE_KEY, branch=STATE_BRANCH
+    )
+    if _state_restored:
+        sys.stderr.write("Encrypted controller state restored from GitHub.\n")
+except StateStoreError as exc:
+    sys.stderr.write(f"FATAL: {exc}\n")
+    raise SystemExit("Encrypted state restore failed; refusing to start with an empty database.") from exc
 
 ADMIN_IDS = {int(x) for x in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 ALLOWED_IDS = {int(x) for x in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").split(",") if x.strip().isdigit()}
@@ -50,7 +71,7 @@ ANALYST_LABEL = {
     "fundamentals": "💰 Fundamentals",
 }
 
-TERMINAL = ("success", "failure", "cancelled")
+TERMINAL = ("success", "failure", "cancelled", "timed_out", "action_required", "neutral", "skipped", "startup_failure", "stale")
 KNOWN_SUFFIXES = ("/chat/completions", "/completions", "/messages", "/generateContent")
 
 DB = sqlite3.connect(STATE_PATH, check_same_thread=False)
@@ -88,6 +109,10 @@ DB.executescript(
         mode TEXT NOT NULL,
         payload_json TEXT NOT NULL,
         model_id TEXT NOT NULL,
+        run_no INTEGER,
+        model_name_snapshot TEXT NOT NULL DEFAULT '',
+        provider_name_snapshot TEXT NOT NULL DEFAULT '',
+        provider_type_snapshot TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL,
         conclusion TEXT NOT NULL DEFAULT '',
         notified INTEGER NOT NULL DEFAULT 0,
@@ -102,12 +127,36 @@ for stmt in (
     "ALTER TABLE runs ADD COLUMN conclusion TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE runs ADD COLUMN notified INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE models ADD COLUMN provider_id TEXT",
+    "ALTER TABLE runs ADD COLUMN run_no INTEGER",
+    "ALTER TABLE runs ADD COLUMN model_name_snapshot TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE runs ADD COLUMN provider_name_snapshot TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE runs ADD COLUMN provider_type_snapshot TEXT NOT NULL DEFAULT ''",
 ):
     with contextlib.suppress(sqlite3.OperationalError):
         DB.execute(stmt)
 
+# Assign stable, monotonic run numbers to records created before this migration.
+_existing_max = int(DB.execute("SELECT COALESCE(MAX(run_no), 0) FROM runs").fetchone()[0] or 0)
+for _row in DB.execute("SELECT request_id FROM runs WHERE run_no IS NULL ORDER BY created_at, request_id").fetchall():
+    _existing_max += 1
+    DB.execute("UPDATE runs SET run_no=? WHERE request_id=?", (_existing_max, _row["request_id"]))
+DB.execute(
+    "UPDATE runs SET model_name_snapshot=COALESCE((SELECT name FROM models WHERE models.id=runs.model_id),'') "
+    "WHERE model_name_snapshot=''"
+)
+DB.execute(
+    "UPDATE runs SET provider_name_snapshot=COALESCE((SELECT providers.name FROM models LEFT JOIN providers "
+    "ON providers.id=models.provider_id WHERE models.id=runs.model_id),'') WHERE provider_name_snapshot=''"
+)
+DB.execute(
+    "UPDATE runs SET provider_type_snapshot=COALESCE((SELECT providers.provider_type FROM models LEFT JOIN providers "
+    "ON providers.id=models.provider_id WHERE models.id=runs.model_id),'') WHERE provider_type_snapshot=''"
+)
 DB.commit()
 DB_LOCK = threading.Lock()
+STATE_DIRTY = True
+STATE_VERSION = 0
+_STATE_SAVE_RETRY_AFTER = 0.0
 
 CACHE: dict[str, Any] = {"runs": [], "ts": 0.0}
 WIZARDS: dict[int, dict[str, Any]] = {}
@@ -141,10 +190,13 @@ def q1(sql: str, args: tuple | list = ()) -> Optional[sqlite3.Row]:
 
 
 def db(sql: str, args: tuple | list = ()):
+    global STATE_DIRTY, STATE_VERSION
     with DB_LOCK:
         try:
             cur = DB.execute(sql, args)
             DB.commit()
+            STATE_VERSION += 1
+            STATE_DIRTY = True
             return cur
         except Exception as e:
             sys.stderr.write(f"DB Exec Error: {e}\nSQL: {sql}\nArgs: {args}\n")
@@ -222,6 +274,27 @@ def gh(method: str, path: str, data: Any = None, timeout: int = 30):
     if status >= 300 or status == 0:
         raise RuntimeError(f"GitHub API error {status}: {raw[:200]}")
     return obj
+
+
+def persist_state_if_dirty() -> None:
+    """Periodically save encrypted DB bytes to the dedicated state branch."""
+    global STATE_DIRTY, _STATE_SAVE_RETRY_AFTER
+    if not STATE_DIRTY or STATE_PATH == ":memory:" or time.monotonic() < _STATE_SAVE_RETRY_AFTER:
+        return
+    try:
+        with DB_LOCK:
+            DB.commit()
+            with open(STATE_PATH, "rb") as handle:
+                snapshot = handle.read()
+            version = STATE_VERSION
+        upload_state_snapshot(snapshot, OWNER, REPO, GH_TOKEN, STATE_KEY, branch=STATE_BRANCH)
+        with DB_LOCK:
+            if STATE_VERSION == version:
+                STATE_DIRTY = False
+        _STATE_SAVE_RETRY_AFTER = 0.0
+    except Exception as exc:
+        _STATE_SAVE_RETRY_AFTER = time.monotonic() + 60.0
+        sys.stderr.write(f"Encrypted state backup failed; retrying: {type(exc).__name__}: {exc}\n")
 
 
 def gh_bytes(path: str) -> bytes:
@@ -348,8 +421,23 @@ def show(chat_id: int, text: str, rows: list[list[tuple[str, str]]], target_mid:
 
 def clean_base_url(value: str) -> str:
     value = value.strip()
-    if not value.startswith(("http://", "https://")):
-        raise ValueError("Base URL باید با http:// یا https:// شروع شود.")
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Base URL باید آدرس معتبر http(s) باشد.")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("Base URL نباید شامل اطلاعات ورود، query یا fragment باشد.")
+    host = parsed.hostname.lower().rstrip(".")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if parsed.scheme == "http" and host != "localhost" and not (ip and ip.is_loopback):
+        raise ValueError("برای جلوگیری از افشای API Token فقط HTTPS مجاز است؛ HTTP فقط برای localhost قابل استفاده است.")
+    if ip and not ip.is_global and not ip.is_loopback:
+        raise ValueError("آدرس IP خصوصی یا محلی برای Provider مجاز نیست.")
+    if host.endswith(".localhost") or host == "metadata.google.internal":
+        if host != "localhost":
+            raise ValueError("این مقصد برای Provider مجاز نیست.")
     value = value.rstrip("/")
     if not value:
         raise ValueError("Base URL معتبر نیست.")
@@ -703,6 +791,12 @@ def dispatch_run(chat_id: int, mode: str, params: dict) -> str:
     model_id = active_model_id()
     if not model_id:
         raise ValueError("اول از بخش مدل‌ها یک مدل فعال کن.")
+    row = q1("SELECT * FROM models WHERE id=? AND enabled=1", (model_id,))
+    if not row:
+        raise ValueError("مدل فعال دیگر در فهرست مدل‌ها وجود ندارد؛ یک مدل معتبر انتخاب کن.")
+    prov = get_provider(str(row["provider_id"]))
+    if not prov:
+        raise ValueError("Provider مدل فعال پیدا نشد؛ مدل را دوباره بررسی کن.")
 
     request_id = uuid.uuid4().hex
     payload = {
@@ -712,38 +806,41 @@ def dispatch_run(chat_id: int, mode: str, params: dict) -> str:
         "model_id": model_id,
         "params": params,
     }
+    try:
+        token = decrypt_token(prov["token_ciphertext"])
+        config = {
+            "request_id": request_id,
+            "provider_type": prov["provider_type"],
+            "model_name": row["name"],
+            "base_url": strip_known_suffix(prov["base_url"]),
+            "provider_env_key": PROVIDER_SECRET.get(prov["provider_type"], ""),
+            "api_token": token,
+        }
+        if not STATE_KEY:
+            raise RuntimeError("BOT_STATE_KEY is required to protect per-run provider configuration.")
+        payload["config_enc"] = encrypt_request_config(config)
+    except Exception as exc:
+        raise RuntimeError("پیکربندی امن مدل آماده نشد؛ اجرا ارسال نشد.") from exc
 
-    row = q1("SELECT * FROM models WHERE id=? AND enabled=1", (model_id,))
-    prov = get_provider(row["provider_id"]) if row else None
-
-    if row and prov:
-        try:
-            token = decrypt_token(prov["token_ciphertext"])
-            config = {
-                "request_id": request_id,
-                "provider_type": prov["provider_type"],
-                "model_name": row["name"],
-                "base_url": strip_known_suffix(prov["base_url"]),
-                "provider_env_key": PROVIDER_SECRET.get(prov["provider_type"], ""),
-                "api_token": token,
-            }
-            if STATE_KEY:
-                payload["config_enc"] = encrypt_request_config(config)
-        except Exception as exc:
-            sys.stderr.write(f"Failed to build encrypted model config: {exc}\n")
-
-    gh(
-        "POST",
-        "/dispatches",
-        {"event_type": "tradingagents_run", "client_payload": payload},
+    next_no = q1("SELECT COALESCE(MAX(run_no), 0) + 1 AS n FROM runs")
+    run_no = int(next_no["n"]) if next_no else 1
+    cur = db(
+        "INSERT INTO runs(request_id,workflow_run_id,chat_id,mode,payload_json,model_id,run_no,"
+        "model_name_snapshot,provider_name_snapshot,provider_type_snapshot,status,conclusion,notified,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)",
+        (
+            request_id, None, chat_id, mode, json.dumps(params, ensure_ascii=False), model_id, run_no,
+            str(row["name"]), str(prov["name"]), str(prov["provider_type"]), "queued", "", now(), now(),
+        ),
     )
+    if cur is None:
+        raise RuntimeError("درخواست در پایگاه داده ثبت نشد؛ برای جلوگیری از اجرای بدون سابقه، ارسال متوقف شد.")
 
-    db(
-        "INSERT INTO runs(request_id,workflow_run_id,chat_id,mode,payload_json,model_id,status,conclusion,notified,created_at,updated_at) "
-        "VALUES(?,?,?,?,?,?,?,?,0,?,?)",
-        (request_id, None, chat_id, mode, json.dumps(params, ensure_ascii=False), model_id, "queued", "", now(), now()),
-    )
-
+    try:
+        gh("POST", "/dispatches", {"event_type": "tradingagents_run", "client_payload": payload})
+    except Exception as exc:
+        db("UPDATE runs SET status='failure', conclusion='dispatch_error', updated_at=? WHERE request_id=?", (now(), request_id))
+        raise RuntimeError("ارسال اجرا به GitHub ناموفق بود؛ درخواست در تاریخچه با وضعیت خطا ثبت شد.") from exc
     return request_id
 
 
@@ -768,7 +865,7 @@ def sync_run_records() -> None:
 
             status = str(run.get("status") or "queued")
             conclusion = str(run.get("conclusion") or "")
-            final = conclusion if status == "completed" and conclusion else status
+            final = (conclusion or "failure") if status == "completed" else status
 
             db(
                 "UPDATE runs SET workflow_run_id=?, status=?, conclusion=?, updated_at=? WHERE request_id=?",
@@ -779,42 +876,36 @@ def sync_run_records() -> None:
 
 
 def notify_finished() -> None:
-    rows = q("SELECT * FROM runs WHERE notified=0 AND status IN " + str(TERMINAL) + " LIMIT 10")
-
+    rows = q("SELECT * FROM runs WHERE notified=0 AND status IN " + str(TERMINAL) + " ORDER BY created_at LIMIT 10")
     for row in rows:
         params = json.loads(row["payload_json"] or "{}")
         subject = params.get("ticker") or params.get("tickers") or "—"
         label = "تحلیل" if row["mode"] == "analysis" else "بک‌تست"
-
         if row["status"] == "success":
-            emoji = "✅"
-            result_text = "موفق"
+            emoji, result_text = "✅", "موفق"
         elif row["status"] == "cancelled":
-            emoji = "🚫"
-            result_text = "لغو شد"
+            emoji, result_text = "🚫", "لغو شد"
         else:
-            emoji = "❌"
-            result_text = "ناموفق"
-
+            emoji, result_text = "❌", "ناموفق"
+        run_no = row["run_no"] or row["request_id"][:8]
         text = (
-            f"{emoji} {label} <code>{esc(subject)}</code> تمام شد.\n"
+            f"{emoji} اجرای <b>#{esc(run_no)}</b> — {label} <code>{esc(subject)}</code> تمام شد.\n"
+            f"شناسه: <code>{esc(row['request_id'][:10])}</code>\n"
             f"نتیجه: <b>{esc(result_text)}</b>\n"
+            f"Provider: <b>{esc(row['provider_name_snapshot'] or '—')}</b>\n"
+            f"Model: <b>{esc(row['model_name_snapshot'] or '—')}</b>\n"
         )
-
-        if row["status"] != "success" and row["conclusion"]:
-            text += f"دلیل: <code>{esc(row['conclusion'])}</code>\n"
-
+        if row["conclusion"]:
+            text += f"وضعیت نهایی: <code>{esc(row['conclusion'])}</code>\n"
         text += "برای دریافت گزارش کامل دکمه زیر را بزن."
-
         buttons = [[("📄 دریافت گزارش کامل", f"view_output:{row['request_id']}")]]
         if row["workflow_run_id"]:
             buttons.append([("🔗 صفحه اجرا", f"url:https://github.com/{OWNER}/{REPO}/actions/runs/{row['workflow_run_id']}")])
-
         try:
             send_message(int(row["chat_id"]), text, buttons)
         except Exception:
             sys.stderr.write(traceback.format_exc())
-
+            continue
         db("UPDATE runs SET notified=1, updated_at=? WHERE request_id=?", (now(), row["request_id"]))
 
 
@@ -824,6 +915,7 @@ def worker_loop() -> None:
             sync_run_records,
             lambda: CACHE.update(runs=fetch_active_runs()),
             notify_finished,
+            persist_state_if_dirty,
         ):
             with contextlib.suppress(Exception):
                 task()
@@ -833,80 +925,57 @@ def worker_loop() -> None:
 
 
 def cancel_run(run_id: int) -> None:
-    try:
-        gh("POST", f"/actions/runs/{run_id}/cancel", timeout=15)
-    except Exception:
-        pass
+    gh("POST", f"/actions/runs/{run_id}/cancel", timeout=15)
 
 
 def hard_cancel(chat_id: int) -> str:
     WIZARDS.pop(chat_id, None)
     FLOWS.pop(chat_id, None)
-
-    cancelled_engines = 0
-
-    try:
-        runs = fetch_active_runs()
-        for run in runs:
-            try:
-                cancel_run(run["id"])
-                cancelled_engines += 1
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    db(
-        "UPDATE runs SET status='cancelled', conclusion='cancelled_by_user', updated_at=? "
-        "WHERE chat_id=? AND status NOT IN " + str(TERMINAL),
-        (now(), chat_id),
+    with contextlib.suppress(Exception):
+        sync_run_records()
+    own_rows = q(
+        "SELECT * FROM runs WHERE chat_id=? AND status NOT IN " + str(TERMINAL) + " ORDER BY created_at DESC",
+        (chat_id,),
     )
-
-    return f"✅ همه چیز متوقف شد ({cancelled_engines} اجرای Engine)."
-
-
-def make_summary_text(row: sqlite3.Row, info: dict[str, Any]) -> str:
-    params = json.loads(row["payload_json"] or "{}")
-    subject = params.get("ticker") or params.get("tickers") or "—"
-    label = "تحلیل" if row["mode"] == "analysis" else "بک‌تست"
-
-    lines = [f"<b>📊 گزارش {label} <code>{esc(subject)}</code></b>"]
-
-    if info.get("rating"):
-        lines.append(f"🧭 نتیجه نهایی: <b>{esc(info.get('rating'))}</b>")
-    if info.get("action"):
-        lines.append(f"🧾 اقدام / سفارش: <b>{esc(info.get('action'))}</b>")
-    if info.get("entry"):
-        lines.append(f"📥 نقطه ورود: <code>{esc(info.get('entry'))}</code>")
-    if info.get("exit"):
-        lines.append(f"📤 نقطه خروج: <code>{esc(info.get('exit'))}</code>")
-    if info.get("target"):
-        lines.append(f"🎯 هدف قیمتی: <code>{esc(info.get('target'))}</code>")
-    if info.get("stop"):
-        lines.append(f"🛑 حد ضرر: <code>{esc(info.get('stop'))}</code>")
-    if info.get("confidence"):
-        lines.append(f"📈 سطح اطمینان: <b>{esc(info.get('confidence'))}</b>")
-    if info.get("horizon"):
-        lines.append(f"⏳ افق زمانی: <b>{esc(info.get('horizon'))}</b>")
-
-    summary = str(info.get("summary") or "").strip()
-    if summary:
-        lines.append("")
-        lines.append(esc(summary[:1800]))
-
-    return "\n".join(lines)[:4096]
+    remote_runs = []
+    with contextlib.suppress(Exception):
+        remote_runs = fetch_active_runs()
+    cancelled = failed = 0
+    for row in own_rows:
+        run_id = row["workflow_run_id"]
+        if not run_id:
+            match = next((r for r in remote_runs if row["request_id"] in str(r.get("display_title") or "")), None)
+            run_id = match.get("id") if match else None
+        if not run_id:
+            failed += 1
+            continue
+        try:
+            cancel_run(int(run_id))
+            db(
+                "UPDATE runs SET status='cancelled', conclusion='cancelled_by_user', workflow_run_id=?, updated_at=? "
+                "WHERE request_id=? AND chat_id=?",
+                (int(run_id), now(), row["request_id"], chat_id),
+            )
+            cancelled += 1
+        except Exception:
+            failed += 1
+    if failed:
+        return f"⚠️ لغو {cancelled} اجرا ارسال شد؛ لغو {failed} اجرا ناموفق بود. وضعیت را تازه‌سازی کن."
+    if not own_rows:
+        return "✅ اجرای فعالی برای حساب تو وجود ندارد."
+    return f"🛑 درخواست لغو برای {cancelled} اجرای متعلق به خودت ارسال شد."
 
 
 def send_output(chat_id: int, request_id: str) -> None:
-    row = q1("SELECT * FROM runs WHERE request_id=?", (request_id,))
+    row = q1("SELECT * FROM runs WHERE request_id=? AND chat_id=?", (request_id, chat_id))
     if not row:
-        send_message(chat_id, "❌ این اجرا پیدا نشد.", [[("بازگشت", "outputs")]])
+        send_message(chat_id, "❌ این اجرا پیدا نشد یا دسترسی به آن مجاز نیست.", [[("بازگشت", "outputs")]])
         return
 
     if not row["workflow_run_id"]:
         with contextlib.suppress(Exception):
             sync_run_records()
-        row = q1("SELECT * FROM runs WHERE request_id=?", (request_id,))
+        row = q1("SELECT * FROM runs WHERE request_id=? AND chat_id=?", (request_id, chat_id))
 
     run_id = row["workflow_run_id"]
     if not run_id:
@@ -935,18 +1004,28 @@ def send_output(chat_id: int, request_id: str) -> None:
         send_message(chat_id, f"❌ دریافت خروجی ناموفق: {esc(exc)}", [[("بازگشت", "outputs")]])
         return
 
-    zf = zipfile.ZipFile(io.BytesIO(raw))
-    names = zf.namelist()
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+        names = zf.namelist()
+        encrypted_name = next((name for name in names if os.path.basename(name).lower() == "results.enc"), None)
+        if encrypted_name:
+            from bot_state_store import decrypt_blob
+            decrypted_archive = decrypt_blob(zf.read(encrypted_name), OWNER, REPO, GH_TOKEN, STATE_KEY)
+            zf = zipfile.ZipFile(io.BytesIO(decrypted_archive))
+            names = zf.namelist()
+    except Exception:
+        send_message(chat_id, "❌ فایل گزارش رمزگشایی یا باز نشد؛ خروجی اصلی دست‌نخورده باقی مانده است.", [[("بازگشت", "outputs")]])
+        return
 
     info = {}
     try:
-        json_name = None
-        for name in names:
-            if os.path.basename(name).lower() == "report.json":
-                json_name = name
-                break
+        json_name = next((name for name in names if os.path.basename(name).lower() == "report.json"), None)
         if json_name:
             info = json.loads(zf.read(json_name).decode("utf-8", "replace"))
+        summary_name = next((name for name in names if os.path.basename(name).lower() == "telegram_summary.json"), None)
+        if summary_name:
+            separate = json.loads(zf.read(summary_name).decode("utf-8", "replace"))
+            info["telegram_summary"] = str(separate.get("summary") or "")
     except Exception:
         info = {}
 
@@ -1457,30 +1536,47 @@ def backtest_confirm_screen(chat_id: int, target_mid: int | None = None) -> int:
     )
 
 
+def run_status_label(status: str) -> str:
+    return {
+        "queued": "⏳ در صف",
+        "waiting": "⏳ منتظر Runner",
+        "pending": "⏳ در انتظار",
+        "in_progress": "🔵 در حال اجرا",
+        "success": "✅ تکمیل‌شده",
+        "failure": "❌ ناموفق",
+        "cancelled": "🚫 لغوشده",
+        "timed_out": "⌛ پایان مهلت",
+        "action_required": "⚠️ نیازمند اقدام",
+        "skipped": "⏭ ردشده",
+        "startup_failure": "❌ خطای شروع",
+        "stale": "⚠️ متوقف/منقضی",
+    }.get(status, f"ℹ️ {status or 'نامشخص'}")
+
+
 def active_runs_screen(chat_id: int, target_mid: int | None = None) -> int:
-    runs = list(CACHE.get("runs", []))
-    lines = ["<b>📊 اجراهای جاری</b>\nلیست پردازش‌هایی که هم‌اکنون در حال اجرا یا در صف انتظار هستند."]
+    with contextlib.suppress(Exception):
+        sync_run_records()
+    rows = q(
+        "SELECT r.*, COALESCE(NULLIF(r.model_name_snapshot,''), m.name, '—') AS model_display, "
+        "COALESCE(NULLIF(r.provider_name_snapshot,''), p.name, '—') AS provider_display "
+        "FROM runs r LEFT JOIN models m ON m.id=r.model_id LEFT JOIN providers p ON p.id=m.provider_id "
+        "WHERE r.chat_id=? AND r.status NOT IN " + str(TERMINAL) + " ORDER BY r.run_no DESC LIMIT 10",
+        (chat_id,),
+    )
+    lines = ["<b>📊 وضعیت اجراها</b>", "شناسه، وضعیت، Provider و Model هر اجرا در همین فهرست مشخص است."]
     buttons = []
-
-    if runs:
-        lines.append("")
-        for idx, run in enumerate(sorted(runs, key=lambda x: str(x.get("created_at", "")), reverse=True), 1):
-            lines.append(f"<b>#{idx}</b> 🟡 <b>{esc(run.get('display_title') or 'Engine')}</b>")
-            lines.append(f"⏱ {esc(format_run_time(run.get('created_at')))}")
-            buttons.append([("🛑 لغو #" + str(idx), f"cancelw:{run.get('id')}")])
-            lines.append("")
+    if not rows:
+        lines.append("\n✅ اجرای فعالی برای این حساب وجود ندارد.")
     else:
-        local = q("SELECT * FROM runs WHERE status NOT IN " + str(TERMINAL) + " ORDER BY created_at DESC LIMIT 5")
-        if local:
-            lines.append("")
-            for idx, row in enumerate(local, 1):
-                lines.append(f"<b>#{idx}</b> 🟡 <code>{esc(row['request_id'][:8])}</code> | <b>{esc(row['status'])}</b>")
-                if row["workflow_run_id"]:
-                    buttons.append([("🛑 لغو #" + str(idx), f"cancelw:{row['workflow_run_id']}")])
-                lines.append("")
-        else:
-            lines.append("\n✅ هیچ پردازش فعالی در حال حاضر وجود ندارد.")
-
+        for row in rows:
+            number = row["run_no"] or row["request_id"][:8]
+            params = json.loads(row["payload_json"] or "{}")
+            subject = params.get("ticker") or params.get("tickers") or "—"
+            lines.append(f"\n<b>#{esc(number)}</b> · <code>{esc(row['request_id'][:10])}</code> · <b>{esc(subject)}</b>")
+            lines.append(f"وضعیت: <b>{run_status_label(str(row['status']))}</b>")
+            lines.append(f"Provider: <b>{esc(row['provider_display'])}</b> · Model: <b>{esc(row['model_display'])}</b>")
+            lines.append(f"شروع: {esc(format_run_time(row['created_at']))}")
+            buttons.append([(f"🛑 لغو #{number}", f"cancelw:{row['request_id']}")])
     buttons.append([("🔄 تازه‌سازی", "active_runs"), ("🏠 خانه", "home")])
     return show(chat_id, "\n".join(lines), buttons, target_mid)
 
@@ -1488,65 +1584,52 @@ def active_runs_screen(chat_id: int, target_mid: int | None = None) -> int:
 def outputs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -> int:
     with contextlib.suppress(Exception):
         sync_run_records()
-
     per_page = 3
-    offset = page * per_page
-
-    rows = q(f"SELECT * FROM runs ORDER BY created_at DESC LIMIT {per_page} OFFSET {offset}")
-    total_count = q1("SELECT COUNT(*) c FROM runs")
-    total_count_val = int(total_count["c"]) if total_count else 0
-    total_pages = max(1, (total_count_val + per_page - 1) // per_page)
-
+    offset = max(0, page) * per_page
+    rows = q(f"SELECT * FROM runs WHERE chat_id=? ORDER BY run_no DESC LIMIT {per_page} OFFSET {offset}", (chat_id,))
+    total = q1("SELECT COUNT(*) c FROM runs WHERE chat_id=?", (chat_id,))
+    count = int(total["c"]) if total else 0
+    total_pages = max(1, (count + per_page - 1) // per_page)
     if not rows:
-        return show(
-            chat_id,
-            "<b>📄 خروجی‌ها</b>\nهنوز گزارشی برای نمایش وجود ندارد.",
-            [[("🏠 خانه", "home")]],
-            target_mid,
-        )
+        return show(chat_id, "<b>📄 خروجی‌ها</b>\nهنوز گزارشی برای نمایش وجود ندارد.", [[("🏠 خانه", "home")]], target_mid)
 
-    lines = [f"<b>📄 خروجی‌ها</b> (صفحه {page + 1}/{total_pages})\nلیست گزارش‌های تولیدشده.", ""]
+    lines = [f"<b>📄 خروجی‌ها</b> (صفحه {min(page + 1, total_pages)}/{total_pages})", ""]
     buttons = []
-
-    for idx, row in enumerate(rows, start=offset + 1):
+    for row in rows:
         params = json.loads(row["payload_json"] or "{}")
         subject = params.get("ticker") or params.get("tickers") or "—"
-
+        number = row["run_no"] or row["request_id"][:8]
         try:
-            created_str = dt.datetime.fromisoformat(row["created_at"].replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
+            created = dt.datetime.fromisoformat(row["created_at"].replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
         except Exception:
-            created_str = row["created_at"][:16]
-
-        is_active = row["status"] not in TERMINAL
-        status_icon = "🟡" if is_active else "✅" if row["status"] == "success" else "❌"
-
-        lines.append(f"<b>#{idx}</b> {status_icon} <code>{esc(row['request_id'][:8])}</code> <b>{esc(subject)}</b> | {esc(created_str)}")
-
-        btn_row = [("📄 گزارش #" + str(idx), f"view_output:{row['request_id']}")]
-        if is_active:
-            btn_row.append(("⚠️ در حال اجرا", "noop"))
-        else:
-            btn_row.append(("🗑 حذف #" + str(idx), f"ask_delete:{row['request_id']}"))
-
-        buttons.append(btn_row)
-
-    nav_row = []
+            created = str(row["created_at"])[:16]
+        status = str(row["status"])
+        icon = "⏳" if status in ("queued", "waiting", "pending") else (
+            "🔵" if status == "in_progress" else "✅" if status == "success" else "🚫" if status == "cancelled" else "❌"
+        )
+        lines.append(f"<b>#{esc(number)}</b> {icon} <code>{esc(row['request_id'][:10])}</code> <b>{esc(subject)}</b> · {esc(created)}")
+        lines.append(f"وضعیت: <b>{run_status_label(status)}</b>")
+        lines.append(f"Provider: <b>{esc(row['provider_name_snapshot'] or '—')}</b> · Model: <b>{esc(row['model_name_snapshot'] or '—')}</b>")
+        row_buttons = [(f"📄 گزارش #{number}", f"view_output:{row['request_id']}")]
+        if status in TERMINAL:
+            row_buttons.append((f"🗑 حذف #{number}", f"ask_delete:{row['request_id']}"))
+        buttons.append(row_buttons)
+    nav = []
     if page > 0:
-        nav_row.append(("◀️ قبلی", f"outputs_page:{page - 1}"))
+        nav.append(("◀️ قبلی", f"outputs_page:{page - 1}"))
     if page < total_pages - 1:
-        nav_row.append(("بعدی ▶️", f"outputs_page:{page + 1}"))
-    if nav_row:
-        buttons.append(nav_row)
-
+        nav.append(("بعدی ▶️", f"outputs_page:{page + 1}"))
+    if nav:
+        buttons.append(nav)
     buttons.append([("🧹 پاک‌سازی", "bulk_delete_menu"), ("🔄 تازه‌سازی", "outputs_refresh")])
     buttons.append([("🏠 خانه", "home")])
     return show(chat_id, "\n".join(lines), buttons, target_mid)
 
 
 def ask_delete_screen(chat_id: int, request_id: str, target_mid: int | None = None) -> int:
-    row = q1("SELECT * FROM runs WHERE request_id=?", (request_id,))
+    row = q1("SELECT * FROM runs WHERE request_id=? AND chat_id=?", (request_id, chat_id))
     if not row:
-        return show(chat_id, "❌ پیدا نشد.", [[("بازگشت", "outputs")]], target_mid)
+        return show(chat_id, "❌ گزارش پیدا نشد یا دسترسی به آن مجاز نیست.", [[("بازگشت", "outputs")]], target_mid)
 
     params = json.loads(row["payload_json"] or "{}")
     subject = params.get("ticker") or params.get("tickers") or "—"
@@ -1582,7 +1665,13 @@ def bulk_confirm_screen(chat_id: int, scope: str, target_mid: int | None = None)
     )
 
 
-def handle_text(chat_id: int, text: str, target_mid: int) -> None:
+def handle_text(chat_id: int, text: str, target_mid: int, chat_type: str = "private") -> None:
+    if chat_type != "private":
+        if chat_id in WIZARDS and WIZARDS[chat_id].get("stage") == "token":
+            with contextlib.suppress(Exception):
+                tg("deleteMessage", {"chat_id": chat_id, "message_id": target_mid})
+            WIZARDS.pop(chat_id, None)
+        return
     text = text.strip()
 
     if text.lower() == "/cancel":
@@ -1692,9 +1781,25 @@ def callback(query: dict[str, Any]) -> None:
         return
 
     message = query.get("message") or {}
-    chat_id = int(message.get("chat", {}).get("id", user_id))
+    chat = message.get("chat") or {}
+    if chat.get("type") != "private":
+        answer_callback(query["id"], "برای امنیت، ربات را در گفت‌وگوی خصوصی باز کن.", True)
+        return
+    chat_id = int(chat.get("id", user_id))
     cb_mid = int(message.get("message_id", 0))
     data = query.get("data", "")
+
+    admin_only = (
+        data in {"model_add", "wizard_manual_model", "fetch_models_list", "model_delete_menu"}
+        or data.startswith((
+            "ask_delete_provider:", "confirm_delete_provider:", "manual_model_for_prov:",
+            "pmd_select:", "mdt_select:", "delete_model:", "activate:", "test_model:",
+            "pmd_test:", "mdt_test:", "md_temp:", "md:", "bulk_do:all",
+        ))
+    )
+    if admin_only and not admin(user_id):
+        answer_callback(query["id"], "این عملیات فقط برای Admin مجاز است.", True)
+        return
 
     if data.startswith("test_model:") or data.startswith("pmd_test:") or data.startswith("mdt_test:"):
         answer_callback(query["id"], "⏳ در حال تست...", False)
@@ -1931,6 +2036,8 @@ def callback(query: dict[str, Any]) -> None:
             ).start()
 
         elif data.startswith("activate:"):
+            if not admin(user_id):
+                raise ValueError("فقط Admin.")
             row = q1("SELECT * FROM models WHERE id=? AND enabled=1", (data.split(":", 1)[1],))
             if not row:
                 raise ValueError("مدل پیدا نشد.")
@@ -1968,13 +2075,27 @@ def callback(query: dict[str, Any]) -> None:
             active_runs_screen(chat_id, cb_mid)
 
         elif data.startswith("cancelw:"):
-            run_id = int(data.split(":", 1)[1])
-            try:
-                cancel_run(run_id)
-                answer_callback(query["id"], "🛑 لغو شد.", True)
-                active_runs_screen(chat_id, cb_mid)
-            except Exception as exc:
-                show(chat_id, f"<b>❌ لغو ناموفق</b>\n{esc(exc)}", [[("بازگشت", "active_runs")]], cb_mid)
+            request_id = data.split(":", 1)[1]
+            row = q1("SELECT * FROM runs WHERE request_id=? AND chat_id=?", (request_id, chat_id))
+            if not row:
+                raise ValueError("این اجرا متعلق به حساب تو نیست یا پیدا نشد.")
+            if row["status"] in TERMINAL:
+                raise ValueError("این اجرا قبلاً پایان یافته است.")
+            run_id = row["workflow_run_id"]
+            if not run_id:
+                candidates = fetch_active_runs()
+                match = next((r for r in candidates if request_id in str(r.get("display_title") or "")), None)
+                run_id = match.get("id") if match else None
+            if not run_id:
+                raise ValueError("شناسه اجرای GitHub هنوز آماده نیست؛ چند لحظه دیگر تازه‌سازی کن.")
+            cancel_run(int(run_id))
+            db(
+                "UPDATE runs SET status='cancelled',conclusion='cancelled_by_user',workflow_run_id=?,updated_at=? "
+                "WHERE request_id=? AND chat_id=?",
+                (int(run_id), now(), request_id, chat_id),
+            )
+            answer_callback(query["id"], "🛑 درخواست لغو ارسال شد.", True)
+            active_runs_screen(chat_id, cb_mid)
 
         elif data == "outputs":
             outputs_screen(chat_id, page=0, target_mid=cb_mid)
@@ -1993,7 +2114,11 @@ def callback(query: dict[str, Any]) -> None:
             ask_delete_screen(chat_id, data.split(":", 1)[1], cb_mid)
 
         elif data.startswith("confirm_delete:"):
-            db("DELETE FROM runs WHERE request_id=?", (data.split(":", 1)[1],))
+            request_id = data.split(":", 1)[1]
+            row = q1("SELECT request_id FROM runs WHERE request_id=? AND chat_id=?", (request_id, chat_id))
+            if not row:
+                raise ValueError("این گزارش متعلق به حساب تو نیست یا حذف شده است.")
+            db("DELETE FROM runs WHERE request_id=? AND chat_id=?", (request_id, chat_id))
             answer_callback(query["id"], "✅ حذف شد.", True)
             outputs_screen(chat_id, page=0, target_mid=cb_mid)
 
@@ -2006,10 +2131,10 @@ def callback(query: dict[str, Any]) -> None:
         elif data.startswith("bulk_do:"):
             scope = data.split(":", 1)[1]
             if scope == "all":
-                cur = db("DELETE FROM runs")
+                cur = db("DELETE FROM runs WHERE chat_id=?", (chat_id,))
             else:
                 cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=int(scope))).isoformat()
-                cur = db("DELETE FROM runs WHERE created_at < ?", (cutoff,))
+                cur = db("DELETE FROM runs WHERE chat_id=? AND created_at < ?", (chat_id, cutoff))
 
             answer_callback(query["id"], f"✅ {cur.rowcount if cur else 0} حذف شد.", True)
             outputs_screen(chat_id, page=0, target_mid=cb_mid)
@@ -2181,7 +2306,10 @@ def poll() -> None:
                     elif "message" in update and update["message"].get("text"):
                         if authorized(int(update["message"]["from"]["id"])):
                             msg = update["message"]
-                            handle_text(int(msg["chat"]["id"]), msg["text"], int(msg["message_id"]))
+                            handle_text(
+                                int(msg["chat"]["id"]), msg["text"], int(msg["message_id"]),
+                                str(msg.get("chat", {}).get("type", "private")),
+                            )
                 except Exception:
                     sys.stderr.write(traceback.format_exc())
 
