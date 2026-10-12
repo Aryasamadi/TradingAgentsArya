@@ -2274,6 +2274,14 @@ def poll() -> None:
         raise SystemExit("TELEGRAM_BOT_TOKEN is required")
     if not GH_TOKEN:
         raise SystemExit("BOT_GITHUB_TOKEN is required")
+    if not STATE_KEY:
+        raise SystemExit("BOT_STATE_KEY is required for encrypted durable state and per-run model configuration")
+    try:
+        persist_state_if_dirty()
+        if STATE_DIRTY:
+            raise SystemExit("Encrypted state backup is not working; refusing to start without durable persistence")
+    except Exception as exc:
+        raise SystemExit(f"Encrypted state backup failed: {type(exc).__name__}") from exc
     if not ADMIN_IDS and not ALLOWED_IDS:
         raise SystemExit("TELEGRAM_ADMIN_IDS or TELEGRAM_ALLOWED_USER_IDS is required")
 
