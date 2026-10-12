@@ -1103,7 +1103,8 @@ def send_output(chat_id: int, request_id: str) -> None:
     params = json.loads(row["payload_json"] or "{}")
     subject = params.get("ticker") or params.get("tickers") or "—"
 
-    caption = f"📄 گزارش PDF {label} {subject}"[:1024]
+    run_number = row["run_no"] or request_id[:8]
+    caption = f"📄 گزارش PDF #{run_number} · {request_id[:10]} · {label} {subject}"[:1024]
 
     try:
         tg_document(chat_id, "TradingAgents_Report.pdf", pdf_bytes, caption)
