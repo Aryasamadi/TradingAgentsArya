@@ -1220,7 +1220,10 @@ def home_screen(chat_id: int, force_new: bool = False, target_mid: int | None = 
     mrow = q1("SELECT name FROM models WHERE id=?", (aid,)) if aid else None
     model_line = f"مدل فعال: <b>{esc(mrow['name'])}</b>" if mrow else "مدل فعال: <b>تنظیم نشده</b>"
 
-    busy_row = q1("SELECT COUNT(*) c FROM runs WHERE status NOT IN " + str(TERMINAL))
+    busy_row = q1(
+        "SELECT COUNT(*) c FROM runs WHERE chat_id=? AND status NOT IN " + str(TERMINAL),
+        (chat_id,),
+    )
     busy = int(busy_row["c"]) if busy_row else 0
     live = f"\n🟡 اجرای فعال: <b>{busy}</b>" if busy else ""
 
@@ -1279,11 +1282,12 @@ def models_screen(chat_id: int, page: int = 0, target_mid: int | None = None) ->
         if nav_row:
             buttons.append(nav_row)
 
-    buttons += [
-        [("➕ افزودن مدل", "model_add"), ("📋 پرووایدرها", "providers_menu")],
-        [("🗑 حذف مدل", "model_delete_menu")],
-        [("🏠 خانه", "home")],
-    ]
+    if admin(chat_id):
+        buttons += [
+            [("➕ افزودن مدل", "model_add"), ("📋 پرووایدرها", "providers_menu")],
+            [("🗑 حذف مدل", "model_delete_menu")],
+        ]
+    buttons.append([("🏠 خانه", "home")])
 
     return show(chat_id, text, buttons, target_mid)
 
@@ -1890,8 +1894,12 @@ def callback(query: dict[str, Any]) -> None:
     data = query.get("data", "")
 
     admin_only = (
-        data in {"model_add", "wizard_manual_model", "fetch_models_list", "model_delete_menu"}
+        data in {
+            "model_add", "wizard_manual_model", "fetch_models_list", "model_delete_menu",
+            "providers_menu", "model_test_menu",
+        }
         or data.startswith((
+            "provider_detail:", "list_provider_models:", "prov_models_page:",
             "ask_delete_provider:", "confirm_delete_provider:", "manual_model_for_prov:",
             "pmd_select:", "mdt_select:", "delete_model:", "activate:", "test_model:",
             "pmd_test:", "mdt_test:", "md_temp:", "md:", "bulk_do:all",
