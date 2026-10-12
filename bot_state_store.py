@@ -108,6 +108,34 @@ def _api(
         raise StateStoreError(f"GitHub state API unavailable: {type(exc).__name__}") from exc
 
 
+def _local_database_has_records(local: pathlib.Path) -> bool:
+    """Distinguish a real local database from a newly created empty SQLite shell."""
+    if not local.exists() or local.stat().st_size == 0:
+        return False
+    try:
+        db = sqlite3.connect(f"file:{local}?mode=ro", uri=True, timeout=5)
+        try:
+            check = db.execute("PRAGMA quick_check").fetchone()
+            if not check or check[0] != "ok":
+                raise StateStoreError("Local database failed SQLite integrity check; it was not overwritten.")
+            tables = {
+                str(row[0])
+                for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            for table in ("providers", "models", "runs"):
+                if table in tables and int(db.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]) > 0:
+                    return True
+            return False
+        finally:
+            db.close()
+    except StateStoreError:
+        raise
+    except Exception as exc:
+        raise StateStoreError(
+            "Existing local database cannot be read; refusing to overwrite it automatically."
+        ) from exc
+
+
 def restore_state_if_missing(
     path: str,
     owner: str,
@@ -117,11 +145,11 @@ def restore_state_if_missing(
     branch: str = "bot-state",
     fallback_branch: str = "main",
 ) -> bool:
-    """Restore a missing/empty SQLite file; never overwrite a non-empty local DB."""
+    """Restore durable state when local DB is missing or is only an empty SQLite shell."""
     local = pathlib.Path(path)
     if path == ":memory:":
         return False
-    if local.exists() and local.stat().st_size > 0:
+    if _local_database_has_records(local):
         return False
     if not token:
         return False
