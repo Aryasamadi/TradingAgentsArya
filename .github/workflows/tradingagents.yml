@@ -282,6 +282,7 @@ jobs:
           [[ -n "${TRADINGAGENTS_LLM_BACKEND_URL:-}" ]] || { echo "Missing active model Base URL."; exit 3; }
 
       - name: Build and run agent command
+        id: run_engine
         run: |
           set -euo pipefail
           mkdir -p .runtime/run
@@ -879,7 +880,7 @@ jobs:
           PY
 
       - name: Create independent Telegram summary
-        if: always()
+        if: always() && steps.run_engine.outcome == 'success'
         env:
           BOT_STATE_KEY: ${{ secrets.BOT_STATE_KEY }}
         run: |
