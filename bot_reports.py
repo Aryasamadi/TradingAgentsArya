@@ -43,6 +43,12 @@ def make_summary_text(row: Mapping[str, Any], info: Mapping[str, Any]) -> str:
     lines.append(f"🔌 Provider: <b>{_esc(provider)}</b>")
     lines.append(f"🤖 Model: <b>{_esc(model)}</b>")
 
+    # Financial values for this separate Telegram view must come from the exact-copy
+    # field written alongside (not instead of) the PDF's display-oriented fields.
+    exact_financial_fields = info.get("telegram_financial_fields")
+    if not isinstance(exact_financial_fields, dict):
+        exact_financial_fields = {}
+
     field_labels = (
         ("rating", "نتیجه نهایی"),
         ("action", "اقدام / سفارش"),
@@ -55,9 +61,16 @@ def make_summary_text(row: Mapping[str, Any], info: Mapping[str, Any]) -> str:
         ("confidence", "سطح اطمینان"),
         ("horizon", "افق زمانی"),
     )
-    missing_labels = {"amount": "در خروجی صریحاً مشخص نشده", "value": "در خروجی صریحاً مشخص نشده"}
+    missing_labels = {
+        "entry": "نسخهٔ دقیق منبع در دسترس نیست",
+        "exit": "نسخهٔ دقیق منبع در دسترس نیست",
+        "target": "نسخهٔ دقیق منبع در دسترس نیست",
+        "stop": "نسخهٔ دقیق منبع در دسترس نیست",
+        "amount": "در خروجی صریحاً مشخص نشده",
+        "value": "در خروجی صریحاً مشخص نشده",
+    }
     for key, label_text in field_labels:
-        value = info.get(key)
+        value = exact_financial_fields.get(key) if key in exact_financial_fields or key in {"entry", "exit", "target", "stop", "amount", "value"} else info.get(key)
         if value is None or str(value).strip() in ("", "—", "-"):
             if key in missing_labels:
                 lines.append(f"📌 {label_text}: <i>{missing_labels[key]}</i>")
