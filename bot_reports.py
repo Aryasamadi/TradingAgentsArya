@@ -21,8 +21,14 @@ def make_summary_text(row: Mapping[str, Any], info: Mapping[str, Any]) -> str:
     label = "تحلیل" if mode == "analysis" else "بک‌تست"
     lines = [f"<b>📊 گزارش {label} <code>{_esc(subject)}</code></b>"]
 
-    provider = str(row["provider_name_snapshot"] or row["provider_name"] or "—")
-    model = str(row["model_name_snapshot"] or row["model_name"] or "—")
+    try:
+        provider = str(row["provider_name_snapshot"] or "—")
+    except (KeyError, IndexError):
+        provider = "—"
+    try:
+        model = str(row["model_name_snapshot"] or "—")
+    except (KeyError, IndexError):
+        model = "—"
     lines.append(f"🔌 Provider: <b>{_esc(provider)}</b>")
     lines.append(f"🤖 Model: <b>{_esc(model)}</b>")
 
