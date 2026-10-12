@@ -278,11 +278,13 @@ def gh(method: str, path: str, data: Any = None, timeout: int = 30):
     return obj
 
 
-def persist_state_if_dirty() -> None:
-    """Periodically save encrypted DB bytes to the dedicated state branch."""
+def persist_state_if_dirty() -> bool:
+    """Save encrypted DB bytes to the dedicated state branch; report whether this save succeeded."""
     global STATE_DIRTY, _STATE_SAVE_RETRY_AFTER
-    if not STATE_DIRTY or STATE_PATH == ":memory:" or time.monotonic() < _STATE_SAVE_RETRY_AFTER:
-        return
+    if not STATE_DIRTY:
+        return True
+    if STATE_PATH == ":memory:" or time.monotonic() < _STATE_SAVE_RETRY_AFTER:
+        return False
     try:
         with DB_LOCK:
             DB.commit()
@@ -294,9 +296,11 @@ def persist_state_if_dirty() -> None:
             if STATE_VERSION == version:
                 STATE_DIRTY = False
         _STATE_SAVE_RETRY_AFTER = 0.0
+        return True
     except Exception as exc:
         _STATE_SAVE_RETRY_AFTER = time.monotonic() + 60.0
         sys.stderr.write(f"Encrypted state backup failed; retrying: {type(exc).__name__}: {exc}\n")
+        return False
 
 
 def gh_bytes(path: str) -> bytes:
@@ -591,9 +595,9 @@ def save_provider(name: str, provider_type: str, base_url: str, token: str) -> s
     )
     if cur is None:
         raise RuntimeError("Provider در پایگاه داده ذخیره نشد.")
-    persist_state_if_dirty()
-    if STATE_DIRTY:
-        raise RuntimeError("Provider ذخیره محلی شد اما پشتیبان رمزگذاری‌شده GitHub به‌روز نشد؛ ربات را راه‌اندازی مجدد نکن.")
+    if not persist_state_if_dirty():
+        db("DELETE FROM providers WHERE id=?", (prov_id,))
+        raise RuntimeError("پشتیبان رمزگذاری‌شده GitHub به‌روز نشد؛ Provider ذخیره نشد. دوباره تلاش کن.")
     return prov_id
 
 
@@ -615,10 +619,14 @@ def active_model_id() -> str:
 
 
 def set_active_model(model_id: str) -> None:
+    previous = active_model_id()
     set_setting("active_model", model_id)
-    persist_state_if_dirty()
-    if STATE_DIRTY:
-        raise RuntimeError("مدل محلی فعال شد اما وضعیت رمزگذاری‌شده GitHub ذخیره نشد؛ از راه‌اندازی مجدد خودداری کن تا پشتیبان برقرار شود.")
+    if not persist_state_if_dirty():
+        if previous:
+            set_setting("active_model", previous)
+        else:
+            db("DELETE FROM settings WHERE key='active_model'")
+        raise RuntimeError("پشتیبان رمزگذاری‌شده GitHub به‌روز نشد؛ انتخاب مدل ثبت نشد. دوباره تلاش کن.")
 
 
 def github_secret(name: str, value: str) -> None:
