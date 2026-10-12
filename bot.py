@@ -2157,12 +2157,23 @@ def callback(query: dict[str, Any]) -> None:
                 raise ValueError("فقط Admin.")
 
             model_id = data.split(":", 1)[1]
-            db("UPDATE models SET enabled=0 WHERE id=?", (model_id,))
+            model = q1("SELECT * FROM models WHERE id=?", (model_id,))
+            if not model:
+                raise ValueError("مدل پیدا نشد.")
+            was_active = active_model_id() == model_id
+            cur = db("UPDATE models SET enabled=0 WHERE id=?", (model_id,))
+            if cur is None:
+                raise RuntimeError("وضعیت مدل در پایگاه داده تغییر نکرد.")
+            try:
+                if was_active:
+                    set_active_model("")
+                elif not persist_state_if_dirty():
+                    raise RuntimeError("پشتیبان پایدار GitHub به‌روز نشد.")
+            except Exception:
+                db("UPDATE models SET enabled=1 WHERE id=?", (model_id,))
+                raise
 
-            if active_model_id() == model_id:
-                set_active_model("")
-
-            answer_callback(query["id"], "🗑 حذف شد.", True)
+            answer_callback(query["id"], "🗑 مدل حذف شد.", True)
 
             last_page = int(get_setting(f"last_models_page_{chat_id}", "0"))
             models_screen(chat_id, page=last_page, target_mid=cb_mid)
@@ -2227,11 +2238,39 @@ def callback(query: dict[str, Any]) -> None:
         elif data.startswith("bulk_do:"):
             scope = data.split(":", 1)[1]
             if scope == "all":
+                removed = q("SELECT * FROM runs WHERE chat_id=?", (chat_id,))
                 cur = db("DELETE FROM runs WHERE chat_id=?", (chat_id,))
             else:
                 cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=int(scope))).isoformat()
+                removed = q(
+                    "SELECT * FROM runs WHERE chat_id=? AND created_at < ?",
+                    (chat_id, cutoff),
+                )
                 cur = db("DELETE FROM runs WHERE chat_id=? AND created_at < ?", (chat_id, cutoff))
-
+            if cur is None:
+                raise RuntimeError("پاک‌سازی تاریخچه در پایگاه داده انجام نشد.")
+            if not persist_state_if_dirty():
+                columns = (
+                    "request_id", "workflow_run_id", "chat_id", "mode", "payload_json", "model_id",
+                    "run_no", "model_name_snapshot", "provider_name_snapshot", "provider_type_snapshot",
+                    "status", "conclusion", "notified", "created_at", "updated_at",
+                )
+                placeholders = ",".join("?" for _ in columns)
+                try:
+                    with DB_LOCK:
+                        DB.execute("BEGIN IMMEDIATE")
+                        for old_row in removed:
+                            DB.execute(
+                                f"INSERT OR REPLACE INTO runs({','.join(columns)}) VALUES({placeholders})",
+                                tuple(old_row[column] for column in columns),
+                            )
+                        DB.commit()
+                        STATE_VERSION += 1
+                        STATE_DIRTY = True
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        DB.rollback()
+                raise RuntimeError("پاک‌سازی در پشتیبان پایدار ذخیره نشد؛ گزارش‌ها برای جلوگیری از گم‌شدن بازگردانده شدند.")
             answer_callback(query["id"], f"✅ {cur.rowcount if cur else 0} حذف شد.", True)
             outputs_screen(chat_id, page=0, target_mid=cb_mid)
 
