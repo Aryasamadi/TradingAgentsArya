@@ -168,6 +168,8 @@ DB_LOCK = threading.Lock()
 STATE_DIRTY = True
 STATE_VERSION = 0
 _STATE_SAVE_RETRY_AFTER = 0.0
+_STATE_LAST_SAVE_AT = 0.0
+_STATE_BACKUP_INTERVAL_SECONDS = 300.0
 
 CACHE: dict[str, Any] = {"runs": [], "ts": 0.0}
 WIZARDS: dict[int, dict[str, Any]] = {}
@@ -289,13 +291,15 @@ def gh(method: str, path: str, data: Any = None, timeout: int = 30):
     return obj
 
 
-def persist_state_if_dirty() -> bool:
+def persist_state_if_dirty(force: bool = False) -> bool:
     """Save encrypted DB bytes to the dedicated state branch; report whether this save succeeded."""
-    global STATE_DIRTY, _STATE_SAVE_RETRY_AFTER
+    global STATE_DIRTY, _STATE_SAVE_RETRY_AFTER, _STATE_LAST_SAVE_AT
     if not STATE_DIRTY:
         return True
     if STATE_PATH == ":memory:" or time.monotonic() < _STATE_SAVE_RETRY_AFTER:
         return False
+    if not force and _STATE_LAST_SAVE_AT and time.monotonic() - _STATE_LAST_SAVE_AT < _STATE_BACKUP_INTERVAL_SECONDS:
+        return True
     try:
         with DB_LOCK:
             DB.commit()
@@ -306,6 +310,7 @@ def persist_state_if_dirty() -> bool:
         with DB_LOCK:
             if STATE_VERSION == version:
                 STATE_DIRTY = False
+        _STATE_LAST_SAVE_AT = time.monotonic()
         _STATE_SAVE_RETRY_AFTER = 0.0
         return True
     except Exception as exc:
@@ -606,7 +611,7 @@ def save_provider(name: str, provider_type: str, base_url: str, token: str) -> s
     )
     if cur is None:
         raise RuntimeError("Provider در پایگاه داده ذخیره نشد.")
-    if not persist_state_if_dirty():
+    if not persist_state_if_dirty(force=True):
         db("DELETE FROM providers WHERE id=?", (prov_id,))
         raise RuntimeError("پشتیبان رمزگذاری‌شده GitHub به‌روز نشد؛ Provider ذخیره نشد. دوباره تلاش کن.")
     return prov_id
@@ -636,7 +641,7 @@ def delete_provider(prov_id: str) -> None:
             DB.rollback()
         raise RuntimeError("حذف Provider در پایگاه داده کامل نشد.") from exc
 
-    if not persist_state_if_dirty():
+    if not persist_state_if_dirty(force=True):
         # Keep local and remote state consistent if the deletion cannot be backed up.
         try:
             with DB_LOCK:
@@ -672,7 +677,7 @@ def active_model_id() -> str:
 def set_active_model(model_id: str) -> None:
     previous = active_model_id()
     set_setting("active_model", model_id)
-    if not persist_state_if_dirty():
+    if not persist_state_if_dirty(force=True):
         if previous:
             set_setting("active_model", previous)
         else:
@@ -921,7 +926,7 @@ def dispatch_run(chat_id: int, mode: str, params: dict) -> str:
 
     # Persist the numbered request before dispatching it, so a restart cannot leave
     # a real engine execution without a matching local/remote run record.
-    if not persist_state_if_dirty():
+    if not persist_state_if_dirty(force=True):
         db(
             "UPDATE runs SET status='failure', conclusion='state_backup_failed', updated_at=? WHERE request_id=?",
             (now(), request_id),
@@ -2176,7 +2181,7 @@ def callback(query: dict[str, Any]) -> None:
             try:
                 if was_active:
                     set_active_model("")
-                elif not persist_state_if_dirty():
+                elif not persist_state_if_dirty(force=True):
                     raise RuntimeError("پشتیبان پایدار GitHub به‌روز نشد.")
             except Exception:
                 db("UPDATE models SET enabled=1 WHERE id=?", (model_id,))
@@ -2258,7 +2263,7 @@ def callback(query: dict[str, Any]) -> None:
                 cur = db("DELETE FROM runs WHERE chat_id=? AND created_at < ?", (chat_id, cutoff))
             if cur is None:
                 raise RuntimeError("پاک‌سازی تاریخچه در پایگاه داده انجام نشد.")
-            if not persist_state_if_dirty():
+            if not persist_state_if_dirty(force=True):
                 columns = (
                     "request_id", "workflow_run_id", "chat_id", "mode", "payload_json", "model_id",
                     "run_no", "model_name_snapshot", "provider_name_snapshot", "provider_type_snapshot",
@@ -2424,7 +2429,7 @@ def poll() -> None:
     if not STATE_KEY:
         raise SystemExit("BOT_STATE_KEY is required for encrypted durable state and per-run model configuration")
     try:
-        persist_state_if_dirty()
+        persist_state_if_dirty(force=True)
         if STATE_DIRTY:
             raise SystemExit("Encrypted state backup is not working; refusing to start without durable persistence")
     except Exception as exc:
