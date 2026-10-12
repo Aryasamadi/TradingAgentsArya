@@ -1723,6 +1723,9 @@ def handle_text(chat_id: int, text: str, target_mid: int, chat_type: str = "priv
                 wizard_token_screen(chat_id, target_mid)
 
             elif stage == "token":
+                # API secrets should not remain in Telegram chat history.
+                with contextlib.suppress(Exception):
+                    tg("deleteMessage", {"chat_id": chat_id, "message_id": target_mid})
                 if item.get("provider_type") == "ollama" and text.strip().lower() in ("-", "none", "no", "empty"):
                     item["token"] = ""
                 elif len(text) < 3:
@@ -1756,7 +1759,7 @@ def handle_text(chat_id: int, text: str, target_mid: int, chat_type: str = "priv
                     target_mid,
                 )
 
-        except ValueError as exc:
+        except Exception as exc:
             show(chat_id, f"<b>⚠️ {esc(exc)}</b>\nلطفاً دوباره تلاش کنید.", [[("❌ لغو", "wizard_cancel")]], target_mid)
 
         return
