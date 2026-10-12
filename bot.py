@@ -1874,6 +1874,7 @@ def handle_text(chat_id: int, text: str, target_mid: int, chat_type: str = "priv
 
 
 def callback(query: dict[str, Any]) -> None:
+    global STATE_DIRTY, STATE_VERSION
     user_id = int(query.get("from", {}).get("id", 0))
     if not authorized(user_id):
         answer_callback(query["id"], "دسترسی مجاز نیست.", True)
