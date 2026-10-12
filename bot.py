@@ -668,11 +668,11 @@ def add_model_from_provider(prov_id: str, model_name: str) -> str:
     existing = q1("SELECT id FROM models WHERE name=? AND provider_id=? AND enabled=1", (model_name, prov_id))
     if existing:
         model_id = str(existing["id"])
+        set_active_model(model_id)
         row = q1("SELECT * FROM models WHERE id=?", (model_id,))
         if row:
             with contextlib.suppress(Exception):
                 write_active_model_secrets(row)
-        set_active_model(model_id)
         return model_id
 
     model_id = "m_" + uuid.uuid4().hex[:12]
@@ -683,12 +683,17 @@ def add_model_from_provider(prov_id: str, model_name: str) -> str:
     if cur is None:
         raise RuntimeError("مدل در پایگاه داده ذخیره نشد.")
 
+    try:
+        set_active_model(model_id)
+    except Exception:
+        # The encrypted remote snapshot wasn't updated; don't leave a supposedly saved model behind.
+        db("DELETE FROM models WHERE id=?", (model_id,))
+        raise
+
     row = q1("SELECT * FROM models WHERE id=?", (model_id,))
     if row:
         with contextlib.suppress(Exception):
             write_active_model_secrets(row)
-
-    set_active_model(model_id)
     return model_id
 
 
