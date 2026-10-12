@@ -339,6 +339,14 @@ jobs:
               "summary": "",
               "decision": "",
           }
+          telegram_financial_fields = {
+              "entry": "",
+              "exit": "",
+              "target": "",
+              "stop": "",
+              "amount": "",
+              "value": "",
+          }
 
           sections = []
           all_texts = []
@@ -405,6 +413,11 @@ jobs:
               if value is not None and value != "" and not fields.get(key):
                   fields[key] = str(value)
 
+          def set_telegram_financial_field(key, value):
+              # Separate presentation field: preserve source characters, unlike PDF formatting.
+              if key in telegram_financial_fields and value is not None and value != "" and not telegram_financial_fields[key]:
+                  telegram_financial_fields[key] = str(value)
+
           def find_value(text, patterns):
               if not text:
                   return ""
@@ -429,28 +442,42 @@ jobs:
                   r"(?:action|recommendation|اقدام|سفارش|عملیات|پیشنهاد معامله)\s*[:：]?\s*([^\n]{1,220})",
               ]))
 
-              set_field("entry", find_value(text, [
+              entry_patterns = [
                   r"(?:entry\s*point|entry\s*price|buy\s*price|entry|نقطه ورود|قیمت ورود|ورود)\s*[:：]?\s*([^\n]{1,220})",
-              ]))
+              ]
+              set_field("entry", find_value(text, entry_patterns))
+              set_telegram_financial_field("entry", find_value(text, entry_patterns))
 
-              set_field("exit", find_value(text, [
+              exit_patterns = [
                   r"(?:exit\s*point|exit\s*price|sell\s*price|exit|نقطه خروج|قیمت خروج|خروج)\s*[:：]?\s*([^\n]{1,220})",
-              ]))
+              ]
+              set_field("exit", find_value(text, exit_patterns))
+              set_telegram_financial_field("exit", find_value(text, exit_patterns))
 
-              set_field("target", find_value(text, [
+              target_patterns = [
                   r"(?:price\s*target|target\s*price|target|قیمت هدف|هدف قیمتی|هدف)\s*[:：]?\s*([^\n]{1,220})",
-              ]))
+              ]
+              set_field("target", find_value(text, target_patterns))
+              set_telegram_financial_field("target", find_value(text, target_patterns))
 
-              set_field("stop", find_value(text, [
+              stop_patterns = [
                   r"(?:stop\s*loss|stop|حد ضرر|استاپ ضرر|استاپ)\s*[:：]?\s*([^\n]{1,220})",
-              ]))
+              ]
+              set_field("stop", find_value(text, stop_patterns))
+              set_telegram_financial_field("stop", find_value(text, stop_patterns))
 
-              set_exact_field("amount", find_value(text, [
+              amount_patterns = [
                   r"(?:position\s*size|trade\s*size|trade\s*amount|quantity|amount\s*of\s*(?:shares|units)|حجم معامله|مقدار معامله|تعداد واحد|تعداد سهام)\s*[:：]\s*([^\n]{1,220})",
-              ]))
-              set_exact_field("value", find_value(text, [
+              ]
+              value_patterns = [
                   r"(?:notional\s*value|position\s*value|trade\s*value|value\s*of\s*position|ارزش معامله|ارزش موقعیت|ارزش پوزیشن)\s*[:：]\s*([^\n]{1,220})",
-              ]))
+              ]
+              amount_value = find_value(text, amount_patterns)
+              trade_value = find_value(text, value_patterns)
+              set_exact_field("amount", amount_value)
+              set_exact_field("value", trade_value)
+              set_telegram_financial_field("amount", amount_value)
+              set_telegram_financial_field("value", trade_value)
 
               set_field("confidence", find_value(text, [
                   r"(?:confidence|level of confidence|سطح اطمینان|اطمینان)\s*[:：]?\s*([^\n]{1,220})",
@@ -475,6 +502,19 @@ jobs:
                           continue
 
                       if isinstance(value, str):
+                          if low_key in {"entry", "entry_price", "buy_price"}:
+                              set_telegram_financial_field("entry", value)
+                          elif low_key in {"exit", "exit_price", "sell_price"}:
+                              set_telegram_financial_field("exit", value)
+                          elif low_key in {"target", "target_price", "price_target"}:
+                              set_telegram_financial_field("target", value)
+                          elif low_key in {"stop", "stop_loss"}:
+                              set_telegram_financial_field("stop", value)
+                          elif low_key in {"amount", "quantity", "position_size", "trade_size", "shares", "units"}:
+                              set_telegram_financial_field("amount", value)
+                          elif low_key in {"position_value", "trade_value", "notional", "notional_value"}:
+                              set_telegram_financial_field("value", value)
+
                           text = value.strip()
                           if not text:
                               continue
@@ -834,6 +874,10 @@ jobs:
               "stop": fields["stop"],
               "amount": fields["amount"],
               "value": fields["value"],
+              "telegram_financial_fields": {
+                  key: (value if value != "" else "—")
+                  for key, value in telegram_financial_fields.items()
+              },
               "confidence": fields["confidence"],
               "horizon": fields["horizon"],
               "summary": fields["summary"],
