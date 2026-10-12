@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
 import os
+import sqlite3
+from unittest.mock import patch
 
 import pytest
 
@@ -36,6 +39,34 @@ def test_missing_remote_token_does_not_touch_local_file(tmp_path):
     target = str(tmp_path / "missing.db")
     assert restore_state_if_missing(target, "owner", "repo", "", "", branch="bot-state") is False
     assert not os.path.exists(target)
+
+
+
+def test_empty_sqlite_shell_restores_encrypted_remote_snapshot(tmp_path):
+    source = tmp_path / "source.db"
+    connection = sqlite3.connect(source)
+    connection.execute("CREATE TABLE models (id TEXT PRIMARY KEY)")
+    connection.execute("INSERT INTO models(id) VALUES('saved-model')")
+    connection.commit()
+    connection.close()
+    snapshot = source.read_bytes()
+
+    local = tmp_path / "bot_state.db"
+    connection = sqlite3.connect(local)
+    connection.execute("CREATE TABLE models (id TEXT PRIMARY KEY)")
+    connection.commit()
+    connection.close()
+    assert local.stat().st_size > 0
+
+    encrypted = encrypt_blob(snapshot, "owner", "repo", "token", "stable-key")
+    payload = {"content": base64.b64encode(encrypted).decode("ascii")}
+    with patch("bot_state_store._api", return_value=payload):
+        restored = restore_state_if_missing(
+            str(local), "owner", "repo", "token", "stable-key", branch="bot-state"
+        )
+
+    assert restored is True
+    assert local.read_bytes() == snapshot
 
 
 def test_telegram_summary_preserves_numeric_values_and_does_not_fallback_to_pdf_slice():
