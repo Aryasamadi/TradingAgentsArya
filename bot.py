@@ -152,6 +152,17 @@ DB.execute(
     "UPDATE runs SET provider_type_snapshot=COALESCE((SELECT providers.provider_type FROM models LEFT JOIN providers "
     "ON providers.id=models.provider_id WHERE models.id=runs.model_id),'') WHERE provider_type_snapshot=''"
 )
+_sequence_row = DB.execute("SELECT value FROM settings WHERE key='run_sequence'").fetchone()
+try:
+    _run_sequence = int(_sequence_row["value"]) if _sequence_row else 0
+except (TypeError, ValueError):
+    _run_sequence = 0
+_run_sequence = max(_run_sequence, _existing_max)
+DB.execute(
+    "INSERT INTO settings(key,value) VALUES('run_sequence',?) "
+    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+    (str(_run_sequence),),
+)
 DB.commit()
 DB_LOCK = threading.Lock()
 STATE_DIRTY = True
@@ -847,8 +858,15 @@ def dispatch_run(chat_id: int, mode: str, params: dict) -> str:
     except Exception as exc:
         raise RuntimeError("پیکربندی امن مدل آماده نشد؛ اجرا ارسال نشد.") from exc
 
-    next_no = q1("SELECT COALESCE(MAX(run_no), 0) + 1 AS n FROM runs")
-    run_no = int(next_no["n"]) if next_no else 1
+    sequence_row = q1("SELECT value FROM settings WHERE key='run_sequence'")
+    try:
+        previous_no = int(sequence_row["value"]) if sequence_row else 0
+    except (TypeError, ValueError):
+        previous_no = 0
+    max_row = q1("SELECT COALESCE(MAX(run_no), 0) AS n FROM runs")
+    previous_no = max(previous_no, int(max_row["n"]) if max_row else 0)
+    run_no = previous_no + 1
+    set_setting("run_sequence", str(run_no))
     cur = db(
         "INSERT INTO runs(request_id,workflow_run_id,chat_id,mode,payload_json,model_id,run_no,"
         "model_name_snapshot,provider_name_snapshot,provider_type_snapshot,status,conclusion,notified,created_at,updated_at) "
@@ -900,6 +918,8 @@ def sync_run_records() -> None:
             status = str(run.get("status") or "queued")
             conclusion = str(run.get("conclusion") or "")
             final = (conclusion or "failure") if status == "completed" else status
+            if row["status"] == "cancelling" and status != "completed":
+                final = "cancelling"
 
             db(
                 "UPDATE runs SET workflow_run_id=?, status=?, conclusion=?, updated_at=? WHERE request_id=?",
@@ -986,7 +1006,7 @@ def hard_cancel(chat_id: int) -> str:
         try:
             cancel_run(int(run_id))
             db(
-                "UPDATE runs SET status='cancelled', conclusion='cancelled_by_user', workflow_run_id=?, updated_at=? "
+                "UPDATE runs SET status='cancelling', conclusion='cancel_requested_by_user', workflow_run_id=?, updated_at=? "
                 "WHERE request_id=? AND chat_id=?",
                 (int(run_id), now(), row["request_id"], chat_id),
             )
@@ -1579,6 +1599,7 @@ def run_status_label(status: str) -> str:
         "success": "✅ تکمیل‌شده",
         "failure": "❌ ناموفق",
         "cancelled": "🚫 لغوشده",
+        "cancelling": "🛑 درخواست لغو ثبت شد",
         "timed_out": "⌛ پایان مهلت",
         "action_required": "⚠️ نیازمند اقدام",
         "skipped": "⏭ ردشده",
@@ -1638,7 +1659,7 @@ def outputs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -
         except Exception:
             created = str(row["created_at"])[:16]
         status = str(row["status"])
-        icon = "⏳" if status in ("queued", "waiting", "pending") else (
+        icon = "⏳" if status in ("queued", "waiting", "pending", "cancelling") else (
             "🔵" if status == "in_progress" else "✅" if status == "success" else "🚫" if status == "cancelled" else "❌"
         )
         lines.append(f"<b>#{esc(number)}</b> {icon} <code>{esc(row['request_id'][:10])}</code> <b>{esc(subject)}</b> · {esc(created)}")
@@ -2124,7 +2145,7 @@ def callback(query: dict[str, Any]) -> None:
                 raise ValueError("شناسه اجرای GitHub هنوز آماده نیست؛ چند لحظه دیگر تازه‌سازی کن.")
             cancel_run(int(run_id))
             db(
-                "UPDATE runs SET status='cancelled',conclusion='cancelled_by_user',workflow_run_id=?,updated_at=? "
+                "UPDATE runs SET status='cancelling',conclusion='cancel_requested_by_user',workflow_run_id=?,updated_at=? "
                 "WHERE request_id=? AND chat_id=?",
                 (int(run_id), now(), request_id, chat_id),
             )
