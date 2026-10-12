@@ -19,7 +19,18 @@ def make_summary_text(row: Mapping[str, Any], info: Mapping[str, Any]) -> str:
     subject = params.get("ticker") or params.get("tickers") or "—"
     mode = row["mode"]
     label = "تحلیل" if mode == "analysis" else "بک‌تست"
-    lines = [f"<b>📊 گزارش {label} <code>{_esc(subject)}</code></b>"]
+    try:
+        run_number = row["run_no"] or row["request_id"][:8]
+    except (KeyError, IndexError):
+        run_number = "—"
+    try:
+        request_short = str(row["request_id"])[:10]
+    except (KeyError, IndexError):
+        request_short = "—"
+    lines = [
+        f"<b>📊 گزارش #{_esc(run_number)} · <code>{_esc(request_short)}</code></b>",
+        f"{label}: <code>{_esc(subject)}</code>",
+    ]
 
     try:
         provider = str(row["provider_name_snapshot"] or "—")
