@@ -617,8 +617,48 @@ def get_provider(prov_id: str):
 
 
 def delete_provider(prov_id: str) -> None:
-    db("DELETE FROM models WHERE provider_id=?", (prov_id,))
-    db("DELETE FROM providers WHERE id=?", (prov_id,))
+    global STATE_DIRTY, STATE_VERSION
+    provider = get_provider(prov_id)
+    if not provider:
+        raise ValueError("Provider یافت نشد.")
+    models = q("SELECT * FROM models WHERE provider_id=?", (prov_id,))
+
+    try:
+        with DB_LOCK:
+            DB.execute("BEGIN IMMEDIATE")
+            DB.execute("DELETE FROM models WHERE provider_id=?", (prov_id,))
+            DB.execute("DELETE FROM providers WHERE id=?", (prov_id,))
+            DB.commit()
+            STATE_VERSION += 1
+            STATE_DIRTY = True
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            DB.rollback()
+        raise RuntimeError("حذف Provider در پایگاه داده کامل نشد.") from exc
+
+    if not persist_state_if_dirty():
+        # Keep local and remote state consistent if the deletion cannot be backed up.
+        try:
+            with DB_LOCK:
+                DB.execute("BEGIN IMMEDIATE")
+                DB.execute(
+                    "INSERT OR REPLACE INTO providers(id,name,provider_type,base_url,token_ciphertext,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    tuple(provider[key] for key in ("id", "name", "provider_type", "base_url", "token_ciphertext", "created_at")),
+                )
+                for model in models:
+                    DB.execute(
+                        "INSERT OR REPLACE INTO models(id,name,provider_id,base_url,token_ciphertext,enabled,created_at) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        tuple(model[key] for key in ("id", "name", "provider_id", "base_url", "token_ciphertext", "enabled", "created_at")),
+                    )
+                DB.commit()
+                STATE_VERSION += 1
+                STATE_DIRTY = True
+        except Exception:
+            with contextlib.suppress(Exception):
+                DB.rollback()
+        raise RuntimeError("حذف Provider ذخیرهٔ پایدار نشد؛ اطلاعات برای جلوگیری از گم‌شدن حفظ شد. دوباره تلاش کن.")
 
 
 def model_rows():
