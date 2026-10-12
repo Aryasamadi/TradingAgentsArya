@@ -74,8 +74,8 @@ def test_empty_sqlite_shell_restores_encrypted_remote_snapshot(tmp_path):
 def test_encrypted_artifact_roundtrip_preserves_original_report_bytes(tmp_path):
     root = tmp_path / "results"
     root.mkdir()
-    pdf_bytes = b"%PDF-1.7\\nExact report bytes: 001.2300, spacing  two spaces, punctuation!\\n\\x00\\xff"
-    json_bytes = b'{"entry":"001.2300","note":"keep  spaces + punctuation"}\\n'
+    pdf_bytes = b"%PDF-1.7\nExact report bytes: 001.2300, spacing  two spaces, punctuation!\n\x00\xff"
+    json_bytes = b'{"entry":"001.2300","note":"keep  spaces + punctuation"}\n'
     (root / "report.pdf").write_bytes(pdf_bytes)
     (root / "report.json").write_bytes(json_bytes)
 
@@ -110,10 +110,19 @@ def test_telegram_summary_preserves_numeric_values_and_does_not_fallback_to_pdf_
         "model_name": "",
     }
     info = {
+        # These normalized fields represent the pre-existing PDF view only.
         "entry": "1,234.50",
         "exit": "-0.005",
         "amount": "1 000.25 shares",
         "value": "$12,345.67",
+        "telegram_financial_fields": {
+            "entry": " 1,234.50 ",
+            "exit": "-0.005",
+            "target": "0001.2300 / 001.2400",
+            "stop": "—",
+            "amount": "1 000.25 shares",
+            "value": "$12,345.67",
+        },
         "summary": "THIS SHOULD NOT BE SHOWN AS A TRUNCATED FALLBACK",
         "telegram_summary": "The evidence is mixed, so the conclusion remains cautious.",
     }
