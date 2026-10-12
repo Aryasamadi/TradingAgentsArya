@@ -2152,11 +2152,14 @@ def callback(query: dict[str, Any]) -> None:
             if not row:
                 raise ValueError("مدل پیدا نشد.")
 
-            with contextlib.suppress(Exception):
-                write_active_model_secrets(row)
-
             set_active_model(row["id"])
-            answer_callback(query["id"], "⚡ مدل فعال شد!", True)
+            try:
+                write_active_model_secrets(row)
+            except Exception:
+                # The selected model is durably saved; per-run encrypted config remains authoritative.
+                answer_callback(query["id"], "⚡ مدل فعال شد؛ همگام‌سازی تنظیمات GitHub کامل نشد.", True)
+            else:
+                answer_callback(query["id"], "⚡ مدل فعال شد!", True)
 
             last_page = int(get_setting(f"last_models_page_{chat_id}", "0"))
             models_screen(chat_id, page=last_page, target_mid=cb_mid)
