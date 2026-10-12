@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
+from bot_artifacts import ArtifactEncryptionError, decrypt_tree, encrypt_tree
 from bot_reports import make_summary_text
 from bot_state_store import (
     StateStoreError,
@@ -67,6 +68,36 @@ def test_empty_sqlite_shell_restores_encrypted_remote_snapshot(tmp_path):
 
     assert restored is True
     assert local.read_bytes() == snapshot
+
+
+
+def test_encrypted_artifact_roundtrip_preserves_original_report_bytes(tmp_path):
+    root = tmp_path / "results"
+    root.mkdir()
+    pdf_bytes = b"%PDF-1.7\\nExact report bytes: 001.2300, spacing  two spaces, punctuation!\\n\\x00\\xff"
+    json_bytes = b'{"entry":"001.2300","note":"keep  spaces + punctuation"}\\n'
+    (root / "report.pdf").write_bytes(pdf_bytes)
+    (root / "report.json").write_bytes(json_bytes)
+
+    encrypt_tree(root, "results.enc", "stable-key")
+    assert not (root / "report.pdf").exists()
+    assert (root / "results.enc").is_file()
+
+    decrypt_tree(root, "results.enc", "stable-key")
+    assert (root / "report.pdf").read_bytes() == pdf_bytes
+    assert (root / "report.json").read_bytes() == json_bytes
+
+
+def test_encrypted_artifact_with_wrong_key_is_not_removed(tmp_path):
+    root = tmp_path / "results"
+    root.mkdir()
+    expected = b"financial string: 1.2300;  two spaces"
+    (root / "report.pdf").write_bytes(expected)
+
+    encrypt_tree(root, "results.enc", "stable-key")
+    with pytest.raises(ArtifactEncryptionError):
+        decrypt_tree(root, "results.enc", "different-key")
+    assert (root / "results.enc").is_file()
 
 
 def test_telegram_summary_preserves_numeric_values_and_does_not_fallback_to_pdf_slice():
