@@ -209,11 +209,13 @@ def get_setting(key: str, default: str = "") -> str:
 
 
 def set_setting(key: str, value: str) -> None:
-    db(
+    cur = db(
         "INSERT INTO settings(key,value) VALUES(?,?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, value),
     )
+    if cur is None:
+        raise RuntimeError(f"Could not persist setting: {key}")
 
 
 def authorized(user_id: int) -> bool:
@@ -583,10 +585,15 @@ def encrypt_request_config(obj: dict[str, Any]) -> str:
 
 def save_provider(name: str, provider_type: str, base_url: str, token: str) -> str:
     prov_id = "p_" + uuid.uuid4().hex[:12]
-    db(
+    cur = db(
         "INSERT INTO providers(id,name,provider_type,base_url,token_ciphertext,created_at) VALUES(?,?,?,?,?,?)",
         (prov_id, name, provider_type, base_url, encrypt_token(token), now()),
     )
+    if cur is None:
+        raise RuntimeError("Provider در پایگاه داده ذخیره نشد.")
+    persist_state_if_dirty()
+    if STATE_DIRTY:
+        raise RuntimeError("Provider ذخیره محلی شد اما پشتیبان رمزگذاری‌شده GitHub به‌روز نشد؛ ربات را راه‌اندازی مجدد نکن.")
     return prov_id
 
 
@@ -609,6 +616,9 @@ def active_model_id() -> str:
 
 def set_active_model(model_id: str) -> None:
     set_setting("active_model", model_id)
+    persist_state_if_dirty()
+    if STATE_DIRTY:
+        raise RuntimeError("مدل محلی فعال شد اما وضعیت رمزگذاری‌شده GitHub ذخیره نشد؛ از راه‌اندازی مجدد خودداری کن تا پشتیبان برقرار شود.")
 
 
 def github_secret(name: str, value: str) -> None:
@@ -658,10 +668,12 @@ def add_model_from_provider(prov_id: str, model_name: str) -> str:
         return model_id
 
     model_id = "m_" + uuid.uuid4().hex[:12]
-    db(
+    cur = db(
         "INSERT INTO models(id,name,provider_id,base_url,token_ciphertext,enabled,created_at) VALUES(?,?,?,?,?,1,?)",
         (model_id, model_name, prov_id, prov["base_url"], prov["token_ciphertext"], now()),
     )
+    if cur is None:
+        raise RuntimeError("مدل در پایگاه داده ذخیره نشد.")
 
     row = q1("SELECT * FROM models WHERE id=?", (model_id,))
     if row:
@@ -1807,9 +1819,6 @@ def callback(query: dict[str, Any]) -> None:
         answer_callback(query["id"], "📄 در حال آماده‌سازی...", False)
     elif data == "fetch_models_list":
         answer_callback(query["id"], "📋 در حال دریافت...", False)
-    else:
-        answer_callback(query["id"])
-
     try:
         if data == "home":
             WIZARDS.pop(chat_id, None)
@@ -2265,7 +2274,10 @@ def callback(query: dict[str, Any]) -> None:
         elif data == "noop":
             pass
 
+        answer_callback(query["id"])
+
     except Exception as exc:
+        answer_callback(query["id"], str(exc)[:200], True)
         show(chat_id, f"<b>❌ خطا</b>\n{esc(exc)}", [[("بازگشت", "home")]], cb_mid)
 
 
