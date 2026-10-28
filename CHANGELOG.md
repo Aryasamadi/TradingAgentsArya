@@ -6,6 +6,105 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Changes that need action when upgrading are listed under "Upgrading from" in their release.
 
+## [0.7.1] — 2026-10-27
+
+Decisions are scored only on final closes and settle across long market holidays, a model's unpadded date no longer reads filings made after the run date, and fixes to portfolios, prices, SEC statements, reports, Azure and Claude settings.
+
+### Upgrading from 0.7.0
+
+- Docker images no longer include `.env.enterprise`. For Azure OpenAI in Docker, put its keys in `.env`.
+
+### Fixed
+
+- A date a model passes without zero padding, such as `2024-7-5`, is read as that date. It could compare as later than a filing made after the run date, and SEC EDGAR then served that filing. (#1488)
+- A decision is no longer scored on the bar of a session still trading, and one made before a market closure longer than a week, such as a national holiday, settles once trading resumes instead of staying pending. (#1548, #1539)
+- A backtest reports the failures of its last settlement pass, and two started in the same second no longer share one run. (#1557, #1549)
+- A holding listed under a broker's spelling (`BTCUSDT`, `700.HK`) is matched to the instrument analyzed, and a portfolio number that is not finite is refused when the file loads. (#1556, #1509)
+- Prices keep their significant digits: a sub-cent close no longer prints as 0.00, and a currency pair keeps its pips. (#1567)
+- SEC EDGAR statements list one row per period, so a model no longer reads a figure against the wrong quarter across a long history, and a figure under one million no longer prints as 0. (#1517, #1589)
+- Saving a report to a folder used before removes the earlier run's sections. (#1566)
+- A date window that ends before it starts is sent back to the model instead of returning no data. (#1595)
+- A statement frequency other than annual or quarterly is sent back to the model instead of being served annual figures under that word. (#1593)
+- The memory's most recent lessons, and the entries rotation keeps, follow decision dates, so a backfill of older dates no longer displaces them. (#1603)
+- Prediction-market odds near 0% or 100% show their distance from it to two significant digits. (#1598)
+- Azure OpenAI receives `max_tokens` and a configured endpoint. (#1584, #1600)
+- Claude's effort setting is decided correctly for dated model IDs such as `claude-sonnet-4-20250514`. (#1585)
+- The CLI checks a ticker with the same rule as the run, so `XAUUSD+` is accepted and `..` is refused at the prompt. (#1604)
+- Docker images no longer include `.env` files from any folder.
+- Tests that failed on Windows and macOS for platform reasons are fixed. (#1506, #1485, #1541)
+
+### Contributors
+
+[@alanfate3](https://github.com/alanfate3), [@aranlucas](https://github.com/aranlucas), [@BichengWang](https://github.com/BichengWang), [@Bortlesboat](https://github.com/Bortlesboat), [@hoffman988](https://github.com/hoffman988), [@jhill-cmd](https://github.com/jhill-cmd), [@muhib-karim](https://github.com/muhib-karim), [@pei711](https://github.com/pei711), [@peiji1981](https://github.com/peiji1981), [@rudycelekli](https://github.com/rudycelekli), [@Shubham-Padkonde](https://github.com/Shubham-Padkonde), [@stevexyz2003](https://github.com/stevexyz2003), [@SuperMarioYL](https://github.com/SuperMarioYL), [@sytfly](https://github.com/sytfly), [@yuv009](https://github.com/yuv009).
+
+## [0.7.0] — 2026-10-16
+
+Runs on your ChatGPT plan, backtests scored from the first close after each decision, a note at start-up when a newer release is out, and a wheel attached to each GitHub release.
+
+### Added
+
+- **Your ChatGPT plan.** The `chatgpt` provider runs TradingAgents on a ChatGPT Plus or Pro plan instead of an API key, through OpenAI's sign-in for open-source apps. Choose "Subscription" in the CLI's provider menu; for unattended runs, Docker and Python (`llm_provider="chatgpt"`), sign in once with `tradingagents login chatgpt`. `tradingagents logout chatgpt` revokes the sign-in. The CLI lists the plan's models, and reasoning effort applies as it does for OpenAI. (#1194, #1475)
+- **What's new at start-up.** The interactive CLI mentions a newer release, with the command that upgrades this install when it can tell how TradingAgents was installed, and notices from Tauric Research for the running version. It checks at most once a day in the background, so a run never waits on it; runs without a terminal never check, and `TRADINGAGENTS_NO_UPDATE_CHECK=1` turns it off.
+- **Release downloads.** Each GitHub release carries the source archive and a wheel, so a version installs with `pip install` from its release page without cloning.
+
+### Upgrading from 0.6.0
+
+- `cryptography` 42 and `packaging` 24 or later are installed.
+- Decisions are now scored from the first close after their date. Outcomes already settled in a memory log keep the earlier entry, the close of the decision date, so a backtest resumed with `run_id` mixes the two; start a new run to compare like with like.
+
+### Fixed
+
+- A decision is no longer scored against news it could not have traded on: a run dated *d* reads news published after the close on *d*, so the memory log and backtests enter it at the first close after *d*, not the close of *d*. (#1518)
+- A run without a terminal, such as a scheduled job or CI, no longer contacts the announcements server before it starts.
+- A model tier on another provider keeps its configured reasoning effort, thinking level or Claude effort when the main provider has none. (#1440)
+
+### Contributors
+
+[@LeonWTW](https://github.com/LeonWTW), [@OleksanderSS](https://github.com/OleksanderSS), [@sovorn-c](https://github.com/sovorn-c).
+
+## [0.6.0] — 2026-10-03
+
+HTML reports, a provider per model tier, past decisions settled for every ticker while the analysts work, and company news read while Yahoo's news feed is down.
+
+### Added
+
+- **HTML report.** A saved report also includes `complete_report.html`, the report as one page with its sections listed beside the text, that reads well in a browser, on a phone and in print. Answering the save question at the prompt also asks about the page and can open it in your browser; `--no-html` or `save_reports(..., html=False)` skips it. The page is self-contained: it loads nothing and runs nothing. (#1419)
+- **A provider per model tier.** The quick and deep models can run on different providers, for example the managers on Claude while the analysts run on OpenAI: set `deep_think_provider` or `quick_think_provider` (`TRADINGAGENTS_DEEP_THINK_PROVIDER`, `TRADINGAGENTS_QUICK_THINK_PROVIDER`) with the tier's model. The report header names each tier's provider. (#1440)
+- **Past decisions settle alongside the analysts.** While a run's analysts work, every logged decision whose holding period has passed is settled, for any ticker, not only the one being analyzed. If settling fails, the run goes on and the report header says so. (#1428, #1445)
+- **Crypto on Reddit.** For a crypto ticker the Sentiment Analyst reads r/CryptoCurrency and r/CryptoMarkets, plus r/Bitcoin, r/ethereum or r/solana for those coins, instead of the stock subreddits. (#1461)
+- `settle_all_pending()` settles every due decision without running an analysis, for a scheduled job; it and `settle_pending()` return the decisions settled and any that could not be. (#1445)
+- The report header names the run's rating.
+- Euro-area macro series by name: `ecb_deposit_rate`, `ecb_main_refi_rate`, `euro_hicp`, `euro_core_hicp`, `euro_real_gdp`, `germany_10y`, `france_10y` and `eur_usd`. (#1465)
+
+### Models
+
+- A Gemini call times out after 600 seconds, as OpenAI and Anthropic calls do, so a stalled call no longer hangs the run. (#1417)
+
+### Upgrading from 0.5.2
+
+- markdown-it-py 4.0 or later is installed.
+- A saved report also writes `complete_report.html`; pass `--no-html`, or `html=False` to `save_reports()`, to keep only the Markdown.
+- A run no longer settles its ticker's decisions before it starts; the Memory Log step settles every ticker's during the run.
+- `settle_pending()` returns a `Settlement` with `settled` and `failed` (was `None`).
+- Checkpoints from 0.5.2 are not resumed.
+
+### Fixed
+
+- Company news is read from Yahoo search while Yahoo's news feed returns nothing. When Yahoo has no article about the symbol, its news is reported unavailable, not absent, and a configured next news vendor is tried. (#1467, #1469)
+- A rating quoted from someone else, such as "Consensus rating: Buy", no longer replaces the Portfolio Manager's own. (#1466)
+- A Yahoo news article with a null field no longer loses the ticker's news. (#1458)
+- A start date a model writes with stray characters is sent back to it to correct, instead of failing the news or price request. (#1476)
+- A request Alpha Vantage rejects is reported as unavailable, not served as data; the API key is kept out of every Alpha Vantage error. (#1442)
+- Yahoo fundamentals print each money figure in its own currency: London prices in GBp, market cap and per-share figures in GBP, and an ADR's income figures in its reporting currency, such as TWD for TSMC. (#1456)
+- Jev screening uses the endpoint `TYPESAFE_BASE_URL` names, so it can run through OpenRouter. (#1416)
+- Runs sharing a memory log settle each decision once, and an interrupted settlement keeps the outcomes it finished.
+- The report header names the sentiment analyst `sentiment`, as the CLI does.
+- `requirements.txt` says the dependencies are declared in `pyproject.toml`.
+
+### Contributors
+
+[@amitbhansali](https://github.com/amitbhansali), [@AyushJain-601](https://github.com/AyushJain-601), [@BichengWang](https://github.com/BichengWang), [@byte7m](https://github.com/byte7m), [@Dangerboi](https://github.com/Dangerboi), [@davidalmeida90](https://github.com/davidalmeida90), [@Jackzigen](https://github.com/Jackzigen), [@jhill-cmd](https://github.com/jhill-cmd), [@Recnelis0](https://github.com/Recnelis0), [@seaaxe](https://github.com/seaaxe), [@vaegev](https://github.com/vaegev).
+
 ## [0.5.2] — 2026-09-29
 
 Parallel analysts, unattended CLI runs, reports that record what produced them,

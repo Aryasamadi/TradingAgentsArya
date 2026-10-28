@@ -4,7 +4,7 @@ Each dated tool takes the run's ``trade_date`` from graph state (``InjectedState
 and never serves data past it, whatever date the model asks for.
 """
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
@@ -31,7 +31,10 @@ def get_stock_data(
     Returns:
         str: A formatted dataframe containing the price data for the instrument over the date range.
     """
-    start_date, end_date = as_of_window(start_date, end_date, trade_date)
+    try:
+        start_date, end_date = as_of_window(start_date, end_date, trade_date)
+    except ValueError as e:
+        return str(e)
     return route_to_vendor("get_stock_data", symbol, start_date, end_date)
 
 
@@ -111,7 +114,7 @@ def get_fundamentals(
 @tool
 def get_balance_sheet(
     ticker: Annotated[str, InjectedState("company_of_interest")],
-    freq: Annotated[str, "reporting frequency: annual/quarterly"] = "quarterly",
+    freq: Annotated[Literal["annual", "quarterly"], "reporting frequency"] = "quarterly",
     curr_date: Annotated[str, "current date you are trading at, yyyy-mm-dd"] = None,
     trade_date: Annotated[str, InjectedState("trade_date")] = "",
 ) -> str:
@@ -130,7 +133,7 @@ def get_balance_sheet(
 @tool
 def get_cashflow(
     ticker: Annotated[str, InjectedState("company_of_interest")],
-    freq: Annotated[str, "reporting frequency: annual/quarterly"] = "quarterly",
+    freq: Annotated[Literal["annual", "quarterly"], "reporting frequency"] = "quarterly",
     curr_date: Annotated[str, "current date you are trading at, yyyy-mm-dd"] = None,
     trade_date: Annotated[str, InjectedState("trade_date")] = "",
 ) -> str:
@@ -149,7 +152,7 @@ def get_cashflow(
 @tool
 def get_income_statement(
     ticker: Annotated[str, InjectedState("company_of_interest")],
-    freq: Annotated[str, "reporting frequency: annual/quarterly"] = "quarterly",
+    freq: Annotated[Literal["annual", "quarterly"], "reporting frequency"] = "quarterly",
     curr_date: Annotated[str, "current date you are trading at, yyyy-mm-dd"] = None,
     trade_date: Annotated[str, InjectedState("trade_date")] = "",
 ) -> str:
@@ -181,7 +184,10 @@ def get_news(
     Returns:
         str: A formatted string containing news data
     """
-    start_date, end_date = as_of_window(start_date, end_date, trade_date)
+    try:
+        start_date, end_date = as_of_window(start_date, end_date, trade_date)
+    except ValueError as e:
+        return str(e)
     return route_to_vendor("get_news", ticker, start_date, end_date)
 
 
@@ -229,7 +235,9 @@ def get_macro_indicators(
         str,
         "Macro indicator: a friendly alias such as 'cpi', 'core_pce', "
         "'unemployment', 'fed_funds_rate', '10y_treasury', 'yield_curve', "
-        "'real_gdp', 'vix', or a raw FRED series ID such as 'CPIAUCSL'.",
+        "'real_gdp', 'vix', euro-area aliases such as 'ecb_deposit_rate', "
+        "'euro_hicp', 'euro_core_hicp', 'euro_real_gdp', 'germany_10y', "
+        "'france_10y', 'eur_usd', or a raw FRED series ID such as 'CPIAUCSL'.",
     ],
     curr_date: Annotated[str, "Current date in yyyy-mm-dd format; the end of the window"],
     look_back_days: Annotated[
@@ -239,7 +247,8 @@ def get_macro_indicators(
 ) -> str:
     """
     Retrieve a macroeconomic indicator time series from FRED (Federal Reserve
-    Economic Data): policy rates, Treasury yields, inflation, labor, and growth.
+    Economic Data): policy rates, Treasury yields, inflation, labor, and growth,
+    for the US and, through FRED's mirrored series, the euro area.
     Returns the series title, units, frequency, the latest value, the change
     over the window, and a recent observation table. Uses the configured
     macro_data vendor.

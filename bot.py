@@ -872,22 +872,39 @@ def make_summary_text(row: sqlite3.Row, info: dict[str, Any]) -> str:
 
     lines = [f"<b>📊 گزارش {label} <code>{esc(subject)}</code></b>"]
 
-    if info.get("rating"):
-        lines.append(f"🧭 نتیجه نهایی: <b>{esc(info.get('rating'))}</b>")
-    if info.get("action"):
-        lines.append(f"🧾 اقدام / سفارش: <b>{esc(info.get('action'))}</b>")
-    if info.get("entry"):
-        lines.append(f"📥 نقطه ورود: <code>{esc(info.get('entry'))}</code>")
-    if info.get("exit"):
-        lines.append(f"📤 نقطه خروج: <code>{esc(info.get('exit'))}</code>")
-    if info.get("target"):
-        lines.append(f"🎯 هدف قیمتی: <code>{esc(info.get('target'))}</code>")
-    if info.get("stop"):
-        lines.append(f"🛑 حد ضرر: <code>{esc(info.get('stop'))}</code>")
-    if info.get("confidence"):
-        lines.append(f"📈 سطح اطمینان: <b>{esc(info.get('confidence'))}</b>")
-    if info.get("horizon"):
-        lines.append(f"⏳ افق زمانی: <b>{esc(info.get('horizon'))}</b>")
+    # A dash is the placeholder for a field the run never produced; showing it
+    # as a result reads as "the analyst said —", which is not what happened.
+    def value_of(key: str) -> str:
+        text = str(info.get(key) or "").strip()
+        return "" if text in {"", "—", "-"} else text
+
+    rating = value_of("rating")
+    if rating:
+        lines.append(f"🧭 نتیجه نهایی: <b>{esc(rating)}</b>")
+    action = value_of("action")
+    if action:
+        lines.append(f"🧾 اقدام / سفارش: <b>{esc(action)}</b>")
+    entry = value_of("entry")
+    if entry:
+        lines.append(f"📥 نقطه ورود: <code>{esc(entry)}</code>")
+    exit_price = value_of("exit")
+    if exit_price:
+        lines.append(f"📤 نقطه خروج: <code>{esc(exit_price)}</code>")
+    target = value_of("target")
+    if target:
+        lines.append(f"🎯 هدف قیمتی: <code>{esc(target)}</code>")
+    stop = value_of("stop")
+    if stop:
+        lines.append(f"🛑 حد ضرر: <code>{esc(stop)}</code>")
+    confidence = value_of("confidence")
+    if confidence:
+        lines.append(f"📈 سطح اطمینان: <b>{esc(confidence)}</b>")
+    horizon = value_of("horizon")
+    if horizon:
+        lines.append(f"⏳ افق زمانی: <b>{esc(horizon)}</b>")
+
+    if not any((rating, action, entry, exit_price, target, stop, confidence, horizon)):
+        lines.append("⚠️ این اجرا هیچ نتیجه‌ای تولید نکرد.")
 
     summary = str(info.get("summary") or "").strip()
     if summary:
@@ -898,7 +915,9 @@ def make_summary_text(row: sqlite3.Row, info: dict[str, Any]) -> str:
 
 
 def send_output(chat_id: int, request_id: str) -> None:
-    row = q1("SELECT * FROM runs WHERE request_id=?", (request_id,))
+    # A run belongs to the chat that asked for it; looking it up by request id
+    # alone let anyone holding the id read another chat's report.
+    row = q1("SELECT * FROM runs WHERE request_id=? AND chat_id=?", (request_id, chat_id))
     if not row:
         send_message(chat_id, "❌ این اجرا پیدا نشد.", [[("بازگشت", "outputs")]])
         return
@@ -962,6 +981,16 @@ def send_output(chat_id: int, request_id: str) -> None:
             break
 
     if not pdf_name:
+        # A run that produced no report tree says so in its status; saying
+        # "PDF not found" there hides the real reason, which is that the
+        # analysis never finished.
+        if info.get("status") == "no_report":
+            send_message(
+                chat_id,
+                "⚠️ این اجرا گزارشی تولید نکرد؛ نتیجه‌ای برای نمایش وجود ندارد.",
+                [[("🔄 بررسی دوباره", f"view_output:{request_id}"), ("🏠 خانه", "home")]],
+            )
+            return
         send_message(chat_id, "⚠️ فایل PDF پیدا نشد.", [[("بازگشت", "outputs")]])
         return
 
@@ -1079,6 +1108,11 @@ def models_screen(chat_id: int, page: int = 0, target_mid: int | None = None) ->
     end = start + per_page
     page_rows = rows[start:end]
     total_pages = max(1, (len(rows) + per_page - 1) // per_page)
+
+    # Remember which page is on screen: the activate and delete handlers come
+    # back to it, and they had no way to know it because the page only ever
+    # lived in the callback that is gone by then.
+    set_setting(f"last_models_page_{chat_id}", str(page))
 
     text = "<b>🤖 مدل‌ها</b>\nلیست مدل‌های هوش مصنوعی ثبت‌شده در سیستم.\n"
     buttons: list[list[tuple[str, str]]] = []
@@ -1492,8 +1526,11 @@ def outputs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -
     per_page = 3
     offset = page * per_page
 
-    rows = q(f"SELECT * FROM runs ORDER BY created_at DESC LIMIT {per_page} OFFSET {offset}")
-    total_count = q1("SELECT COUNT(*) c FROM runs")
+    rows = q(
+        "SELECT * FROM runs WHERE chat_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (chat_id, per_page, offset),
+    )
+    total_count = q1("SELECT COUNT(*) c FROM runs WHERE chat_id=?", (chat_id,))
     total_count_val = int(total_count["c"]) if total_count else 0
     total_pages = max(1, (total_count_val + per_page - 1) // per_page)
 
@@ -1620,7 +1657,6 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
                 item["prov_id"] = prov_id
                 item["stage"] = "model"
 
-                answer_callback(f"temp_{chat_id}", "✅ Provider ذخیره شد!", True)
                 wizard_model_manual_screen(chat_id, target_mid)
 
             elif stage == "model_manual":
@@ -1634,7 +1670,6 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
                 model_id = add_model_from_provider(prov_id, text)
                 WIZARDS.pop(chat_id, None)
 
-                answer_callback(f"temp_{chat_id}", "✅ مدل ذخیره شد!", True)
                 show(
                     chat_id,
                     f"<b>✅ مدل ذخیره و فعال شد</b>\n<code>{esc(text)}</code>",
@@ -2005,11 +2040,13 @@ def callback(query: dict[str, Any]) -> None:
 
         elif data.startswith("bulk_do:"):
             scope = data.split(":", 1)[1]
+            # Every run belongs to a chat; clearing "all" meant clearing every
+            # user's runs, including the ones they cannot see in their own list.
             if scope == "all":
-                cur = db("DELETE FROM runs")
+                cur = db("DELETE FROM runs WHERE chat_id=?", (chat_id,))
             else:
                 cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=int(scope))).isoformat()
-                cur = db("DELETE FROM runs WHERE created_at < ?", (cutoff,))
+                cur = db("DELETE FROM runs WHERE chat_id=? AND created_at < ?", (chat_id, cutoff))
 
             answer_callback(query["id"], f"✅ {cur.rowcount if cur else 0} حذف شد.", True)
             outputs_screen(chat_id, page=0, target_mid=cb_mid)
