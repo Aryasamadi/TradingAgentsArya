@@ -296,6 +296,62 @@ def collect_sections(tree: pathlib.Path) -> list[dict[str, str]]:
     return sections
 
 
+def find_memory_log(logs_dir: pathlib.Path) -> pathlib.Path | None:
+    """The newest memory log under ``logs_dir``, if there is one.
+
+    A backtest writes no report tree: it records one decision per cell in a
+    memory log.  That log is the only trace of the sweep, so it is what the
+    report has to be built from.
+    """
+    candidates = [
+        path for path in logs_dir.rglob("trading_memory.md")
+        if path.is_file()
+    ]
+    if not candidates:
+        return None
+
+    def stamp(path: pathlib.Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return max(candidates, key=stamp)
+
+
+def sections_from_memory_log(log: pathlib.Path) -> list[dict[str, str]]:
+    """Each decision in a memory log as its own section.
+
+    The log's entries look like ``[date | ticker | rating | pending]``
+    followed by the decision text; the rating in the tag is the run's own
+    verdict, so it is read from there rather than guessed from the prose.
+    """
+    sections: list[dict[str, str]] = []
+    raw = _read(log)
+    if not raw:
+        return sections
+
+    entry_re = re.compile(
+        r"^\[(?P<date>[^|]+)\|\s*(?P<ticker>[^|]+)\|\s*(?P<rating>[^|]*)\|\s*(?P<state>[^\]]*)\]\s*$"
+        r"(?P<body>.*?)(?=\n\[[^|]+\|[^|]+\|[^|]*\|[^\]]*\]\s*$|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+
+    for match in entry_re.finditer(raw):
+        body = clean_text(match.group("body"))
+        body = re.sub(r"\nDECISION:\s*", "\n", body, count=1).strip()
+        body = re.sub(r"<!--\s*ENTRY_END\s*-->", "", body).strip()
+        if not body:
+            continue
+        ticker = match.group("ticker").strip()
+        date = match.group("date").strip()
+        rating = match.group("rating").strip()
+        title = f"{ticker} · {date}" + (f" · {rating}" if rating else "")
+        sections.append({"title": title, "body": body, "source": str(log)})
+
+    return sections
+
+
 def report_body(tree: pathlib.Path, sections: list[dict[str, str]]) -> str:
     """The consolidated report text, used for the summary and as a fallback."""
     complete = tree / "complete_report.md"
@@ -524,6 +580,7 @@ def build_report(home: str | pathlib.Path, out_dir: str | pathlib.Path,
     fields["summary"] = ""
     fields["decision"] = ""
     sections: list[dict[str, str]] = []
+    source = ""
 
     if tree is not None:
         sections = collect_sections(tree)
@@ -545,6 +602,22 @@ def build_report(home: str | pathlib.Path, out_dir: str | pathlib.Path,
                 if section["title"] == "معامله‌گر":
                     trader = section["body"]
         fields = extract_fields(decision, trader, complete)
+        source = "report"
+    else:
+        # A backtest writes no report tree; its memory log holds one decision
+        # per cell, and that is the sweep's only trace.
+        log = find_memory_log(pathlib.Path(logs_dir))
+        if log is not None:
+            sections = sections_from_memory_log(log)
+            if sections:
+                complete = "\n\n".join(s["body"] for s in sections)
+                fields = extract_fields("", "", complete)
+                fields["decision"] = ""
+                fields["summary"] = (
+                    f"{len(sections)} تصمیم در این بک‌تست ثبت شد."
+                    if len(sections) > 1 else "یک تصمیم در این بک‌تست ثبت شد."
+                )
+                source = "memory_log"
 
     for key in _KEY_FIELDS:
         fields[key] = (fields.get(key) or "").strip() or "—"
@@ -579,7 +652,8 @@ def build_report(home: str | pathlib.Path, out_dir: str | pathlib.Path,
         "summary": fields["summary"][:2500],
         "decision": fields["decision"][:3000],
         "has_pdf": pdf_ok,
-        "status": "ok" if tree is not None else "no_report",
+        "status": "ok" if source == "report" else ("memory_log" if source else "no_report"),
+        "sections": len(sections),
     }
     (out_dir / "report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"

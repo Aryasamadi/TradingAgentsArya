@@ -16,8 +16,10 @@ from report_builder import (
     build_report,
     collect_sections,
     extract_fields,
+    find_memory_log,
     find_report_tree,
     render_html,
+    sections_from_memory_log,
 )
 
 TICKER = "NVDA"
@@ -208,18 +210,67 @@ def test_report_is_built_once_per_section(tmp_path: pathlib.Path) -> None:
 
 
 def test_a_run_without_a_report_tree_says_so(tmp_path: pathlib.Path) -> None:
-    """No tree means no report: the fields say that, they do not invent one."""
+    """No tree and no log means no report: the fields say that, they do not invent one."""
     (tmp_path / "logs").mkdir()
     out = tmp_path / "out"
     build_report(tmp_path, out, TICKER, "analysis", "2026-10-27")
 
     data = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert data["status"] == "no_report"
     assert data["rating"] == "—"
     assert data["action"] == "—"
     assert data["entry"] == "—"
     assert data["stop"] == "—"
     assert data["target"] == "—"
-    assert data["status"] == "no_report"
+
+
+def write_memory_log(logs: pathlib.Path) -> pathlib.Path:
+    """A backtest's memory log: one entry per cell, as upstream writes it."""
+    log = logs / "backtest" / "run-001" / "trading_memory.md"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "[2026-10-01 | NVDA | Buy | pending]\n\n"
+        "DECISION:\n**Rating**: Buy\n\n**Price Target**: 250.00\n\n"
+        "<!-- ENTRY_END -->\n\n"
+        "[2026-10-08 | AAPL | Hold | pending]\n\n"
+        "DECISION:\n**Rating**: Hold\n\n**Price Target**: 190.00\n\n"
+        "<!-- ENTRY_END -->\n\n",
+        encoding="utf-8",
+    )
+    return log
+
+
+def test_a_backtest_reports_from_its_memory_log(tmp_path: pathlib.Path) -> None:
+    """A backtest writes no report tree; its memory log is the sweep's only trace."""
+    logs = tmp_path / "logs"
+    write_memory_log(logs)
+    out = tmp_path / "out"
+    build_report(tmp_path, out, "NVDA,AAPL", "backtest", "2026-10-01 → 2026-10-08")
+
+    data = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert data["status"] == "memory_log"
+    assert data["sections"] == 2
+    assert "2 تصمیم" in data["summary"]
+
+    doc = (out / "report.html").read_text(encoding="utf-8")
+    assert "NVDA" in doc
+    assert "AAPL" in doc
+    assert doc.count("250.00") == 1
+
+
+def test_a_memory_log_entry_is_read_once(tmp_path: pathlib.Path) -> None:
+    logs = tmp_path / "logs"
+    write_memory_log(logs)
+    log = find_memory_log(logs)
+    assert log is not None
+    sections = sections_from_memory_log(log)
+
+    assert [s["title"] for s in sections] == [
+        "NVDA · 2026-10-01 · Buy",
+        "AAPL · 2026-10-08 · Hold",
+    ]
+    assert "250.00" in sections[0]["body"]
+    assert "ENTRY_END" not in sections[0]["body"]
 
 
 def test_html_is_rtl_and_carries_the_header() -> None:
