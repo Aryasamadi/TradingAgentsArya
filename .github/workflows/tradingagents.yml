@@ -250,6 +250,8 @@ jobs:
           [[ -n "${TRADINGAGENTS_LLM_BACKEND_URL:-}" ]] || { echo "Missing active model Base URL."; exit 3; }
 
       - name: Build and run agent command
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p .runtime/run
@@ -289,7 +291,30 @@ jobs:
           echo "Mode: ${REQUEST_MODE}"
           echo "Language: ${TRADINGAGENTS_OUTPUT_LANGUAGE}"
 
+          # Follow the agents' conversation while it happens. The watcher opens
+          # the checkpoint database the graph writes and only reads it, so the
+          # run itself is untouched; when the chat is unreachable it gives up
+          # quietly and the analysis goes on.
+          watcher_pid=""
+          if [[ "$REQUEST_MODE" == "analysis" && -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${REQUEST_CHAT_ID:-}" ]]; then
+            python live_stream.py \
+              --cache-dir "${TRADINGAGENTS_CACHE_DIR}" \
+              --ticker "${TICKER}" \
+              --chat-id "${REQUEST_CHAT_ID}" \
+              --request-id "${REQUEST_ID}" \
+              >> .runtime/run/live_stream.log 2>&1 &
+            watcher_pid=$!
+            echo "Live stream watcher started (pid ${watcher_pid})."
+          fi
+
           "${CMD[@]}" 2>&1 | tee .runtime/run/agent.log
+
+          # Give the watcher a moment to publish the last messages.
+          sleep 5
+          if [[ -n "${watcher_pid}" ]]; then
+            kill "${watcher_pid}" 2>/dev/null || true
+            wait "${watcher_pid}" 2>/dev/null || true
+          fi
 
       - name: Install report dependencies
         if: always()
