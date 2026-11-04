@@ -217,26 +217,255 @@ class CheckpointReader:
         return found
 
 
+# ---- markdown as Telegram HTML --------------------------------------------
+
+_CODE_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+_LIST_RE = re.compile(r"^([-*+]|\d+[.)])\s+(.*)$")
+_RULE_RE = re.compile(r"^([-*_])(?:\s*\1){2,}$")
+_SEPARATOR_CELL_RE = re.compile(r"^:?-{2,}:?$")
+_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+
+
+def render_inline(text: str) -> str:
+    """The inline markdown of a text as Telegram HTML."""
+    parts: list[str] = []
+    for chunk in re.split(r"(`[^`]+`)", str(text)):
+        if len(chunk) > 2 and chunk.startswith("`") and chunk.endswith("`"):
+            parts.append(f"<code>{html.escape(chunk[1:-1].strip(), quote=False)}</code>")
+            continue
+        parts.append(_render_span(chunk))
+    return "".join(parts)
+
+
+def _render_span(text: str) -> str:
+    """Escape a plain span and apply the inline markdown of it."""
+    out = html.escape(text, quote=False)
+
+    def link(match: re.Match) -> str:
+        label, url = match.group(1), match.group(2)
+        if not re.match(r"^https?://", url, re.IGNORECASE):
+            return label
+        return f'<a href="{html.escape(url, quote=True)}">{label}</a>'
+
+    out = _LINK_RE.sub(link, out)
+    out = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", out)
+    out = re.sub(r"__([^_]+)__", r"<b>\1</b>", out)
+    out = re.sub(r"~~([^~]+)~~", r"<s>\1</s>", out)
+    out = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<i>\1</i>", out)
+    out = re.sub(r"(?<![\w_])_([^_\n]+)_(?![\w_])", r"<i>\1</i>", out)
+    return out
+
+
+def render_blocks(text: str) -> list[str]:
+    """Render markdown into Telegram-HTML blocks.
+
+    Every block is a complete piece of HTML on its own, and every line inside
+    a block carries balanced tags, so a block can be sent or split without
+    breaking the markup.
+    """
+    lines = str(text or "").splitlines()
+    blocks: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+
+        if _CODE_FENCE_RE.match(line):
+            fence = stripped[:3]
+            index += 1
+            code: list[str] = []
+            while index < len(lines) and not lines[index].strip().startswith(fence):
+                code.append(lines[index])
+                index += 1
+            index += 1
+            content = "\n".join(code).strip("\n")
+            if content:
+                blocks.append(f"<pre>{html.escape(content, quote=False)}</pre>")
+            continue
+
+        if _RULE_RE.match(stripped):
+            index += 1
+            continue
+
+        if stripped.startswith("|"):
+            table: list[str] = []
+            while index < len(lines) and lines[index].strip().startswith("|"):
+                table.append(lines[index].strip())
+                index += 1
+            rendered = _render_table(table)
+            if rendered:
+                blocks.append(rendered)
+            continue
+
+        heading = _HEADING_RE.match(stripped)
+        if heading:
+            blocks.append(f"<b>{render_inline(heading.group(2).strip())}</b>")
+            index += 1
+            continue
+
+        if stripped.startswith(">"):
+            quoted: list[str] = []
+            while index < len(lines) and lines[index].strip().startswith(">"):
+                quoted.append(lines[index].strip().lstrip(">").strip())
+                index += 1
+            blocks.append(f"<blockquote>{render_inline(' '.join(quoted))}</blockquote>")
+            continue
+
+        if _LIST_RE.match(stripped):
+            items: list[str] = []
+            while index < len(lines):
+                current = lines[index]
+                match = _LIST_RE.match(current.strip())
+                if not match:
+                    break
+                depth = (len(current) - len(current.lstrip())) // 2
+                marker = "• " if depth == 0 else "↳ "
+                items.append(f"{marker}{render_inline(match.group(2))}")
+                index += 1
+            blocks.append("\n".join(items))
+            continue
+
+        if stripped:
+            paragraph = [stripped]
+            index += 1
+            while index < len(lines):
+                following = lines[index].strip()
+                if (
+                    not following
+                    or following.startswith(("#", ">", "|", "```", "~~~"))
+                    or _LIST_RE.match(following)
+                    or _RULE_RE.match(following)
+                ):
+                    break
+                paragraph.append(following)
+                index += 1
+            blocks.append(render_inline(" ".join(paragraph)))
+            continue
+
+        index += 1
+
+    return [block for block in blocks if block.strip()]
+
+
+def _table_cells(row: str) -> list[str]:
+    """The cells of one markdown table row, in their columns."""
+    text = row.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|"):
+        text = text[:-1]
+    return [cell.strip() for cell in text.split("|")]
+
+
+def _is_separator_row(cells: list[str]) -> bool:
+    """A row of dashes is the separator of a markdown table, not data."""
+    filled = [cell for cell in cells if cell]
+    return bool(filled) and all(_SEPARATOR_CELL_RE.match(cell) for cell in filled)
+
+
+def _render_table(rows: list[str]) -> str:
+    """Render a markdown table as readable lines; Telegram has no tables."""
+    parsed = [_table_cells(row) for row in rows]
+    if not parsed:
+        return ""
+    has_header = len(parsed) > 1 and _is_separator_row(parsed[1])
+    header = parsed[0] if has_header else []
+    data = [cells for cells in parsed[1:] if not _is_separator_row(cells)] if has_header else []
+    if not has_header:
+        data = [cells for cells in parsed if not _is_separator_row(cells)]
+    lines: list[str] = []
+    for cells in data:
+        pieces: list[str] = []
+        for position, value in enumerate(cells):
+            if not value:
+                continue
+            label = header[position] if position < len(header) else ""
+            text = render_inline(value)
+            if label:
+                pieces.append(f"<b>{render_inline(label)}:</b> {text}")
+            else:
+                pieces.append(text)
+        if pieces:
+            lines.append("• " + " · ".join(pieces))
+    return "\n".join(lines)
+
+
+def _tags_balanced(text: str) -> bool:
+    """Whether every tag of the text is closed."""
+    stack: list[str] = []
+    for match in re.finditer(r"<(/?)([a-zA-Z]+)[^>]*>", text):
+        closing, name = match.group(1), match.group(2)
+        if closing:
+            if not stack or stack[-1] != name:
+                return False
+            stack.pop()
+        elif not match.group(0).endswith("/>"):
+            stack.append(name)
+    return not stack
+
+
+def _cut_balanced(text: str, limit: int) -> str:
+    """The longest prefix that fits in `limit` and whose tags are balanced."""
+    if len(text) <= limit:
+        return text
+    newline = text.rfind("\n", 0, limit + 1)
+    if newline > 0 and _tags_balanced(text[:newline]):
+        return text[:newline]
+    stack: list[str] = []
+    index = 0
+    cut = 0
+    while index < len(text):
+        if text[index] == "<":
+            end = text.find(">", index)
+            if end == -1:
+                break
+            tag = text[index : end + 1]
+            if tag.startswith("</"):
+                name = tag[2:-1].strip()
+                if stack and stack[-1] == name:
+                    stack.pop()
+            elif not tag.endswith("/>") and not tag.startswith("<!"):
+                parts = tag[1:-1].split()
+                stack.append(parts[0] if parts else "")
+            index = end + 1
+        else:
+            index += 1
+        if not stack and index <= limit:
+            cut = index
+    if cut <= 0:
+        cut = text.rfind("<", 0, limit + 1)
+        if cut <= 0:
+            cut = limit
+    return text[:cut]
+
+
 class LiveMessage:
     """One Telegram message that grows while the run goes on.
 
-    The text sits in an expandable blockquote: the header stays visible and the
-    conversation can be folded away. When the block no longer fits in one
+    The header names the ticker and the state of the run. The conversation
+    sits in an expandable blockquote, so the header stays visible and the text
+    can be folded away. The agents write markdown, so their words are rendered
+    into Telegram HTML first: a heading becomes bold text, a table becomes
+    readable lines and a horizontal rule disappears, instead of the markdown
+    source leaking into the chat. When the block no longer fits in one
     Telegram message, the rest continues in the next one.
     """
 
-    def __init__(self, client, chat_id: int, header: str, max_chars: int = MAX_BLOCK_CHARS):
+    def __init__(self, client, chat_id, ticker: str, max_chars: int = MAX_BLOCK_CHARS):
         self.client = client
         self.chat_id = chat_id
-        self.header = header
+        self.ticker = ticker
+        self.state = "thinking"
+        self.header = build_header(ticker, self.state)
         self.max_chars = int(max_chars)
         self.message_id: int | None = None
         self._body = ""
-        self._pending = ""
+        self._pending: list[str] = []
 
     @property
     def pending(self) -> str:
-        return self._pending
+        return "\n".join(self._pending)
 
     @property
     def body(self) -> str:
@@ -244,7 +473,7 @@ class LiveMessage:
         return self._body
 
     def _render(self, body: str) -> str:
-        return f"{self.header}\n<blockquote expandable>{html.escape(body)}</blockquote>"
+        return f"{self.header}\n<blockquote expandable>{body}</blockquote>"
 
     def _send(self, body: str) -> int:
         response = self.client.call(
@@ -272,10 +501,19 @@ class LiveMessage:
             },
         )
 
+    def start(self) -> None:
+        """Publish the empty card, so the chat shows the run right away."""
+        if self.message_id is not None:
+            return
+        self.message_id = self._send(self._body)
+
     def add(self, entries) -> None:
         """Queue agent messages for the next publish."""
         for label, text in entries:
-            self._pending += f"\n\n— {label} —\n{text}"
+            if self._pending:
+                self._pending.append("")
+            self._pending.append(f"<b>{html.escape(label, quote=False)}</b>")
+            self._pending.extend(render_blocks(text))
 
     def flush(self) -> None:
         """Publish what is queued.
@@ -283,29 +521,68 @@ class LiveMessage:
         The content that could not be published stays queued, so a rate limit
         or a temporary network failure loses nothing.
         """
-        pending = self._pending.strip("\n")
-        if not pending:
+        if not self._pending:
             return
-        consumed = 0
+
+        # Work on a copy: the queue is only shortened after a successful call.
+        pending = list(self._pending)
+        body = self._body
+        original = self._body
+        chunks: list[str] = []
         while pending:
-            room = self.max_chars - len(self._body) - (2 if self._body else 0)
+            room = self.max_chars - len(body) - (2 if body else 0)
             if room < 200:
-                self.message_id = None
-                self._body = ""
-                continue
-            head = pending[:room]
-            self._body = (self._body + "\n\n" + head) if self._body else head
-            if self.message_id is None:
-                self.message_id = self._send(self._body)
-            else:
-                self._edit(self._body)
-            consumed += len(head)
-            pending = pending[room:].lstrip("\n")
-            if pending:
                 # The current message is full; the rest goes to the next one.
+                chunks.append(body)
+                body = ""
+                continue
+            head = pending[0]
+            if not head:
+                pending.pop(0)
+                if body:
+                    body += "\n"
+                continue
+            if len(head) > room:
+                # Cut the block at a boundary that keeps the tags balanced.
+                piece = _cut_balanced(head, room)
+                if not piece:
+                    chunks.append(body)
+                    body = ""
+                    continue
+                body = (body + "\n\n" + piece) if body else piece
+                pending[0] = head[len(piece) :]
+                chunks.append(body)
+                body = ""
+                continue
+            body = (body + "\n\n" + head) if body else head
+            pending.pop(0)
+        chunks.append(body)
+
+        for index, text in enumerate(chunks):
+            if index:
+                # The rest of the conversation continues in the next message.
                 self.message_id = None
-                self._body = ""
-        self._pending = self._pending[consumed:].lstrip("\n")
+            elif text == original:
+                # Nothing new for the message that is already open.
+                continue
+            if index or text:
+                self._publish(text)
+                self._body = text
+        self._pending = pending
+
+    def _publish(self, body: str) -> None:
+        if self.message_id is None:
+            self.message_id = self._send(body)
+        else:
+            self._edit(body)
+
+    def finish(self) -> None:
+        """Mark the run as finished and publish the last of the conversation."""
+        self.state = "done"
+        self.header = build_header(self.ticker, self.state)
+        self.flush()
+        if self.message_id is not None:
+            self._edit(self._body)
 
     def action(self) -> None:
         """Show the typing indicator."""
@@ -319,13 +596,13 @@ def checkpoint_path(cache_dir: str, ticker: str) -> str:
     return os.path.join(cache_dir, "checkpoints", f"{ticker.upper()}.db")
 
 
-def build_header(ticker: str, request_id: str = "") -> str:
-    title = html.escape(str(ticker or ""))
-    request = html.escape(str(request_id or "")[:10])
-    header = f"🧠 <b>گفتگوی ایجنت‌ها</b> · <b>{title}</b>"
-    if request:
-        header += f" · <code>{request}</code>"
-    return header + "\n<i>در حال اجرا — این پیام زنده به‌روز می‌شود</i>"
+def build_header(ticker: str, state: str = "thinking") -> str:
+    """The header of the live card: the ticker first, then the state."""
+    title = html.escape(str(ticker or "").upper())
+    label = "thinking…" if state == "thinking" else "done"
+    if not title:
+        return f"📊 <i>{label}</i>"
+    return f"📊 <b>{title}</b> · <i>{label}</i>"
 
 
 def watch(
@@ -343,8 +620,14 @@ def watch(
     """Follow the agents until the run ends."""
     client = client or TelegramClient(token)
     reader = CheckpointReader(db_path)
-    message = LiveMessage(client, chat_id, build_header(ticker, request_id))
+    message = LiveMessage(client, chat_id, ticker)
     should_stop = should_stop or (lambda: False)
+
+    # The card goes out right away, so the chat shows the run while the first
+    # agent is still thinking.
+    with contextlib.suppress(TelegramError):
+        message.start()
+    print(f"live stream: following {ticker} (request {request_id})", flush=True)
 
     last_edit = 0.0
     last_action = 0.0
@@ -373,7 +656,7 @@ def watch(
         time.sleep(interval)
 
     with contextlib.suppress(TelegramError):
-        message.flush()
+        message.finish()
 
 
 def main(argv: list[str] | None = None) -> int:
