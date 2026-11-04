@@ -238,6 +238,11 @@ class LiveMessage:
     def pending(self) -> str:
         return self._pending
 
+    @property
+    def body(self) -> str:
+        """The text the current message carries."""
+        return self._body
+
     def _render(self, body: str) -> str:
         return f"{self.header}\n<blockquote expandable>{html.escape(body)}</blockquote>"
 
@@ -356,10 +361,11 @@ def watch(
             try:
                 message.flush()
                 last_edit = now
+                print(f"live stream: published up to {len(message.body)} characters", flush=True)
             except TelegramRateLimited:
                 last_edit = now - edit_seconds + 1
-            except TelegramError:
-                pass
+            except TelegramError as error:
+                print(f"live stream: {error}", flush=True)
         if now - last_action >= action_seconds:
             with contextlib.suppress(TelegramError):
                 message.action()
