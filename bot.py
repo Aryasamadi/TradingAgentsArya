@@ -51,6 +51,21 @@ ANALYST_LABEL = {
 }
 
 TERMINAL = ("success", "failure", "cancelled")
+# Every non-terminal status GitHub reports for a workflow run. A run that waits
+# behind a concurrency group is reported as "pending", a run without a free
+# runner as "waiting" — asking only for "queued" and "in_progress" hid them.
+ACTIVE_STATUSES = ("queued", "pending", "waiting", "requested", "in_progress")
+QUEUE_STATUSES = ("queued", "pending")
+RUN_STATUS_LABEL = {
+    "queued": "در صف",
+    "pending": "منتظر نوبت",
+    "waiting": "منتظر رانر",
+    "requested": "درخواست شده",
+    "in_progress": "در حال اجرا",
+    "success": "موفق",
+    "failure": "ناموفق",
+    "cancelled": "لغو شده",
+}
 KNOWN_SUFFIXES = ("/chat/completions", "/completions", "/messages", "/generateContent")
 
 DB = sqlite3.connect(STATE_PATH, check_same_thread=False)
@@ -687,7 +702,7 @@ def fetch_models_list(base_url: str, token: str) -> list[str]:
 
 def fetch_active_runs():
     active = []
-    for status in ("queued", "in_progress"):
+    for status in ACTIVE_STATUSES:
         try:
             data = gh("GET", f"/actions/workflows/{WORKFLOW}/runs?status={status}&per_page=50", timeout=15) or {}
             for run in data.get("workflow_runs", []):
@@ -1075,9 +1090,12 @@ def home_screen(chat_id: int, force_new: bool = False, target_mid: int | None = 
     mrow = q1("SELECT name FROM models WHERE id=?", (aid,)) if aid else None
     model_line = f"مدل فعال: <b>{esc(mrow['name'])}</b>" if mrow else "مدل فعال: <b>تنظیم نشده</b>"
 
-    busy_row = q1("SELECT COUNT(*) c FROM runs WHERE status NOT IN " + str(TERMINAL))
+    busy_row = q1(
+        "SELECT COUNT(*) c FROM runs WHERE status NOT IN " + str(TERMINAL) + " AND chat_id=?",
+        (chat_id,),
+    )
     busy = int(busy_row["c"]) if busy_row else 0
-    live = f"\n🟡 اجرای فعال: <b>{busy}</b>" if busy else ""
+    live = f"\n🟡 اجرای فعال شما: <b>{busy}</b>" if busy else ""
 
     text = (
         f"<b>🤖 TradingAgentsArya</b>\n"
@@ -1491,29 +1509,169 @@ def backtest_confirm_screen(chat_id: int, target_mid: int | None = None) -> int:
     )
 
 
+def _request_id_from_title(title: str) -> str:
+    """The engine workflow names every run 'Engine · <request_id>'."""
+    text = str(title or "")
+    if "·" in text:
+        text = text.split("·", 1)[1]
+    return text.strip()
+
+
+def _subject_of(payload_json: str) -> str:
+    try:
+        params = json.loads(payload_json or "{}")
+    except Exception:
+        params = {}
+    if not isinstance(params, dict):
+        params = {}
+    raw = params.get("ticker") or params.get("tickers") or "—"
+    if isinstance(raw, (list, tuple)):
+        return ", ".join(str(item) for item in raw) or "—"
+    return str(raw)
+
+
+def _collect_active_runs(chat_id: int, api_runs: list, db_rows: list, is_admin: bool = False) -> list[dict]:
+    """Merge live workflow runs and local run rows into one list for this chat.
+
+    A live run is attributed to a chat through its local row, because the
+    request id is part of the workflow run name. Rows without a live
+    counterpart are kept too, so a run that the API does not list yet (or that
+    finished between two refreshes) is never silently dropped.
+    """
+    rows_by_request: dict[str, dict] = {}
+    for row in db_rows or []:
+        data = dict(row)
+        rows_by_request[str(data.get("request_id") or "")] = data
+
+    entries: list[dict] = []
+    seen: set[str] = set()
+
+    for run in api_runs or []:
+        request_id = _request_id_from_title(run.get("display_title"))
+        if not request_id or request_id in seen:
+            continue
+        row = rows_by_request.get(request_id)
+        owner = int(row["chat_id"]) if row and row.get("chat_id") is not None else None
+        if owner is not None and owner != chat_id and not is_admin:
+            continue
+        seen.add(request_id)
+        entries.append(
+            {
+                "request_id": request_id,
+                "workflow_run_id": run.get("id"),
+                "status": str(run.get("status") or "queued"),
+                "created_at": str(run.get("created_at") or (row or {}).get("created_at") or ""),
+                "subject": _subject_of((row or {}).get("payload_json") or ""),
+                "owner": owner,
+                "known_owner": owner is not None,
+                # Only a run this chat owns may be cancelled from this screen.
+                "cancelable": bool(run.get("id")) and (owner == chat_id or is_admin),
+                "stale": False,
+            }
+        )
+
+    for request_id, row in rows_by_request.items():
+        if not request_id or request_id in seen:
+            continue
+        status = str(row.get("status") or "queued")
+        if status in TERMINAL:
+            continue
+        owner = row.get("chat_id")
+        owner_id = int(owner) if owner is not None else None
+        if owner_id is not None and owner_id != chat_id and not is_admin:
+            continue
+        entries.append(
+            {
+                "request_id": request_id,
+                "workflow_run_id": row.get("workflow_run_id"),
+                "status": status,
+                "created_at": str(row.get("created_at") or ""),
+                "subject": _subject_of(row.get("payload_json") or ""),
+                "owner": owner_id,
+                "known_owner": owner_id is not None,
+                "cancelable": bool(row.get("workflow_run_id")) and (owner_id == chat_id or is_admin),
+                "stale": True,
+            }
+        )
+
+    queued = sorted(
+        (entry for entry in entries if entry["status"] in QUEUE_STATUSES),
+        key=lambda entry: str(entry["created_at"] or ""),
+    )
+    for position, entry in enumerate(queued, 1):
+        entry["queue_position"] = position
+    for entry in entries:
+        entry.setdefault("queue_position", 0)
+
+    running = sorted(
+        (entry for entry in entries if entry["status"] not in QUEUE_STATUSES),
+        key=lambda entry: str(entry["created_at"] or ""),
+        reverse=True,
+    )
+    return running + queued
+
+
+def _send_run_card(chat_id: int, mode: str, request_id: str, params: dict) -> None:
+    """Announce a dispatched run in a message of its own.
+
+    A chat keeps one shared UI message for the screens. Writing the
+    confirmation there replaced the announcement of the previous run, so with
+    several runs in flight only the last one was visible.
+    """
+    label = "تحلیل" if mode == "analysis" else "بک‌تست"
+    raw_subject = params.get("ticker") or params.get("tickers") or "—"
+    subject = (
+        ", ".join(str(item) for item in raw_subject)
+        if isinstance(raw_subject, (list, tuple))
+        else str(raw_subject)
+    )
+    send_message(
+        chat_id,
+        f"<b>🚀 {esc(label)} ثبت شد</b>\n"
+        f"شناسه: <code>{esc(request_id[:10])}</code>\n"
+        f"موضوع: <b>{esc(subject)}</b>\n"
+        f"وضعیت: 🕒 در صف\n"
+        f"<i>این کارت مستقل است؛ با ثبت اجرای بعدی پاک نمی‌شود.</i>",
+        [[("📊 اجراهای جاری", "active_runs"), ("🏠 خانه", "home")]],
+    )
+
+
 def active_runs_screen(chat_id: int, target_mid: int | None = None) -> int:
-    runs = list(CACHE.get("runs", []))
-    lines = ["<b>📊 اجراهای جاری</b>\nلیست پردازش‌هایی که هم‌اکنون در حال اجرا یا در صف انتظار هستند."]
+    api_runs = list(CACHE.get("runs", []))
+    db_rows = [
+        dict(row)
+        for row in q(
+            "SELECT * FROM runs WHERE status NOT IN " + str(TERMINAL) + " ORDER BY created_at DESC LIMIT 50"
+        )
+    ]
+    entries = _collect_active_runs(chat_id, api_runs, db_rows, admin(chat_id))
+
+    lines = [
+        "<b>📊 اجراهای جاری</b>\nپردازش‌هایی که هم‌اکنون در حال اجرا یا در صف انتظار هستند.",
+    ]
     buttons = []
 
-    if runs:
-        lines.append("")
-        for idx, run in enumerate(sorted(runs, key=lambda x: str(x.get("created_at", "")), reverse=True), 1):
-            lines.append(f"<b>#{idx}</b> 🟡 <b>{esc(run.get('display_title') or 'Engine')}</b>")
-            lines.append(f"⏱ {esc(format_run_time(run.get('created_at')))}")
-            buttons.append([("🛑 لغو #" + str(idx), f"cancelw:{run.get('id')}")])
+    if entries:
+        lines.append(f"\n<b>{len(entries)}</b> پردازش فعال")
+        for idx, entry in enumerate(entries, 1):
+            status = entry["status"]
+            icon = "🟢" if status == "in_progress" else "🕒"
+            label = "وضعیت نامشخص" if entry.get("stale") else RUN_STATUS_LABEL.get(status, status)
+            line = f"<b>#{idx}</b> {icon} <b>{esc(entry['subject'])}</b> — {esc(label)}"
+            if entry.get("queue_position"):
+                line += f" · نوبت {entry['queue_position']}"
+            elapsed = format_run_time(entry["created_at"])
+            if elapsed:
+                line += f" · ⏱ {esc(elapsed)}"
+            if not entry.get("known_owner"):
+                line += " · <i>مالک نامشخص</i>"
+            lines.append(line)
+            lines.append(f"<code>{esc(entry['request_id'][:10])}</code>")
+            if entry.get("cancelable"):
+                buttons.append([("🛑 لغو #" + str(idx), f"cancelw:{entry['workflow_run_id']}")])
             lines.append("")
     else:
-        local = q("SELECT * FROM runs WHERE status NOT IN " + str(TERMINAL) + " ORDER BY created_at DESC LIMIT 5")
-        if local:
-            lines.append("")
-            for idx, row in enumerate(local, 1):
-                lines.append(f"<b>#{idx}</b> 🟡 <code>{esc(row['request_id'][:8])}</code> | <b>{esc(row['status'])}</b>")
-                if row["workflow_run_id"]:
-                    buttons.append([("🛑 لغو #" + str(idx), f"cancelw:{row['workflow_run_id']}")])
-                lines.append("")
-        else:
-            lines.append("\n✅ هیچ پردازش فعالی در حال حاضر وجود ندارد.")
+        lines.append("\n✅ هیچ پردازش فعالی در حال حاضر وجود ندارد.")
 
     buttons.append([("🔄 تازه‌سازی", "active_runs"), ("🏠 خانه", "home")])
     return show(chat_id, "\n".join(lines), buttons, target_mid)
@@ -1557,11 +1715,18 @@ def outputs_screen(chat_id: int, page: int = 0, target_mid: int | None = None) -
         is_active = row["status"] not in TERMINAL
         status_icon = "🟡" if is_active else "✅" if row["status"] == "success" else "❌"
 
-        lines.append(f"<b>#{idx}</b> {status_icon} <code>{esc(row['request_id'][:8])}</code> <b>{esc(subject)}</b> | {esc(created_str)}")
+        line = f"<b>#{idx}</b> {status_icon} <code>{esc(row['request_id'][:8])}</code> <b>{esc(subject)}</b> | {esc(created_str)}"
+        if is_active:
+            label = RUN_STATUS_LABEL.get(row["status"], row["status"])
+            elapsed = format_run_time(row["created_at"])
+            line += f" · {esc(label)}" + (f" · ⏱ {esc(elapsed)}" if elapsed else "")
+        lines.append(line)
 
         btn_row = [("📄 گزارش #" + str(idx), f"view_output:{row['request_id']}")]
         if is_active:
-            btn_row.append(("⚠️ در حال اجرا", "noop"))
+            # Re-render this page instead of a dead button, so the status of a
+            # running row can be watched without leaving the list.
+            btn_row.append(("🔄 تازه‌سازی", f"outputs_page:{page}"))
         else:
             btn_row.append(("🗑 حذف #" + str(idx), f"ask_delete:{row['request_id']}"))
 
@@ -1744,7 +1909,9 @@ def callback(query: dict[str, Any]) -> None:
         if data == "home":
             WIZARDS.pop(chat_id, None)
             FLOWS.pop(chat_id, None)
-            home_screen(chat_id, target_mid=cb_mid)
+            # The persistent UI message, not the pressed one: a run card is a
+            # message of its own and must survive the navigation.
+            home_screen(chat_id)
 
         elif data == "models":
             models_screen(chat_id, page=0, target_mid=cb_mid)
@@ -2000,16 +2167,18 @@ def callback(query: dict[str, Any]) -> None:
             models_screen(chat_id, page=last_page, target_mid=cb_mid)
 
         elif data == "active_runs":
-            active_runs_screen(chat_id, cb_mid)
+            # Rendered in the persistent UI message so a run card (a message of
+            # its own) is not overwritten by the list.
+            active_runs_screen(chat_id)
 
         elif data.startswith("cancelw:"):
             run_id = int(data.split(":", 1)[1])
             try:
                 cancel_run(run_id)
                 answer_callback(query["id"], "🛑 لغو شد.", True)
-                active_runs_screen(chat_id, cb_mid)
+                active_runs_screen(chat_id)
             except Exception as exc:
-                show(chat_id, f"<b>❌ لغو ناموفق</b>\n{esc(exc)}", [[("بازگشت", "active_runs")]], cb_mid)
+                show(chat_id, f"<b>❌ لغو ناموفق</b>\n{esc(exc)}", [[("بازگشت", "active_runs")]])
 
         elif data == "outputs":
             outputs_screen(chat_id, page=0, target_mid=cb_mid)
@@ -2167,12 +2336,8 @@ def callback(query: dict[str, Any]) -> None:
             label = "تحلیل" if mode == "analysis" else "بک‌تست"
             answer_callback(query["id"], f"🚀 {label} در صف!", True)
 
-            show(
-                chat_id,
-                f"<b>🚀 در صف</b>\n<code>{esc(request_id[:10])}</code>",
-                [[("📊 اجراها", "active_runs"), ("🏠 خانه", "home")]],
-                cb_mid,
-            )
+            _send_run_card(chat_id, mode, request_id, params)
+            home_screen(chat_id)
 
         elif data == "noop":
             pass

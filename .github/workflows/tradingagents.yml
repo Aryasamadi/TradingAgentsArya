@@ -126,6 +126,10 @@ jobs:
     concurrency:
       group: tradingagents-engine-${{ github.repository }}
       cancel-in-progress: false
+      # Without an explicit queue the group keeps a single pending run, and a
+      # new dispatch cancels the one that was waiting. queue: max lets several
+      # analyses wait their turn instead of being killed.
+      queue: max
     env:
       # Upstream writes its reports, its data cache and its trading memory
       # under ~/.tradingagents. The workflow persists .runtime/cache as an
