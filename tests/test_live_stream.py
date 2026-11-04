@@ -140,7 +140,7 @@ def test_reader_survives_a_database_without_the_table(tmp_path):
 
 def test_the_message_is_sent_once_and_then_grows():
     client = FakeClient()
-    message = live_stream.LiveMessage(client, 42, "🧠 <b>گفتگوی ایجنت‌ها</b>")
+    message = live_stream.LiveMessage(client, 42, "BTC")
 
     message.add([("تحلیل‌گر بازار", "اولین گفتگو")])
     message.flush()
@@ -154,13 +154,13 @@ def test_the_message_is_sent_once_and_then_grows():
     assert "اولین گفتگو" in sent
     assert "اولین گفتگو" in edited  # the block grows, it does not replace
     assert "دومین گفتگو" in edited
-    assert edited.startswith("🧠 <b>گفتگوی ایجنت‌ها</b>\n<blockquote expandable>")
+    assert edited.startswith("📊 <b>BTC</b> · <i>thinking…</i>\n<blockquote expandable>")
     assert edited.endswith("</blockquote>")
 
 
 def test_the_text_sits_in_an_expandable_blockquote():
     client = FakeClient()
-    message = live_stream.LiveMessage(client, 42, "header")
+    message = live_stream.LiveMessage(client, 42, "BTC")
     message.add([("تحلیل‌گر", "سلام")])
     message.flush()
 
@@ -169,7 +169,7 @@ def test_the_text_sits_in_an_expandable_blockquote():
 
 def test_html_in_the_agents_text_is_escaped():
     client = FakeClient()
-    message = live_stream.LiveMessage(client, 42, "header")
+    message = live_stream.LiveMessage(client, 42, "BTC")
     message.add([("تحلیل‌گر", "<b>bold</b> & <script>")])
     message.flush()
 
@@ -180,7 +180,7 @@ def test_html_in_the_agents_text_is_escaped():
 
 def test_a_full_block_continues_in_the_next_message():
     client = FakeClient()
-    message = live_stream.LiveMessage(client, 42, "header", max_chars=500)
+    message = live_stream.LiveMessage(client, 42, "BTC", max_chars=500)
 
     # what fits stays in the first message and grows it
     message.add([("تحلیل‌گر", "x" * 200)])
@@ -204,7 +204,7 @@ def test_a_full_block_continues_in_the_next_message():
 
 def test_a_failed_call_keeps_the_content_queued():
     client = FakeClient(fail=True)
-    message = live_stream.LiveMessage(client, 42, "header")
+    message = live_stream.LiveMessage(client, 42, "BTC")
     message.add([("تحلیل‌گر", "مهم")])
 
     with pytest.raises(live_stream.TelegramError):
@@ -215,7 +215,7 @@ def test_a_failed_call_keeps_the_content_queued():
 
 def test_the_typing_action_is_sent():
     client = FakeClient()
-    message = live_stream.LiveMessage(client, 42, "header")
+    message = live_stream.LiveMessage(client, 42, "BTC")
     message.action()
 
     method, payload = client.calls[0]
@@ -280,6 +280,109 @@ def test_the_watcher_publishes_what_the_agents_say(tmp_path):
 
     sent = client.texts("sendMessage")
     assert sent, "the watcher published nothing"
-    assert "من bullish هستم" in sent[0]
-    assert "BTC" in sent[0]
-    assert "request" in sent[0]
+    # the card with the ticker goes out before the first agent speaks
+    assert sent[0].startswith("📊 <b>BTC</b> · <i>thinking…</i>")
+    edited = client.texts("editMessageText")
+    assert edited, "the watcher published nothing"
+    assert "من bullish هستم" in edited[-1]
+    assert "BTC" in edited[-1]
+
+
+# ---- markdown as Telegram HTML --------------------------------------------
+
+
+def test_a_markdown_heading_becomes_bold_text():
+    assert live_stream.render_blocks("## گزارش بازار") == ["<b>گزارش بازار</b>"]
+
+
+def test_a_horizontal_rule_disappears():
+    blocks = live_stream.render_blocks("متن\n\n---\n\nمتن دیگر")
+    assert "---" not in "\n".join(blocks)
+    assert len(blocks) == 2
+
+
+def test_a_table_becomes_readable_lines():
+    table = "| سیگنال | جهت |\n|---|---|\n| معرفی محصول | مثبت |"
+    rendered = "\n".join(live_stream.render_blocks(table))
+    assert "|" not in rendered
+    assert "<b>سیگنال:</b> معرفی محصول" in rendered
+    assert "<b>جهت:</b> مثبت" in rendered
+
+
+def test_a_table_with_more_cells_than_headers_stays_readable():
+    table = "| بخش | نکته |\n|---|---|\n| ETF | نماینده | BTC | بورس |"
+    rendered = "\n".join(live_stream.render_blocks(table))
+    assert "|" not in rendered
+    assert "بورس" in rendered
+
+
+def test_a_code_block_becomes_a_pre_block():
+    assert live_stream.render_blocks('```python\nprint("hi")\n```') == ['<pre>print("hi")</pre>']
+
+
+def test_inline_code_and_links_are_rendered():
+    rendered = live_stream.render_inline("یک `code` و یک [لینک](https://example.com)")
+    assert "<code>code</code>" in rendered
+    assert '<a href="https://example.com">لینک</a>' in rendered
+
+
+def test_no_markdown_source_leaks_into_the_rendered_text():
+    source = """**درش:** خوب
+
+## بخش
+
+- یکی
+- دویی
+
+| ستون | دیگر |
+|---|---|
+| یک | دو |
+
+```
+code
+```
+"""
+    rendered = "\n".join(live_stream.render_blocks(source))
+    assert "**" not in rendered
+    assert not rendered.lstrip().startswith("#")
+    assert "|---" not in rendered
+    assert "```" not in rendered
+    assert rendered.count("<b>") == rendered.count("</b>")
+
+
+def test_a_long_text_is_split_without_breaking_the_tags():
+    client = FakeClient()
+    message = live_stream.LiveMessage(client, 42, "BTC", max_chars=500)
+    message.add([("تحلیل‌گر", "یک پاراگراف بلند. " * 200)])
+    message.flush()
+
+    sends = client.texts("sendMessage")
+    assert len(sends) > 1
+    for text in sends:
+        assert len(text) <= 4096
+        assert text.count("<b>") == text.count("</b>")
+        assert text.endswith("</blockquote>")
+
+
+def test_the_header_names_the_ticker_and_the_state():
+    assert live_stream.build_header("btc") == "📊 <b>BTC</b> · <i>thinking…</i>"
+    assert live_stream.build_header("BTC", "done") == "📊 <b>BTC</b> · <i>done</i>"
+
+
+def test_the_message_starts_with_the_thinking_card():
+    client = FakeClient()
+    message = live_stream.LiveMessage(client, 42, "BTC")
+    message.start()
+    assert client.texts("sendMessage")[0] == (
+        "📊 <b>BTC</b> · <i>thinking…</i>\n<blockquote expandable></blockquote>"
+    )
+
+
+def test_the_message_ends_as_done():
+    client = FakeClient()
+    message = live_stream.LiveMessage(client, 42, "BTC")
+    message.start()
+    message.add([("تحلیل‌گر", "سلام")])
+    message.flush()
+    message.finish()
+    assert client.texts("editMessageText")[-1].startswith("📊 <b>BTC</b> · <i>done</i>")
