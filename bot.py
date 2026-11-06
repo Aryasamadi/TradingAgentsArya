@@ -1187,16 +1187,25 @@ def send_output(chat_id: int, request_id: str) -> None:
     except Exception:
         send_message(chat_id, "📊 گزارش آماده شد.", [[("🏠 خانه", "home")]])
 
-    pdf_name = None
-    for name in names:
-        if os.path.basename(name).lower() == "report.pdf":
-            pdf_name = name
-            break
+    html_name = next((name for name in names if os.path.basename(name).lower() == "report.html"), None)
+    pdf_name = next((name for name in names if os.path.basename(name).lower() == "report.pdf"), None)
+    label = "تحلیل" if row["mode"] == "analysis" else "بک‌تست"
+    params = json.loads(row["payload_json"] or "{}")
+    subject = params.get("ticker") or params.get("tickers") or "—"
+
+    # HTML is mobile-friendly and remains available even when PDF rendering fails.
+    if html_name:
+        try:
+            tg_document(
+                chat_id,
+                "TradingAgents_Report.html",
+                zf.read(html_name),
+                f"🌐 گزارش HTML {label} {subject}"[:1024],
+            )
+        except Exception as exc:
+            send_message(chat_id, f"❌ ارسال HTML ناموفق: {esc(exc)}", [[("بازگشت", "outputs")]])
 
     if not pdf_name:
-        # A run that produced no report tree says so in its status; saying
-        # "PDF not found" there hides the real reason, which is that the
-        # analysis never finished.
         if info.get("status") == "no_report":
             send_message(
                 chat_id,
@@ -1204,21 +1213,16 @@ def send_output(chat_id: int, request_id: str) -> None:
                 [[("🔄 بررسی دوباره", f"view_output:{request_id}"), ("🏠 خانه", "home")]],
             )
             return
-        send_message(chat_id, "⚠️ فایل PDF پیدا نشد.", [[("بازگشت", "outputs")]])
+        if html_name:
+            send_message(chat_id, "⚠️ گزارش HTML ارسال شد؛ فایل PDF برای این اجرا ساخته نشده است.", [[("بازگشت", "outputs")]])
+            return
+        send_message(chat_id, "⚠️ فایل‌های گزارش HTML و PDF پیدا نشدند.", [[("بازگشت", "outputs")]])
         return
 
-    pdf_bytes = zf.read(pdf_name)
-    label = "تحلیل" if row["mode"] == "analysis" else "بک‌تست"
-    params = json.loads(row["payload_json"] or "{}")
-    subject = params.get("ticker") or params.get("tickers") or "—"
-
-    caption = f"📄 گزارش PDF {label} {subject}"[:1024]
-
     try:
-        tg_document(chat_id, "TradingAgents_Report.pdf", pdf_bytes, caption)
+        tg_document(chat_id, "TradingAgents_Report.pdf", zf.read(pdf_name), f"📄 گزارش PDF {label} {subject}"[:1024])
     except Exception as exc:
         send_message(chat_id, f"❌ ارسال PDF ناموفق: {esc(exc)}", [[("بازگشت", "outputs")]])
-
 
 def valid_date(value: str) -> str:
     value = value.strip().lower()
