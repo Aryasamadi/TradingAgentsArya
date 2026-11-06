@@ -28,3 +28,58 @@ class AnalystExecutionPlanTests(unittest.TestCase):
         self.assertEqual(spec.key, "social")
         self.assertEqual(spec.agent_node, "Sentiment Analyst")
         self.assertEqual(spec.report_key, "sentiment_report")
+
+
+class AnalystFailureIsolationTests(unittest.TestCase):
+    def test_one_no_tool_analyst_failure_becomes_visible_report(self):
+        from tradingagents.graph.analyst_execution import AnalystNodeSpec
+        from tradingagents.graph.setup import ANALYST_FAILURE_PREFIX, _analyst_graph
+
+        spec = AnalystNodeSpec(
+            key="broken",
+            agent_node="Broken Analyst",
+            report_key="broken_report",
+            tools=(),
+        )
+
+        def broken_agent(_state):
+            raise RuntimeError("simulated provider outage")
+
+        isolated = _analyst_graph(spec, broken_agent, max_tool_rounds=1)
+        result = isolated({"messages": [("human", "AAPL")]})
+
+        self.assertTrue(result["broken_report"].startswith(ANALYST_FAILURE_PREFIX))
+        self.assertIn("simulated provider outage", result["broken_report"])
+
+    def test_all_analysts_failed_blocks_trade_path(self):
+        from types import SimpleNamespace
+
+        from tradingagents.graph.setup import _check_analyst_results
+
+        specs = [
+            SimpleNamespace(agent_node="Market Analyst", report_key="market_report"),
+            SimpleNamespace(agent_node="News Analyst", report_key="news_report"),
+        ]
+        state = {
+            "market_report": "⚠️ ANALYST FAILURE — Market Analyst",
+            "news_report": "⚠️ ANALYST FAILURE — News Analyst",
+        }
+        with self.assertRaisesRegex(RuntimeError, "All selected analysts failed"):
+            _check_analyst_results(state, specs)
+
+    def test_partial_analyst_failure_is_allowed_when_another_succeeds(self):
+        from types import SimpleNamespace
+
+        from tradingagents.graph.setup import _check_analyst_results
+
+        specs = [
+            SimpleNamespace(agent_node="Market Analyst", report_key="market_report"),
+            SimpleNamespace(agent_node="News Analyst", report_key="news_report"),
+        ]
+        state = {
+            "market_report": "A grounded market report",
+            "news_report": "⚠️ ANALYST FAILURE — News Analyst",
+        }
+        result = _check_analyst_results(state, specs)
+        self.assertIn("ANALYST FAILURE", result["memory_note"])
+        self.assertIn("News Analyst", result["memory_note"])

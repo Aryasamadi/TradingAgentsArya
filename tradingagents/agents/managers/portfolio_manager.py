@@ -33,6 +33,11 @@ def create_portfolio_manager(llm):
         trader_plan = state["trader_investment_plan"]
 
         past_context = state.get("past_context", "")
+        run_warnings = str(state.get("memory_note") or "").strip()
+        warning_line = (
+            f"- Run warnings, including analysts that failed:\n{run_warnings}\n"
+            if run_warnings else ""
+        )
         lessons_line = (
             f"- Lessons from prior decisions and outcomes:\n{past_context}\n"
             if past_context
@@ -58,6 +63,7 @@ def create_portfolio_manager(llm):
 - Research Manager's investment plan: **{research_plan}**
 - Trader's transaction proposal: **{trader_plan}**
 {lessons_line}
+{warning_line}
 **Risk Analysts Debate History:**
 {history}
 

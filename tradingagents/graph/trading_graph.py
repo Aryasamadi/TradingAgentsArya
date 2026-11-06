@@ -159,7 +159,7 @@ class TradingAgentsGraph:
             # The layout itself: a checkpoint saved when analysts ran one after
             # another has pending nodes this graph no longer has, and one saved
             # before the Memory Log step would resume without the lessons.
-            "analysts=parallel",
+            "analysts=parallel-error-isolation-v1",
             "memory=parallel",
             f"settings={digest}",
         ])

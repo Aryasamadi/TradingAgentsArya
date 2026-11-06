@@ -91,7 +91,8 @@ jobs:
       TRADINGAGENTS_CHECKPOINT_ENABLED: "true"
 
       # Reliability / output control
-      TRADINGAGENTS_LLM_MAX_RETRIES: "6"
+      TRADINGAGENTS_LLM_MAX_RETRIES: "0"
+      TRADINGAGENTS_RPM_RETRIES: "3"
       TRADINGAGENTS_MAX_TOKENS: "8192"
 
     steps:
