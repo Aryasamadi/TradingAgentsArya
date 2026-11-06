@@ -22,6 +22,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MAX_TOOL_ROUNDS":      "max_tool_rounds",
     "TRADINGAGENTS_CHECKPOINT_ENABLED":   "checkpoint_enabled",
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
+    "TRADINGAGENTS_HOLDING_PERIOD_DAYS": "holding_period_days",
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
     "TRADINGAGENTS_MAX_TOKENS":           "max_tokens",
@@ -80,7 +81,7 @@ def build_default_config() -> dict:
     Read when the package is imported, as DEFAULT_CONFIG; call it again to see
     the environment as it is now.
     """
-    return _apply_env_overrides({
+    config = _apply_env_overrides({
         "results_dir": os.getenv("TRADINGAGENTS_RESULTS_DIR") or os.path.join(_TRADINGAGENTS_HOME, "logs"),
         "data_cache_dir": os.getenv("TRADINGAGENTS_CACHE_DIR") or os.path.join(_TRADINGAGENTS_HOME, "cache"),
         "memory_log_path": os.getenv("TRADINGAGENTS_MEMORY_LOG_PATH") or os.path.join(_TRADINGAGENTS_HOME, "memory", "trading_memory.md"),
@@ -204,6 +205,25 @@ def build_default_config() -> dict:
         },
 
     })
+    # Structured provider-routing maps are JSON because their keys are dynamic.
+    # Only dictionaries are accepted; invalid unattended configuration fails early.
+    import json
+
+    for env_name, config_key in (
+        ("TRADINGAGENTS_DATA_VENDORS_JSON", "data_vendors"),
+        ("TRADINGAGENTS_TOOL_VENDORS_JSON", "tool_vendors"),
+    ):
+        raw = os.environ.get(env_name, "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON in {env_name}: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{env_name} must contain a JSON object.")
+        config[config_key].update(parsed)
+    return config
 
 
 DEFAULT_CONFIG = build_default_config()
