@@ -35,7 +35,7 @@ def create_portfolio_manager(llm):
         past_context = state.get("past_context", "")
         run_warnings = str(state.get("memory_note") or "").strip()
         warning_line = (
-            f"- Run warnings, including analysts that failed:\\n{run_warnings}\\n"
+            f"- Run warnings, including analysts that failed:\n{run_warnings}\n"
             if run_warnings else ""
         )
         lessons_line = (
