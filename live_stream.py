@@ -217,6 +217,55 @@ class CheckpointReader:
         return found
 
 
+class AgentLogReader:
+    """Read newly appended warning/error lines without blocking the engine."""
+
+    ALERT = re.compile(
+        r"\\b(?:ERROR|CRITICAL|WARNING)\\b|rate.?limit|\\b429\\b|analyst failure|\\bfailed\\b",
+        re.IGNORECASE,
+    )
+
+    def __init__(self, log_path: str):
+        self.log_path = str(log_path or "")
+        self.offset = 0
+
+    @staticmethod
+    def _redact(line: str) -> str:
+        for name, value in os.environ.items():
+            if value and len(value) >= 8 and any(
+                part in name.upper() for part in ("API_KEY", "TOKEN", "SECRET")
+            ):
+                line = line.replace(value, "[REDACTED]")
+        line = re.sub(r"\\bsk-[A-Za-z0-9_-]{12,}\\b", "[REDACTED]", line)
+        return re.sub(
+            r"(?i)bearer\\s+[A-Za-z0-9._~+/-]{12,}", "Bearer [REDACTED]", line
+        )
+
+    def poll(self) -> list[tuple[str, str]]:
+        """Return one expandable log update for newly observed agent alerts."""
+        if not self.log_path or not os.path.isfile(self.log_path):
+            return []
+        try:
+            size = os.path.getsize(self.log_path)
+            if size < self.offset:
+                self.offset = 0
+            with open(self.log_path, "rb") as stream:
+                stream.seek(self.offset)
+                chunk = stream.read()
+                self.offset = stream.tell()
+        except OSError:
+            return []
+
+        alerts = []
+        for raw_line in chunk.decode("utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if line and self.ALERT.search(line):
+                alerts.append(self._redact(line)[:500])
+        if not alerts:
+            return []
+        return [("هشدارها و خطاهای موتور", "\\n".join(alerts[-20:]))]
+
+
 # ---- markdown as Telegram HTML --------------------------------------------
 
 _CODE_FENCE_RE = re.compile(r"^\s*(```|~~~)")
@@ -612,6 +661,7 @@ def watch(
     ticker: str,
     request_id: str = "",
     client=None,
+    log_path: str = "",
     should_stop=None,
     interval: float = POLL_SECONDS,
     edit_seconds: float = EDIT_SECONDS,
@@ -620,6 +670,7 @@ def watch(
     """Follow the agents until the run ends."""
     client = client or TelegramClient(token)
     reader = CheckpointReader(db_path)
+    log_reader = AgentLogReader(log_path)
     message = LiveMessage(client, chat_id, ticker)
     should_stop = should_stop or (lambda: False)
 
@@ -638,6 +689,12 @@ def watch(
             entries = []
         if entries:
             message.add(entries)
+        try:
+            log_entries = log_reader.poll()
+        except Exception:
+            log_entries = []
+        if log_entries:
+            message.add(log_entries)
 
         now = time.monotonic()
         if message.pending and now - last_edit >= edit_seconds:
@@ -665,6 +722,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ticker", default="")
     parser.add_argument("--chat-id", required=True)
     parser.add_argument("--request-id", default="")
+    parser.add_argument("--log-path", default="")
     parser.add_argument("--token", default=os.environ.get("TELEGRAM_BOT_TOKEN", ""))
     parser.add_argument("--interval", type=float, default=POLL_SECONDS)
     args = parser.parse_args(argv)
@@ -693,6 +751,7 @@ def main(argv: list[str] | None = None) -> int:
             args.token,
             args.ticker,
             args.request_id,
+            log_path=args.log_path,
             interval=args.interval,
             should_stop=lambda: stopping["flag"],
         )
