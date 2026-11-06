@@ -46,7 +46,7 @@ class AnalystFailureIsolationTests(unittest.TestCase):
             raise RuntimeError("simulated provider outage")
 
         isolated = _analyst_graph(spec, broken_agent, max_tool_rounds=1)
-        result = isolated.invoke({"messages": [("human", "AAPL")]})
+        result = isolated({"messages": [("human", "AAPL")]})
 
         self.assertTrue(result["broken_report"].startswith(ANALYST_FAILURE_PREFIX))
         self.assertIn("simulated provider outage", result["broken_report"])
