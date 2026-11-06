@@ -38,6 +38,10 @@ STATE_FILE_NAME = "bot_state.db"
 # The tables the controller needs to work. An artifact without them is not a
 # state database and must not replace a good one.
 REQUIRED_TABLES = ("providers", "models", "runs")
+# Marker file written next to the state when a durable artifact existed but
+# could not be loaded. The controller then runs with an empty state, and this
+# marker keeps that empty state from being published over the good one.
+MARKER_NAME = "bot_state.restore-incomplete"
 
 
 def run_gh(args: list[str], repo: str) -> str:
@@ -135,8 +139,11 @@ def restore(repo: str, destination: Path) -> int:
         print(f"Could not list state artifacts: {exc}")
         artifacts = []
 
+    marker = destination.with_name(MARKER_NAME)
     if not artifacts:
         print("No state artifact found; starting with a fresh state.")
+        if marker.exists():
+            marker.unlink()
         return 0
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -145,8 +152,14 @@ def restore(repo: str, destination: Path) -> int:
             artifact_id = artifact.get("id")
             if not isinstance(artifact_id, int):
                 continue
-            zip_path = download_artifact(repo, artifact_id, tmp_dir / f"{artifact_id}.zip")
-            extracted = extract_state(zip_path, tmp_dir / f"a{artifact_id}")
+            try:
+                zip_path = download_artifact(repo, artifact_id, tmp_dir / f"{artifact_id}.zip")
+                extracted = extract_state(zip_path, tmp_dir / f"a{artifact_id}")
+            except Exception as exc:
+                # A broken download must not stop the search; the next
+                # artifact may still hold a usable state.
+                print(f"Artifact {artifact_id} could not be downloaded: {exc}")
+                continue
             if extracted is None:
                 print(f"Artifact {artifact_id} has no {STATE_FILE_NAME}; skipping.")
                 continue
@@ -173,9 +186,16 @@ def restore(repo: str, destination: Path) -> int:
             )
             if index > 0:
                 print(f"Newer artifacts ({index}) were unusable and were skipped.")
+            if marker.exists():
+                marker.unlink()
             return 0
 
+    # An artifact exists but none of them could be loaded. The controller now
+    # runs with an empty state, which must not be published over the durable
+    # state that is still waiting in the artifact.
     print("No usable state artifact found; starting with a fresh state.")
+    marker.write_text("a durable state artifact exists but could not be restored\n")
+    print(f"Wrote {marker}; the empty state will not be published.")
     return 0
 
 
@@ -192,6 +212,18 @@ def check(db_path: Path) -> int:
             f"(tables={summary['tables']}); it will not be published."
         )
         return 1
+
+    marker = db_path.with_name(MARKER_NAME)
+    if marker.exists():
+        # The restore could not load the durable state, so this file was
+        # started empty. Publishing it would replace the state that is still
+        # waiting in the artifact.
+        print(
+            f"{marker} exists: the durable state could not be restored, so the "
+            "empty state will not be published."
+        )
+        return 1
+
     print(
         f"State file is valid (providers={summary['providers']}, "
         f"models={summary['models']}, runs={summary['runs']})."

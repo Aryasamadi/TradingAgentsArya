@@ -379,6 +379,79 @@ def test_an_unusable_state_is_not_published():
     assert restore.check(good) == 0
 
 
+def test_an_unrestorable_state_is_not_published_over_the_durable_one():
+    """A failed restore must not wipe the state that waits in the artifact."""
+    restore = _load_restore_module()
+    repo = "Aryasamadi/TradingAgentsArya"
+    work = _STATE_DIR / "restore-fail-work"
+    work.mkdir(parents=True, exist_ok=True)
+
+    broken_zip = work / "100.zip"
+    with zipfile.ZipFile(broken_zip, "w") as archive:
+        archive.writestr("bot_state.db", "this is not a database")
+
+    def fake_list(repo_name):
+        return [{"id": 100, "name": restore.ARTIFACT_NAME, "created_at": "2026-11-05T00:00:00Z"}]
+
+    def fake_download(repo_name, artifact_id, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(broken_zip.read_bytes())
+        return dest
+
+    destination = _STATE_DIR / "restore-fail" / "bot_state.db"
+    with _patched(restore, "list_artifacts", fake_list), _patched(
+        restore, "download_artifact", fake_download
+    ):
+        assert restore.restore(repo, destination) == 0
+
+    marker = destination.with_name(restore.MARKER_NAME)
+    assert marker.exists()
+
+    # The controller now runs with an empty state; publishing it would
+    # replace the durable state that is still in the artifact.
+    empty = _STATE_DIR / "restore-fail" / "empty.db"
+    _make_state_db(empty, providers=0, models=0, runs=0)
+    assert restore.check(empty) == 1
+
+
+def test_a_broken_download_does_not_stop_the_search():
+    """The next artifact may still hold a usable state."""
+    restore = _load_restore_module()
+    repo = "Aryasamadi/TradingAgentsArya"
+    work = _STATE_DIR / "restore-dl-work"
+    work.mkdir(parents=True, exist_ok=True)
+
+    good = _STATE_DIR / "restore-dl-good.db"
+    _make_state_db(good, providers=1, models=1, runs=1)
+    good_zip = work / "99.zip"
+    with zipfile.ZipFile(good_zip, "w") as archive:
+        archive.write(good, "bot_state.db")
+
+    artifacts = [
+        {"id": 100, "name": restore.ARTIFACT_NAME, "created_at": "2026-11-05T00:00:00Z"},
+        {"id": 99, "name": restore.ARTIFACT_NAME, "created_at": "2026-11-04T00:00:00Z"},
+    ]
+
+    def fake_list(repo_name):
+        return artifacts
+
+    def fake_download(repo_name, artifact_id, dest):
+        if artifact_id == 100:
+            raise RuntimeError("network is down")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(good_zip.read_bytes())
+        return dest
+
+    destination = _STATE_DIR / "restore-dl" / "bot_state.db"
+    with _patched(restore, "list_artifacts", fake_list), _patched(
+        restore, "download_artifact", fake_download
+    ):
+        assert restore.restore(repo, destination) == 0
+
+    assert restore.inspect_state(destination)["ok"] is True
+    assert not destination.with_name(restore.MARKER_NAME).exists()
+
+
 def test_the_controller_checkpoints_before_the_state_is_uploaded():
     """The uploaded file must be complete on its own."""
     source = (ROOT / "bot.py").read_text(encoding="utf-8")
