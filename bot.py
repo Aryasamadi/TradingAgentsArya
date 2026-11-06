@@ -210,7 +210,18 @@ def checkpoint_state() -> None:
 
 def get_setting(key: str, default: str = "") -> str:
     row = q1("SELECT value FROM settings WHERE key=?", (key,))
-    return str(row[0]) if row else default
+    if not row:
+        return default
+    # Keep the accessor resilient to lightweight mapping-based DB test doubles
+    # and callers that return named rows rather than sqlite positional rows.
+    if isinstance(row, dict):
+        value = row.get("value", default)
+        return str(value) if value is not None else default
+    try:
+        value = row[0]
+    except (IndexError, KeyError, TypeError):
+        return default
+    return str(value) if value is not None else default
 
 
 def set_setting(key: str, value: str) -> None:
