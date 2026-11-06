@@ -391,14 +391,14 @@ def test_the_message_ends_as_done():
 def test_agent_log_reader_streams_alerts_once_and_redacts_secrets(tmp_path, monkeypatch):
     log = tmp_path / "agent.log"
     log.write_text(
-        "INFO: routine startup\\n"
-        "WARNING: Model Analyst hit requests-per-minute limit; retry 1/3\\n"
-        "ERROR: provider request failed with sk-1234567890abcdefghijk\\n",
+        "INFO: routine startup\n"
+        "WARNING: Model Analyst hit requests-per-minute limit; retry 1/3\n"
+        "ERROR: provider request failed with sk-1234567890abcdefghijk\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("OPENAI_API_KEY", "super-secret-api-key-value")
     with log.open("a", encoding="utf-8") as stream:
-        stream.write("ERROR: leaked token super-secret-api-key-value\\n")
+        stream.write("ERROR: leaked token super-secret-api-key-value\n")
 
     reader = live_stream.AgentLogReader(str(log))
     first = reader.poll()
@@ -412,7 +412,7 @@ def test_agent_log_reader_streams_alerts_once_and_redacts_secrets(tmp_path, monk
 def test_watcher_publishes_engine_errors_inside_the_expandable_live_message(tmp_path):
     db = tmp_path / "BTC.db"
     log = tmp_path / "agent.log"
-    log.write_text("WARNING: Market Analyst hit requests-per-minute limit; retry 1/3\\n", encoding="utf-8")
+    log.write_text("WARNING: Market Analyst hit requests-per-minute limit; retry 1/3\n", encoding="utf-8")
     client = FakeClient()
     polls = {"count": 0}
 
