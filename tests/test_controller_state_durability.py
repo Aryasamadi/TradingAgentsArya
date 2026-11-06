@@ -50,6 +50,17 @@ def _patched(obj, name, value):
 
 
 @contextmanager
+def patch_subprocess(module, fake_run):
+    """Replace subprocess.run in the restore module for one block."""
+    original = module.subprocess.run
+    module.subprocess.run = fake_run
+    try:
+        yield
+    finally:
+        module.subprocess.run = original
+
+
+@contextmanager
 def _no_sleep():
     """Run without waiting; the cancel checks the run back a few times."""
     with _patched(controller, "time", type("T", (), {"sleep": staticmethod(lambda _: None)})):
@@ -468,6 +479,52 @@ def test_a_broken_download_does_not_stop_the_search():
 
     assert restore.inspect_state(destination)["ok"] is True
     assert not destination.with_name(restore.MARKER_NAME).exists()
+
+
+def test_the_gh_calls_do_not_use_a_flag_gh_api_does_not_have():
+    """``gh api`` has no --repo flag; passing one makes every call fail."""
+    restore = _load_restore_module()
+    captured = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(cmd)
+        raise RuntimeError("stop here")
+
+    with patch_subprocess(restore, fake_run), suppress(Exception):
+        restore.list_artifacts("Aryasamadi/TradingAgentsArya")
+
+    assert captured, "the restore must call gh"
+    for cmd in captured:
+        assert cmd[0] == "gh"
+        assert "--repo" not in cmd
+
+
+def test_the_restore_uses_the_token_gh_reads():
+    """gh only looks at GH_TOKEN; the workflow also passes GITHUB_TOKEN."""
+    restore = _load_restore_module()
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env") or {}
+        raise RuntimeError("stop here")
+
+    saved = {name: os.environ.get(name) for name in ("GH_TOKEN", "GITHUB_TOKEN")}
+    os.environ.pop("GH_TOKEN", None)
+    os.environ["GITHUB_TOKEN"] = "token-from-github-token"
+    try:
+        with patch_subprocess(restore, fake_run), suppress(Exception):
+            restore.list_artifacts("Aryasamadi/TradingAgentsArya")
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    assert captured["cmd"][0] == "gh"
+    assert "--repo" not in captured["cmd"]
+    assert captured["env"].get("GH_TOKEN") == "token-from-github-token"
 
 
 def test_the_controller_checkpoints_before_the_state_is_uploaded():
