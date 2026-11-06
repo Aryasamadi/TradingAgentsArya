@@ -943,7 +943,7 @@ def cycle_engine_setting(key: str) -> str:
         raise ValueError("تنظیم موتور ناشناخته است.")
     choices = ENGINE_SETTING_CHOICES[key]
     setting_key = "engine_" + key
-    current = get_setting(setting_key, choices[0])
+    current = get_setting(setting_key, engine_settings_values()[key])
     try:
         index = choices.index(current)
     except ValueError:
