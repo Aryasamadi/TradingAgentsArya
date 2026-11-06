@@ -97,7 +97,10 @@ def apply_setting(value: Any, key: str, raw_value: str) -> dict[str, Any]:
     elif key == "temperature":
         candidate = float(raw_value)
     elif key == "checkpoint_enabled":
-        candidate = raw_value.lower() == "true"
+        normalized_bool = raw_value.strip().lower()
+        if normalized_bool not in {"true", "false"}:
+            raise ValueError(f"Invalid boolean value for {key}: {raw_value!r}")
+        candidate = normalized_bool == "true"
     if candidate not in SETTING_CHOICES[key]:
         raise ValueError(f"مقدار نامعتبر برای {key}: {raw_value}")
     current[key] = candidate
