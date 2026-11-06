@@ -27,7 +27,12 @@ import uuid
 import zipfile
 from typing import Any, Tuple, Optional
 
-BUILD = "v19-pdf"
+from bot_ui_config import (
+    DATA_VENDOR_OPTIONS, SETTING_CHOICES, apply_setting, normalize_run_settings,
+    set_data_vendor, validate_portfolio,
+)
+
+BUILD = "v20-engine-ui"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
@@ -205,7 +210,18 @@ def checkpoint_state() -> None:
 
 def get_setting(key: str, default: str = "") -> str:
     row = q1("SELECT value FROM settings WHERE key=?", (key,))
-    return str(row[0]) if row else default
+    if not row:
+        return default
+    # Keep the accessor resilient to lightweight mapping-based DB test doubles
+    # and callers that return named rows rather than sqlite positional rows.
+    if isinstance(row, dict):
+        value = row.get("value", default)
+        return str(value) if value is not None else default
+    try:
+        value = row[0]
+    except (IndexError, KeyError, TypeError):
+        return default
+    return str(value) if value is not None else default
 
 
 def set_setting(key: str, value: str) -> None:
@@ -575,6 +591,39 @@ def set_active_model(model_id: str) -> None:
     set_setting("active_model", model_id)
 
 
+def tier_model_id(tier: str) -> str:
+    if tier not in {"quick", "deep"}:
+        raise ValueError("ناحیه مدل نامعتبر است.")
+    selected = get_setting(f"{tier}_model_id", "")
+    if selected and q1("SELECT id FROM models WHERE id=? AND enabled=1", (selected,)):
+        return selected
+    return active_model_id()
+
+
+def set_tier_model_id(tier: str, model_id: str) -> None:
+    if tier not in {"quick", "deep"}:
+        raise ValueError("ناحیه مدل نامعتبر است.")
+    row = q1("SELECT id FROM models WHERE id=? AND enabled=1", (model_id,))
+    if not row:
+        raise ValueError("مدل فعال و معتبری انتخاب نشده است.")
+    set_setting(f"{tier}_model_id", model_id)
+
+
+def get_run_settings() -> dict[str, Any]:
+    raw = get_setting("run_settings", "")
+    try:
+        value = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("تنظیمات ذخیره‌شده خراب است؛ از گزینه بازنشانی استفاده کن.") from exc
+    return normalize_run_settings(value)
+
+
+def save_run_settings(value: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_run_settings(value)
+    set_setting("run_settings", json.dumps(normalized, ensure_ascii=False))
+    return normalized
+
+
 def github_secret(name: str, value: str) -> None:
     from nacl import encoding, public
 
@@ -752,37 +801,71 @@ def fetch_active_runs():
 
 
 def dispatch_run(chat_id: int, mode: str, params: dict) -> str:
-    model_id = active_model_id()
-    if not model_id:
-        raise ValueError("اول از بخش مدل‌ها یک مدل فعال کن.")
+    quick_id, deep_id = tier_model_id("quick"), tier_model_id("deep")
+    if not quick_id or not deep_id:
+        raise ValueError("مدل‌های Quick و Deep را در بخش «نقش مدل‌ها» انتخاب کن.")
+    if not STATE_KEY:
+        raise ValueError("برای انتقال امن تنظیمات مستقل مدل‌ها و پورتفولیو، Secret با نام BOT_STATE_KEY باید در GitHub تنظیم شده باشد.")
 
     request_id = uuid.uuid4().hex
+    safe_params = dict(params)
+    portfolio = safe_params.pop("portfolio", None)
+    if portfolio is not None:
+        portfolio = validate_portfolio(portfolio)
+
+    def model_bundle(tier: str, model_id: str) -> dict[str, str]:
+        row = q1("SELECT * FROM models WHERE id=? AND enabled=1", (model_id,))
+        if not row:
+            raise ValueError(f"مدل {tier} حذف شده یا غیرفعال است؛ نقش مدل را دوباره تنظیم کن.")
+        prov = get_provider(row["provider_id"])
+        if not prov:
+            raise ValueError(f"Provider مدل {tier} پیدا نشد.")
+        token = decrypt_token(prov["token_ciphertext"])
+        provider_type = str(prov["provider_type"]).strip().lower()
+        if provider_type not in PROVIDER_SECRET and provider_type not in {"ollama"}:
+            raise ValueError(f"Provider مدل {tier} در نگاشت کلید API پشتیبانی نشده است: {provider_type}")
+        return {
+            "provider_type": provider_type,
+            "model_name": str(row["name"]),
+            "base_url": strip_known_suffix(str(prov["base_url"])),
+            "provider_env_key": PROVIDER_SECRET.get(provider_type, ""),
+            "api_token": token,
+        }
+
+    tiers = {
+        "quick": model_bundle("Quick", quick_id),
+        "deep": model_bundle("Deep", deep_id),
+    }
+
+    # GitHub Actions exposes one environment variable per provider credential.
+    # Two roles may share a provider only when they use the same credential.
+    credentials: dict[str, str] = {}
+    for bundle in tiers.values():
+        env_key, token = bundle["provider_env_key"], bundle["api_token"]
+        if env_key and token:
+            if env_key in credentials and credentials[env_key] != token:
+                raise ValueError(
+                    "برای دو نقش با یک Provider نمی‌توان دو API Token جداگانه در یک اجرا تزریق کرد. "
+                    "از یک Credential مشترک استفاده کن یا برای یکی از نقش‌ها Provider دیگری انتخاب کن."
+                )
+            credentials[env_key] = token
+
+    config = {
+        "request_id": request_id,
+        "tiers": tiers,
+        "run_settings": get_run_settings(),
+    }
+    if portfolio is not None:
+        config["portfolio"] = portfolio
+
     payload = {
         "request_id": request_id,
         "mode": mode,
         "chat_id": str(chat_id),
-        "model_id": model_id,
-        "params": params,
+        "model_id": quick_id,
+        "params": safe_params,
+        "config_enc": encrypt_request_config(config),
     }
-
-    row = q1("SELECT * FROM models WHERE id=? AND enabled=1", (model_id,))
-    prov = get_provider(row["provider_id"]) if row else None
-
-    if row and prov:
-        try:
-            token = decrypt_token(prov["token_ciphertext"])
-            config = {
-                "request_id": request_id,
-                "provider_type": prov["provider_type"],
-                "model_name": row["name"],
-                "base_url": strip_known_suffix(prov["base_url"]),
-                "provider_env_key": PROVIDER_SECRET.get(prov["provider_type"], ""),
-                "api_token": token,
-            }
-            if STATE_KEY:
-                payload["config_enc"] = encrypt_request_config(config)
-        except Exception as exc:
-            sys.stderr.write(f"Failed to build encrypted model config: {exc}\n")
 
     gh(
         "POST",
@@ -793,11 +876,10 @@ def dispatch_run(chat_id: int, mode: str, params: dict) -> str:
     db(
         "INSERT INTO runs(request_id,workflow_run_id,chat_id,mode,payload_json,model_id,status,conclusion,notified,created_at,updated_at) "
         "VALUES(?,?,?,?,?,?,?,?,0,?,?)",
-        (request_id, None, chat_id, mode, json.dumps(params, ensure_ascii=False), model_id, "queued", "", now(), now()),
+        (request_id, None, chat_id, mode, json.dumps(safe_params, ensure_ascii=False), quick_id, "queued", "", now(), now()),
     )
 
     return request_id
-
 
 def sync_run_records() -> None:
     rows = q("SELECT * FROM runs WHERE status NOT IN " + str(TERMINAL) + " ORDER BY created_at DESC LIMIT 30")
@@ -1119,16 +1201,25 @@ def send_output(chat_id: int, request_id: str) -> None:
     except Exception:
         send_message(chat_id, "📊 گزارش آماده شد.", [[("🏠 خانه", "home")]])
 
-    pdf_name = None
-    for name in names:
-        if os.path.basename(name).lower() == "report.pdf":
-            pdf_name = name
-            break
+    html_name = next((name for name in names if os.path.basename(name).lower() == "report.html"), None)
+    pdf_name = next((name for name in names if os.path.basename(name).lower() == "report.pdf"), None)
+    label = "تحلیل" if row["mode"] == "analysis" else "بک‌تست"
+    params = json.loads(row["payload_json"] or "{}")
+    subject = params.get("ticker") or params.get("tickers") or "—"
+
+    # HTML is mobile-friendly and remains available even when PDF rendering fails.
+    if html_name:
+        try:
+            tg_document(
+                chat_id,
+                "TradingAgents_Report.html",
+                zf.read(html_name),
+                f"🌐 گزارش HTML {label} {subject}"[:1024],
+            )
+        except Exception as exc:
+            send_message(chat_id, f"❌ ارسال HTML ناموفق: {esc(exc)}", [[("بازگشت", "outputs")]])
 
     if not pdf_name:
-        # A run that produced no report tree says so in its status; saying
-        # "PDF not found" there hides the real reason, which is that the
-        # analysis never finished.
         if info.get("status") == "no_report":
             send_message(
                 chat_id,
@@ -1136,21 +1227,16 @@ def send_output(chat_id: int, request_id: str) -> None:
                 [[("🔄 بررسی دوباره", f"view_output:{request_id}"), ("🏠 خانه", "home")]],
             )
             return
-        send_message(chat_id, "⚠️ فایل PDF پیدا نشد.", [[("بازگشت", "outputs")]])
+        if html_name:
+            send_message(chat_id, "⚠️ گزارش HTML ارسال شد؛ فایل PDF برای این اجرا ساخته نشده است.", [[("بازگشت", "outputs")]])
+            return
+        send_message(chat_id, "⚠️ فایل‌های گزارش HTML و PDF پیدا نشدند.", [[("بازگشت", "outputs")]])
         return
 
-    pdf_bytes = zf.read(pdf_name)
-    label = "تحلیل" if row["mode"] == "analysis" else "بک‌تست"
-    params = json.loads(row["payload_json"] or "{}")
-    subject = params.get("ticker") or params.get("tickers") or "—"
-
-    caption = f"📄 گزارش PDF {label} {subject}"[:1024]
-
     try:
-        tg_document(chat_id, "TradingAgents_Report.pdf", pdf_bytes, caption)
+        tg_document(chat_id, "TradingAgents_Report.pdf", zf.read(pdf_name), f"📄 گزارش PDF {label} {subject}"[:1024])
     except Exception as exc:
         send_message(chat_id, f"❌ ارسال PDF ناموفق: {esc(exc)}", [[("بازگشت", "outputs")]])
-
 
 def valid_date(value: str) -> str:
     value = value.strip().lower()
@@ -1218,7 +1304,13 @@ def format_run_time(iso_str: str) -> str:
 def home_screen(chat_id: int, force_new: bool = False, target_mid: int | None = None) -> int:
     aid = active_model_id()
     mrow = q1("SELECT name FROM models WHERE id=?", (aid,)) if aid else None
-    model_line = f"مدل فعال: <b>{esc(mrow['name'])}</b>" if mrow else "مدل فعال: <b>تنظیم نشده</b>"
+    quick_id, deep_id = tier_model_id("quick"), tier_model_id("deep")
+    quick_row = q1("SELECT name FROM models WHERE id=? AND enabled=1", (quick_id,)) if quick_id else None
+    deep_row = q1("SELECT name FROM models WHERE id=? AND enabled=1", (deep_id,)) if deep_id else None
+    model_line = (
+        f"⚡ Quick: <b>{esc(quick_row['name']) if quick_row else 'تنظیم نشده'}</b>\n"
+        f"🧠 Deep: <b>{esc(deep_row['name']) if deep_row else 'تنظیم نشده'}</b>"
+    )
 
     busy_row = q1(
         "SELECT COUNT(*) c FROM runs WHERE status NOT IN " + str(TERMINAL) + " AND chat_id=?",
@@ -1238,6 +1330,7 @@ def home_screen(chat_id: int, force_new: bool = False, target_mid: int | None = 
         [("🚀 تحلیل جدید", "flow_analysis_start"), ("📈 بک‌تست", "flow_backtest_start")],
         [("🤖 مدل‌ها", "models"), ("📊 اجراهای جاری", "active_runs")],
         [("📄 خروجی‌ها", "outputs")],
+        [("⚙️ تنظیمات موتور", "engine_settings"), ("🎚 نقش مدل‌ها", "model_roles")],
     ]
 
     if force_new:
@@ -1289,11 +1382,129 @@ def models_screen(chat_id: int, page: int = 0, target_mid: int | None = None) ->
 
     buttons += [
         [("➕ افزودن مدل", "model_add"), ("📋 پرووایدرها", "providers_menu")],
+        [("🎚 نقش Quick / Deep", "model_roles")],
         [("🗑 حذف مدل", "model_delete_menu")],
         [("🏠 خانه", "home")],
     ]
 
     return show(chat_id, text, buttons, target_mid)
+
+
+def model_roles_screen(chat_id: int, target_mid: int | None = None) -> int:
+    quick_id, deep_id = tier_model_id("quick"), tier_model_id("deep")
+    quick = q1("SELECT name FROM models WHERE id=? AND enabled=1", (quick_id,)) if quick_id else None
+    deep = q1("SELECT name FROM models WHERE id=? AND enabled=1", (deep_id,)) if deep_id else None
+    return show(
+        chat_id,
+        "<b>🎚 نقش مدل‌ها</b>\n"
+        f"⚡ Quick (تحلیل‌گران، پژوهش‌گران و معامله‌گر): <b>{esc(quick['name']) if quick else 'مدل پیش‌فرض تنظیم نشده'}</b>\n"
+        f"🧠 Deep (مدیران پژوهش و پورتفولیو): <b>{esc(deep['name']) if deep else 'مدل پیش‌فرض تنظیم نشده'}</b>\n"
+        "هر نقش می‌تواند از Provider و Endpoint مستقل استفاده کند.",
+        [
+            [("⚡ انتخاب مدل Quick", "assign_tier_menu:quick")],
+            [("🧠 انتخاب مدل Deep", "assign_tier_menu:deep")],
+            [("بازگشت", "models")],
+        ],
+        target_mid,
+    )
+
+
+def assign_tier_screen(chat_id: int, tier: str, target_mid: int | None = None) -> int:
+    if tier not in {"quick", "deep"}:
+        raise ValueError("نقش مدل نامعتبر است.")
+    active = tier_model_id(tier)
+    rows = q("SELECT id,name FROM models WHERE enabled=1 ORDER BY name COLLATE NOCASE")
+    buttons = [[(f"{'✅ ' if r['id'] == active else ''}{r['name'][:48]}", f"assign_tier:{tier}:{r['id']}")] for r in rows]
+    buttons.append([("بازگشت", "model_roles")])
+    label = "Quick" if tier == "quick" else "Deep"
+    return show(chat_id, f"<b>انتخاب مدل {label}</b>\nمدل موردنظر را انتخاب کن.", buttons, target_mid)
+
+
+def settings_menu(chat_id: int, target_mid: int | None = None) -> int:
+    cfg = get_run_settings()
+    lines = [
+        "<b>⚙️ تنظیمات موتور تحلیل</b>",
+        f"زبان گزارش: <b>{esc(cfg['output_language'])}</b>",
+        f"عمق مناظره: <b>{cfg['max_debate_rounds']}</b> | ریسک: <b>{cfg['max_risk_discuss_rounds']}</b>",
+        f"حد ابزار هر Agent: <b>{cfg['max_tool_rounds']}</b>",
+        f"حد خروجی: <b>{esc(cfg['max_tokens'] if cfg['max_tokens'] is not None else 'پیش‌فرض Provider')}</b>",
+        f"Temperature: <b>{esc(cfg['temperature'] if cfg['temperature'] is not None else 'پیش‌فرض Provider')}</b>",
+        f"Checkpoint: <b>{'روشن' if cfg['checkpoint_enabled'] else 'خاموش'}</b>",
+        f"Holding period: <b>{cfg['holding_period_days']} روز معاملاتی</b>",
+        f"Benchmark: <b>{esc(cfg['benchmark_ticker'] or 'خودکار بر اساس بازار')}</b>",
+    ]
+    buttons = [
+        [("🌐 زبان خروجی", "setting_menu:output_language")],
+        [("🗣 دور مناظره", "setting_menu:max_debate_rounds"), ("🛡 دور ریسک", "setting_menu:max_risk_discuss_rounds")],
+        [("🔧 دور ابزار Agent", "setting_menu:max_tool_rounds"), ("🎯 Max Tokens", "setting_menu:max_tokens")],
+        [("🌡 Temperature", "setting_menu:temperature"), ("💾 Checkpoint", "setting_menu:checkpoint_enabled")],
+        [("🧠 Google Thinking", "setting_menu:google_thinking_level")],
+        [("🧠 OpenAI Reasoning", "setting_menu:openai_reasoning_effort"), ("🧠 Anthropic Effort", "setting_menu:anthropic_effort")],
+        [("📆 Holding Period", "setting_menu:holding_period_days"), ("🏁 Benchmark", "benchmark_input")],
+        [("🗃 منابع داده", "data_vendors_menu")],
+        [("♻️ بازنشانی تنظیمات", "settings_reset"), ("🏠 خانه", "home")],
+    ]
+    return show(chat_id, "\n".join(lines), buttons, target_mid)
+
+
+def setting_choices_screen(chat_id: int, key: str, target_mid: int | None = None) -> int:
+    if key not in SETTING_CHOICES:
+        raise ValueError("این تنظیم قابل تغییر نیست.")
+    current = get_run_settings()
+    labels = {
+        "output_language": {"Persian": "فارسی", "English": "English", "German": "Deutsch", "French": "Français", "Spanish": "Español", "Arabic": "العربية", "Chinese": "中文", "Japanese": "日本語"},
+        "checkpoint_enabled": {True: "روشن", False: "خاموش"},
+    }
+    buttons = []
+    for value in SETTING_CHOICES[key]:
+        token = "default" if value is None else str(value).lower() if isinstance(value, bool) else str(value)
+        label = labels.get(key, {}).get(value, "پیش‌فرض Provider" if value is None else str(value))
+        selected = "✅ " if current.get(key) == value else ""
+        buttons.append([(selected + label, f"setting:{key}:{token}")])
+    buttons.append([("بازگشت", "engine_settings")])
+    return show(chat_id, f"<b>انتخاب مقدار</b>\n<code>{esc(key)}</code>", buttons, target_mid)
+
+
+def data_vendors_menu(chat_id: int, target_mid: int | None = None) -> int:
+    cfg = get_run_settings()
+    names = {
+        "core_stock_apis": "قیمت و داده‌های اصلی",
+        "technical_indicators": "اندیکاتورهای تکنیکال",
+        "fundamental_data": "داده بنیادی",
+        "news_data": "اخبار",
+        "macro_data": "داده کلان",
+        "prediction_markets": "بازارهای پیش‌بینی",
+    }
+    lines = ["<b>🗃 منابع داده</b>"]
+    buttons = []
+    for key, title in names.items():
+        lines.append(f"{title}: <code>{esc(cfg['data_vendors'][key])}</code>")
+        buttons.append([(title, f"vendor_menu:{key}")])
+    buttons.append([("بازگشت", "engine_settings")])
+    return show(chat_id, "\n".join(lines), buttons, target_mid)
+
+
+def data_vendor_choices_screen(chat_id: int, category: str, target_mid: int | None = None) -> int:
+    if category not in DATA_VENDOR_OPTIONS:
+        raise ValueError("دسته منبع داده نامعتبر است.")
+    current = get_run_settings()["data_vendors"][category]
+    buttons = []
+    for vendor in DATA_VENDOR_OPTIONS[category]:
+        label = vendor.replace(",", " + ")
+        buttons.append([(f"{'✅ ' if vendor == current else ''}{label}", f"vendor:{category}:{vendor}")])
+    buttons.append([("بازگشت", "data_vendors_menu")])
+    return show(chat_id, f"<b>انتخاب منبع داده</b>\n<code>{esc(category)}</code>", buttons, target_mid)
+
+
+def portfolio_json_screen(chat_id: int, target_mid: int | None = None) -> int:
+    return show(
+        chat_id,
+        "<b>🎒 پورتفولیو (JSON)</b>\n"
+        "یک JSON با ساختار زیر بفرست. اطلاعات فقط همراه همین اجرا و به‌صورت رمزنگاری‌شده منتقل می‌شود.\n"
+        "<pre>{\n  \"cash\": 10000,\n  \"currency\": \"USD\",\n  \"positions\": [{\"ticker\": \"NVDA\", \"quantity\": 5, \"average_price\": 120}]\n}</pre>",
+        [[("❌ لغو ورود", "portfolio_cancel")]],
+        target_mid,
+    )
 
 
 def providers_menu(chat_id: int, target_mid: int | None = None) -> int:
@@ -1586,7 +1797,7 @@ def analyst_picker(chat_id: int, backtest: bool, target_mid: int | None = None) 
     allowed = list(ANALYST_ORDER)
     ticker = data.get("ticker", "")
 
-    if not backtest and ticker and is_crypto(ticker):
+    if (not backtest and ticker and is_crypto(ticker)) or (backtest and data.get("asset_type") == "crypto"):
         allowed.remove("fundamentals")
 
     selected = {x for x in data.get("analysts", "").split(",") if x in allowed}
@@ -1610,10 +1821,12 @@ def analysis_confirm_screen(chat_id: int, target_mid: int | None = None) -> int:
         f"<b>✅ آماده اجرا</b>\n"
         f"Ticker: <code>{esc(data.get('ticker'))}</code>\n"
         f"تاریخ: <code>{esc(data.get('date'))}</code>\n"
-        f"تحلیلگران: <b>{esc(chosen)}</b>",
+        f"تحلیلگران: <b>{esc(chosen)}</b>\n"
+        f"پورتفولیو: <b>{'تنظیم‌شده' if data.get('portfolio') else 'بدون اطلاعات پورتفولیو'}</b>",
         [
             [("🚀 شروع", "analysis_run")],
             [("🎛 تحلیلگران", "analysis_analysts"), ("📅 تاریخ", "analysis_change_date")],
+            [("🎒 پورتفولیو JSON", "portfolio_input"), ("🧹 حذف پورتفولیو", "portfolio_clear")],
             [("❌ لغو", "flow_cancel")],
         ],
         target_mid,
@@ -1629,10 +1842,15 @@ def backtest_confirm_screen(chat_id: int, target_mid: int | None = None) -> int:
         f"<b>✅ آماده بک‌تست</b>\n"
         f"Tickerها: <code>{esc(data.get('tickers'))}</code>\n"
         f"از <code>{esc(data.get('start'))}</code> تا <code>{esc(data.get('end'))}</code>\n"
-        f"فاصله: <b>هر {esc(data.get('every', 7))} روز</b>",
+        f"فاصله: <b>هر {esc(data.get('every', 7))} روز</b>\n"
+        f"نوع دارایی: <b>{esc(data.get('asset_type', 'stock'))}</b>\n"
+        f"تحلیلگران: <b>{esc(chosen)}</b>\n"
+        f"پورتفولیو: <b>{'تنظیم‌شده' if data.get('portfolio') else 'بدون اطلاعات پورتفولیو'}</b>",
         [
             [("🚀 شروع", "backtest_run")],
             [("🎛 تحلیلگران", "backtest_analysts"), ("📅 فاصله", "backtest_every")],
+            [("💱 نوع دارایی", "backtest_asset_type")],
+            [("🎒 پورتفولیو JSON", "portfolio_input"), ("🧹 حذف پورتفولیو", "portfolio_clear")],
             [("❌ لغو", "flow_cancel")],
         ],
         target_mid,
@@ -1933,7 +2151,14 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
         stage = item.get("stage")
 
         try:
-            if stage == "url":
+            if stage == "benchmark":
+                cfg = get_run_settings()
+                cfg["benchmark_ticker"] = text
+                save_run_settings(cfg)
+                WIZARDS.pop(chat_id, None)
+                settings_menu(chat_id, target_mid)
+
+            elif stage == "url":
                 item["url"] = clean_base_url(text)
                 item["provider_type"] = infer_provider_type(item["url"])
                 item["provider_name"] = infer_provider_name(item["url"])
@@ -2011,6 +2236,18 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
                 flow["stage"] = "every"
                 backtest_every_screen(chat_id, target_mid)
 
+            elif stage == "portfolio":
+                try:
+                    raw_portfolio = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"JSON معتبر نیست: {exc.msg}") from exc
+                flow["portfolio"] = validate_portfolio(raw_portfolio)
+                flow["stage"] = "confirm"
+                if kind == "analysis":
+                    analysis_confirm_screen(chat_id, target_mid)
+                else:
+                    backtest_confirm_screen(chat_id, target_mid)
+
         except ValueError as exc:
             show(chat_id, f"<b>⚠️ {esc(exc)}</b>\nلطفاً دوباره تلاش کنید.", [[("❌ لغو", "flow_cancel")]], target_mid)
 
@@ -2045,6 +2282,63 @@ def callback(query: dict[str, Any]) -> None:
 
         elif data == "models":
             models_screen(chat_id, page=0, target_mid=cb_mid)
+
+        elif data == "engine_settings":
+            settings_menu(chat_id, cb_mid)
+
+        elif data.startswith("setting_menu:"):
+            setting_choices_screen(chat_id, data.split(":", 1)[1], cb_mid)
+
+        elif data.startswith("setting:"):
+            if not admin(user_id):
+                raise ValueError("فقط Admin می‌تواند تنظیمات سراسری موتور را تغییر دهد.")
+            _, key, value = data.split(":", 2)
+            updated = apply_setting(get_run_settings(), key, value)
+            save_run_settings(updated)
+            settings_menu(chat_id, cb_mid)
+
+        elif data == "settings_reset":
+            if not admin(user_id):
+                raise ValueError("فقط Admin.")
+            save_run_settings({})
+            settings_menu(chat_id, cb_mid)
+
+        elif data == "data_vendors_menu":
+            data_vendors_menu(chat_id, cb_mid)
+
+        elif data.startswith("vendor_menu:"):
+            data_vendor_choices_screen(chat_id, data.split(":", 1)[1], cb_mid)
+
+        elif data.startswith("vendor:"):
+            if not admin(user_id):
+                raise ValueError("فقط Admin می‌تواند منابع داده را تغییر دهد.")
+            _, category, vendor = data.split(":", 2)
+            updated = set_data_vendor(get_run_settings(), category, vendor)
+            save_run_settings(updated)
+            data_vendors_menu(chat_id, cb_mid)
+
+        elif data == "benchmark_input":
+            if not admin(user_id):
+                raise ValueError("فقط Admin.")
+            WIZARDS[chat_id] = {"stage": "benchmark"}
+            show(chat_id, "<b>🏁 Benchmark سفارشی</b>\nنماد شاخص را بفرست؛ برای بازگشت به تشخیص خودکار، <code>-</code> بفرست.", [[("لغو", "benchmark_cancel")]], cb_mid)
+
+        elif data == "benchmark_cancel":
+            WIZARDS.pop(chat_id, None)
+            settings_menu(chat_id, cb_mid)
+
+        elif data == "model_roles":
+            model_roles_screen(chat_id, cb_mid)
+
+        elif data.startswith("assign_tier_menu:"):
+            assign_tier_screen(chat_id, data.split(":", 1)[1], cb_mid)
+
+        elif data.startswith("assign_tier:"):
+            if not admin(user_id):
+                raise ValueError("فقط Admin.")
+            _, tier, model_id = data.split(":", 2)
+            set_tier_model_id(tier, model_id)
+            model_roles_screen(chat_id, cb_mid)
 
         elif data.startswith("models_page:"):
             page = int(data.split(":", 1)[1])
@@ -2287,6 +2581,9 @@ def callback(query: dict[str, Any]) -> None:
 
             model_id = data.split(":", 1)[1]
             db("UPDATE models SET enabled=0 WHERE id=?", (model_id,))
+            for tier in ("quick", "deep"):
+                if get_setting(f"{tier}_model_id", "") == model_id:
+                    set_setting(f"{tier}_model_id", "")
 
             if active_model_id() == model_id:
                 set_active_model("")
@@ -2362,16 +2659,68 @@ def callback(query: dict[str, Any]) -> None:
             home_screen(chat_id, target_mid=cb_mid)
 
         elif data == "flow_analysis_start":
-            if not active_model_id():
-                raise ValueError("اول مدل فعال کن.")
+            WIZARDS.pop(chat_id, None)
+            if not (tier_model_id("quick") and tier_model_id("deep")):
+                raise ValueError("ابتدا یک مدل فعال کن یا مدل‌های Quick و Deep را در بخش نقش مدل‌ها انتخاب کن.")
             FLOWS[chat_id] = {"kind": "analysis", "stage": "ticker", "analysts": "market,social,news,fundamentals"}
             analysis_ticker_screen(chat_id, cb_mid)
 
         elif data == "flow_backtest_start":
-            if not active_model_id():
-                raise ValueError("اول مدل فعال کن.")
-            FLOWS[chat_id] = {"kind": "backtest", "stage": "tickers", "every": 7, "analysts": "market,social,news,fundamentals"}
+            WIZARDS.pop(chat_id, None)
+            if not (tier_model_id("quick") and tier_model_id("deep")):
+                raise ValueError("ابتدا یک مدل فعال کن یا مدل‌های Quick و Deep را در بخش نقش مدل‌ها انتخاب کن.")
+            FLOWS[chat_id] = {"kind": "backtest", "stage": "tickers", "every": 7, "asset_type": "stock", "analysts": "market,social,news,fundamentals"}
             backtest_tickers_screen(chat_id, cb_mid)
+
+        elif data == "portfolio_input":
+            flow = FLOWS.get(chat_id)
+            if not flow:
+                raise ValueError("ابتدا یک تحلیل یا بک‌تست بساز.")
+            flow["stage"] = "portfolio"
+            portfolio_json_screen(chat_id, cb_mid)
+
+        elif data == "portfolio_clear":
+            flow = FLOWS.get(chat_id)
+            if not flow:
+                raise ValueError("اجرا پیدا نشد.")
+            flow.pop("portfolio", None)
+            if flow.get("kind") == "analysis":
+                analysis_confirm_screen(chat_id, cb_mid)
+            else:
+                backtest_confirm_screen(chat_id, cb_mid)
+
+        elif data == "portfolio_cancel":
+            flow = FLOWS.get(chat_id)
+            if not flow:
+                home_screen(chat_id, target_mid=cb_mid)
+            elif flow.get("kind") == "analysis":
+                flow["stage"] = "confirm"
+                analysis_confirm_screen(chat_id, cb_mid)
+            else:
+                flow["stage"] = "confirm"
+                backtest_confirm_screen(chat_id, cb_mid)
+
+        elif data == "backtest_asset_type":
+            flow = FLOWS.get(chat_id)
+            if not flow:
+                raise ValueError("اجرا منقضی شده است.")
+            show(chat_id, "<b>نوع دارایی بک‌تست</b>", [[("📈 سهام", "asset_type:stock"), ("₿ کریپتو", "asset_type:crypto")], [("بازگشت", "backtest_asset_type_back")]], cb_mid)
+
+        elif data == "backtest_asset_type_back":
+            backtest_confirm_screen(chat_id, cb_mid)
+
+        elif data.startswith("asset_type:"):
+            flow = FLOWS.get(chat_id)
+            if not flow or flow.get("kind") != "backtest":
+                raise ValueError("بک‌تست منقضی شده است.")
+            asset_type = data.split(":", 1)[1]
+            if asset_type not in {"stock", "crypto"}:
+                raise ValueError("نوع دارایی نامعتبر است.")
+            flow["asset_type"] = asset_type
+            if asset_type == "crypto":
+                selected = [x for x in flow.get("analysts", "").split(",") if x and x != "fundamentals"]
+                flow["analysts"] = ",".join(selected)
+            backtest_confirm_screen(chat_id, cb_mid)
 
         elif data == "flow_cancel":
             FLOWS.pop(chat_id, None)
@@ -2464,9 +2813,12 @@ def callback(query: dict[str, Any]) -> None:
                     "start": flow["start"],
                     "end": flow["end"],
                     "every": int(flow.get("every", 7)),
+                    "asset_type": flow.get("asset_type", "stock"),
                     "analysts": flow.get("analysts", ""),
                 }
                 mode = "backtest"
+            if flow.get("portfolio"):
+                params["portfolio"] = flow["portfolio"]
 
             request_id = dispatch_run(chat_id, mode, params)
             FLOWS.pop(chat_id, None)

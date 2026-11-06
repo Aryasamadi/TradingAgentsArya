@@ -1,4 +1,4 @@
-name: TradingAgents Engine + Telegram Controller
+name: TradingAgents Engine + Telegram Controller (phase 1 UI)
 
 run-name: >-
   ${{ github.event_name == 'repository_dispatch'
@@ -221,6 +221,7 @@ jobs:
           write_env("END_DATE", params.get("end"))
           write_env("EVERY", params.get("every", "7"))
           write_env("ANALYSTS", params.get("analysts"))
+          write_env("ASSET_TYPE", params.get("asset_type", "stock"))
 
           config_enc = str(payload.get("config_enc") or "")
           if config_enc:
@@ -235,17 +236,60 @@ jobs:
                       decrypted = SecretBox(key).decrypt(base64.b64decode(config_enc))
                       cfg = json.loads(decrypted.decode("utf-8"))
 
-                      token = str(cfg.get("api_token") or "")
-                      if token:
-                          print(f"::add-mask::{token}")
-                          env_key = str(cfg.get("provider_env_key") or "")
-                          if env_key:
-                              write_env(env_key, token)
+                      tiers = cfg.get("tiers")
+                      if isinstance(tiers, dict):
+                          for tier in ("quick", "deep"):
+                              item = tiers.get(tier) or {}
+                              prefix = tier.upper()
+                              write_env(f"TRADINGAGENTS_{prefix}_THINK_PROVIDER", item.get("provider_type"))
+                              write_env(f"TRADINGAGENTS_{prefix}_THINK_LLM", item.get("model_name"))
+                              write_env(f"TRADINGAGENTS_{prefix}_THINK_BACKEND_URL", item.get("base_url"))
+                              token = str(item.get("api_token") or "")
+                              env_key = str(item.get("provider_env_key") or "")
+                              if token:
+                                  print(f"::add-mask::{token}")
+                                  if env_key:
+                                      write_env(env_key, token)
+                          write_env("TRADINGAGENTS_LLM_PROVIDER", (tiers.get("quick") or {}).get("provider_type"))
+                          write_env("TRADINGAGENTS_LLM_BACKEND_URL", (tiers.get("quick") or {}).get("base_url"))
+                      else:
+                          token = str(cfg.get("api_token") or "")
+                          if token:
+                              print(f"::add-mask::{token}")
+                              env_key = str(cfg.get("provider_env_key") or "")
+                              if env_key:
+                                  write_env(env_key, token)
+                          write_env("TRADINGAGENTS_LLM_PROVIDER", cfg.get("provider_type"))
+                          write_env("TRADINGAGENTS_DEEP_THINK_LLM", cfg.get("model_name"))
+                          write_env("TRADINGAGENTS_QUICK_THINK_LLM", cfg.get("model_name"))
+                          write_env("TRADINGAGENTS_LLM_BACKEND_URL", cfg.get("base_url"))
 
-                      write_env("TRADINGAGENTS_LLM_PROVIDER", cfg.get("provider_type"))
-                      write_env("TRADINGAGENTS_DEEP_THINK_LLM", cfg.get("model_name"))
-                      write_env("TRADINGAGENTS_QUICK_THINK_LLM", cfg.get("model_name"))
-                      write_env("TRADINGAGENTS_LLM_BACKEND_URL", cfg.get("base_url"))
+                      run_settings = cfg.get("run_settings") or {}
+                      setting_env = {
+                          "output_language": "TRADINGAGENTS_OUTPUT_LANGUAGE",
+                          "max_debate_rounds": "TRADINGAGENTS_MAX_DEBATE_ROUNDS",
+                          "max_risk_discuss_rounds": "TRADINGAGENTS_MAX_RISK_ROUNDS",
+                          "max_tool_rounds": "TRADINGAGENTS_MAX_TOOL_ROUNDS",
+                          "checkpoint_enabled": "TRADINGAGENTS_CHECKPOINT_ENABLED",
+                          "temperature": "TRADINGAGENTS_TEMPERATURE",
+                          "max_tokens": "TRADINGAGENTS_MAX_TOKENS",
+                          "google_thinking_level": "TRADINGAGENTS_GOOGLE_THINKING_LEVEL",
+                          "openai_reasoning_effort": "TRADINGAGENTS_OPENAI_REASONING_EFFORT",
+                          "anthropic_effort": "TRADINGAGENTS_ANTHROPIC_EFFORT",
+                          "holding_period_days": "TRADINGAGENTS_HOLDING_PERIOD_DAYS",
+                          "benchmark_ticker": "TRADINGAGENTS_BENCHMARK_TICKER",
+                      }
+                      for key_name, env_name in setting_env.items():
+                          if key_name in run_settings:
+                              # An empty GITHUB_ENV value clears a workflow-level
+                              # default and lets the provider choose its own default.
+                              write_env(env_name, run_settings[key_name])
+                      if "data_vendors" in run_settings:
+                          write_env("TRADINGAGENTS_DATA_VENDORS_JSON", json.dumps(run_settings["data_vendors"], separators=(",", ":")))
+                      portfolio = cfg.get("portfolio")
+                      if portfolio:
+                          packed = base64.b64encode(json.dumps(portfolio, separators=(",", ":")).encode("utf-8")).decode("ascii")
+                          write_env("PORTFOLIO_JSON_B64", packed)
                   except Exception as exc:
                       raise SystemExit(f"Failed to decrypt request model config: {exc}")
           PY
@@ -265,14 +309,25 @@ jobs:
           set -euo pipefail
           mkdir -p .runtime/run
 
+          PORTFOLIO_ARGS=()
+          if [[ -n "${PORTFOLIO_JSON_B64:-}" ]]; then
+            printf '%s' "$PORTFOLIO_JSON_B64" | base64 --decode > .runtime/run/portfolio.json
+            PORTFOLIO_ARGS=(--portfolio .runtime/run/portfolio.json)
+          fi
+
+          CHECKPOINT_FLAG=(--no-checkpoint)
+          if [[ "${TRADINGAGENTS_CHECKPOINT_ENABLED:-false}" == "true" ]]; then
+            CHECKPOINT_FLAG=(--checkpoint)
+          fi
+
           if [[ "$REQUEST_MODE" == "analysis" ]]; then
             [[ -n "$TICKER" ]] || { echo "Missing ticker."; exit 2; }
             [[ -n "$ANALYSIS_DATE" ]] || { echo "Missing analysis date."; exit 2; }
-            CMD=(tradingagents --ticker "$TICKER" --date "$ANALYSIS_DATE" --analysts "${ANALYSTS:-${TRADINGAGENTS_DEFAULT_ANALYSTS}}" --save --no-show --checkpoint)
+            CMD=(tradingagents --ticker "$TICKER" --date "$ANALYSIS_DATE" --analysts "${ANALYSTS:-${TRADINGAGENTS_DEFAULT_ANALYSTS}}" --save --no-show "${CHECKPOINT_FLAG[@]}" "${PORTFOLIO_ARGS[@]}")
           elif [[ "$REQUEST_MODE" == "backtest" ]]; then
             [[ -n "$TICKERS" ]] || { echo "Missing backtest tickers."; exit 2; }
             [[ -n "$START_DATE" && -n "$END_DATE" ]] || { echo "Missing backtest dates."; exit 2; }
-            CMD=(tradingagents backtest "$TICKERS" --start "$START_DATE" --end "$END_DATE" --every "${EVERY:-7}" --analysts "${ANALYSTS:-${TRADINGAGENTS_DEFAULT_ANALYSTS}}")
+            CMD=(tradingagents backtest "$TICKERS" --start "$START_DATE" --end "$END_DATE" --every "${EVERY:-7}" --asset-type "${ASSET_TYPE:-stock}" --analysts "${ANALYSTS:-${TRADINGAGENTS_DEFAULT_ANALYSTS}}" "${PORTFOLIO_ARGS[@]}")
           else
             echo "Unsupported mode: $REQUEST_MODE"
             exit 2
