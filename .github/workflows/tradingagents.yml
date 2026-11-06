@@ -221,6 +221,7 @@ jobs:
           write_env("END_DATE", params.get("end"))
           write_env("EVERY", params.get("every", "7"))
           write_env("ANALYSTS", params.get("analysts"))
+          write_env("ASSET_TYPE", params.get("asset_type", "stock"))
 
           config_enc = str(payload.get("config_enc") or "")
           if config_enc:
@@ -306,14 +307,25 @@ jobs:
           set -euo pipefail
           mkdir -p .runtime/run
 
+          PORTFOLIO_ARGS=()
+          if [[ -n "${PORTFOLIO_JSON_B64:-}" ]]; then
+            printf '%s' "$PORTFOLIO_JSON_B64" | base64 --decode > .runtime/run/portfolio.json
+            PORTFOLIO_ARGS=(--portfolio .runtime/run/portfolio.json)
+          fi
+
+          CHECKPOINT_FLAG=(--no-checkpoint)
+          if [[ "${TRADINGAGENTS_CHECKPOINT_ENABLED:-false}" == "true" ]]; then
+            CHECKPOINT_FLAG=(--checkpoint)
+          fi
+
           if [[ "$REQUEST_MODE" == "analysis" ]]; then
             [[ -n "$TICKER" ]] || { echo "Missing ticker."; exit 2; }
             [[ -n "$ANALYSIS_DATE" ]] || { echo "Missing analysis date."; exit 2; }
-            CMD=(tradingagents --ticker "$TICKER" --date "$ANALYSIS_DATE" --analysts "${ANALYSTS:-${TRADINGAGENTS_DEFAULT_ANALYSTS}}" --save --no-show --checkpoint)
+            CMD=(tradingagents --ticker "$TICKER" --date "$ANALYSIS_DATE" --analysts "${ANALYSTS:-${TRADINGAGENTS_DEFAULT_ANALYSTS}}" --save --no-show "${CHECKPOINT_FLAG[@]}" "${PORTFOLIO_ARGS[@]}")
           elif [[ "$REQUEST_MODE" == "backtest" ]]; then
             [[ -n "$TICKERS" ]] || { echo "Missing backtest tickers."; exit 2; }
             [[ -n "$START_DATE" && -n "$END_DATE" ]] || { echo "Missing backtest dates."; exit 2; }
-            CMD=(tradingagents backtest "$TICKERS" --start "$START_DATE" --end "$END_DATE" --every "${EVERY:-7}" --analysts "${ANALYSTS:-${TRADINGAGENTS_DEFAULT_ANALYSTS}}")
+            CMD=(tradingagents backtest "$TICKERS" --start "$START_DATE" --end "$END_DATE" --every "${EVERY:-7}" --asset-type "${ASSET_TYPE:-stock}" --analysts "${ANALYSTS:-${TRADINGAGENTS_DEFAULT_ANALYSTS}}" "${PORTFOLIO_ARGS[@]}")
           else
             echo "Unsupported mode: $REQUEST_MODE"
             exit 2
