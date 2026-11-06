@@ -583,7 +583,10 @@ def set_active_model(model_id: str) -> None:
 def tier_model_id(tier: str) -> str:
     if tier not in {"quick", "deep"}:
         raise ValueError("ناحیه مدل نامعتبر است.")
-    return get_setting(f"{tier}_model_id", "") or active_model_id()
+    selected = get_setting(f"{tier}_model_id", "")
+    if selected and q1("SELECT id FROM models WHERE id=? AND enabled=1", (selected,)):
+        return selected
+    return active_model_id()
 
 
 def set_tier_model_id(tier: str, model_id: str) -> None:
@@ -2567,6 +2570,9 @@ def callback(query: dict[str, Any]) -> None:
 
             model_id = data.split(":", 1)[1]
             db("UPDATE models SET enabled=0 WHERE id=?", (model_id,))
+            for tier in ("quick", "deep"):
+                if get_setting(f"{tier}_model_id", "") == model_id:
+                    set_setting(f"{tier}_model_id", "")
 
             if active_model_id() == model_id:
                 set_active_model("")
@@ -2642,14 +2648,16 @@ def callback(query: dict[str, Any]) -> None:
             home_screen(chat_id, target_mid=cb_mid)
 
         elif data == "flow_analysis_start":
-            if not active_model_id():
-                raise ValueError("اول مدل فعال کن.")
+            WIZARDS.pop(chat_id, None)
+            if not (tier_model_id("quick") and tier_model_id("deep")):
+                raise ValueError("ابتدا یک مدل فعال کن یا مدل‌های Quick و Deep را در بخش نقش مدل‌ها انتخاب کن.")
             FLOWS[chat_id] = {"kind": "analysis", "stage": "ticker", "analysts": "market,social,news,fundamentals"}
             analysis_ticker_screen(chat_id, cb_mid)
 
         elif data == "flow_backtest_start":
+            WIZARDS.pop(chat_id, None)
             if not (tier_model_id("quick") and tier_model_id("deep")):
-                raise ValueError("ابتدا مدل‌های Quick و Deep را در بخش نقش مدل‌ها تنظیم کن.")
+                raise ValueError("ابتدا یک مدل فعال کن یا مدل‌های Quick و Deep را در بخش نقش مدل‌ها انتخاب کن.")
             FLOWS[chat_id] = {"kind": "backtest", "stage": "tickers", "every": 7, "asset_type": "stock", "analysts": "market,social,news,fundamentals"}
             backtest_tickers_screen(chat_id, cb_mid)
 
@@ -2673,7 +2681,7 @@ def callback(query: dict[str, Any]) -> None:
         elif data == "portfolio_cancel":
             flow = FLOWS.get(chat_id)
             if not flow:
-                home_screen(chat_id, cb_mid)
+                home_screen(chat_id, target_mid=cb_mid)
             elif flow.get("kind") == "analysis":
                 flow["stage"] = "confirm"
                 analysis_confirm_screen(chat_id, cb_mid)
@@ -2685,7 +2693,10 @@ def callback(query: dict[str, Any]) -> None:
             flow = FLOWS.get(chat_id)
             if not flow:
                 raise ValueError("اجرا منقضی شده است.")
-            show(chat_id, "<b>نوع دارایی بک‌تست</b>", [[("📈 سهام", "asset_type:stock"), ("₿ کریپتو", "asset_type:crypto")], [("بازگشت", "noop")]], cb_mid)
+            show(chat_id, "<b>نوع دارایی بک‌تست</b>", [[("📈 سهام", "asset_type:stock"), ("₿ کریپتو", "asset_type:crypto")], [("بازگشت", "backtest_asset_type_back")]], cb_mid)
+
+        elif data == "backtest_asset_type_back":
+            backtest_confirm_screen(chat_id, cb_mid)
 
         elif data.startswith("asset_type:"):
             flow = FLOWS.get(chat_id)
