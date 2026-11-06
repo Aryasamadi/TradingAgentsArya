@@ -27,7 +27,12 @@ import uuid
 import zipfile
 from typing import Any, Tuple, Optional
 
-BUILD = "v19-pdf"
+from bot_ui_config import (
+    DATA_VENDOR_OPTIONS, SETTING_CHOICES, apply_setting, normalize_run_settings,
+    set_data_vendor, validate_portfolio,
+)
+
+BUILD = "v20-engine-ui"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GH_TOKEN = os.getenv("BOT_GITHUB_TOKEN", "").strip()
@@ -573,6 +578,36 @@ def active_model_id() -> str:
 
 def set_active_model(model_id: str) -> None:
     set_setting("active_model", model_id)
+
+
+def tier_model_id(tier: str) -> str:
+    if tier not in {"quick", "deep"}:
+        raise ValueError("ناحیه مدل نامعتبر است.")
+    return get_setting(f"{tier}_model_id", "") or active_model_id()
+
+
+def set_tier_model_id(tier: str, model_id: str) -> None:
+    if tier not in {"quick", "deep"}:
+        raise ValueError("ناحیه مدل نامعتبر است.")
+    row = q1("SELECT id FROM models WHERE id=? AND enabled=1", (model_id,))
+    if not row:
+        raise ValueError("مدل فعال و معتبری انتخاب نشده است.")
+    set_setting(f"{tier}_model_id", model_id)
+
+
+def get_run_settings() -> dict[str, Any]:
+    raw = get_setting("run_settings", "")
+    try:
+        value = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("تنظیمات ذخیره‌شده خراب است؛ از گزینه بازنشانی استفاده کن.") from exc
+    return normalize_run_settings(value)
+
+
+def save_run_settings(value: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_run_settings(value)
+    set_setting("run_settings", json.dumps(normalized, ensure_ascii=False))
+    return normalized
 
 
 def github_secret(name: str, value: str) -> None:
@@ -1218,7 +1253,13 @@ def format_run_time(iso_str: str) -> str:
 def home_screen(chat_id: int, force_new: bool = False, target_mid: int | None = None) -> int:
     aid = active_model_id()
     mrow = q1("SELECT name FROM models WHERE id=?", (aid,)) if aid else None
-    model_line = f"مدل فعال: <b>{esc(mrow['name'])}</b>" if mrow else "مدل فعال: <b>تنظیم نشده</b>"
+    quick_id, deep_id = tier_model_id("quick"), tier_model_id("deep")
+    quick_row = q1("SELECT name FROM models WHERE id=? AND enabled=1", (quick_id,)) if quick_id else None
+    deep_row = q1("SELECT name FROM models WHERE id=? AND enabled=1", (deep_id,)) if deep_id else None
+    model_line = (
+        f"⚡ Quick: <b>{esc(quick_row['name']) if quick_row else 'تنظیم نشده'}</b>\n"
+        f"🧠 Deep: <b>{esc(deep_row['name']) if deep_row else 'تنظیم نشده'}</b>"
+    )
 
     busy_row = q1(
         "SELECT COUNT(*) c FROM runs WHERE status NOT IN " + str(TERMINAL) + " AND chat_id=?",
@@ -1238,6 +1279,7 @@ def home_screen(chat_id: int, force_new: bool = False, target_mid: int | None = 
         [("🚀 تحلیل جدید", "flow_analysis_start"), ("📈 بک‌تست", "flow_backtest_start")],
         [("🤖 مدل‌ها", "models"), ("📊 اجراهای جاری", "active_runs")],
         [("📄 خروجی‌ها", "outputs")],
+        [("⚙️ تنظیمات موتور", "engine_settings"), ("🎚 نقش مدل‌ها", "model_roles")],
     ]
 
     if force_new:
@@ -1289,11 +1331,129 @@ def models_screen(chat_id: int, page: int = 0, target_mid: int | None = None) ->
 
     buttons += [
         [("➕ افزودن مدل", "model_add"), ("📋 پرووایدرها", "providers_menu")],
+        [("🎚 نقش Quick / Deep", "model_roles")],
         [("🗑 حذف مدل", "model_delete_menu")],
         [("🏠 خانه", "home")],
     ]
 
     return show(chat_id, text, buttons, target_mid)
+
+
+def model_roles_screen(chat_id: int, target_mid: int | None = None) -> int:
+    quick_id, deep_id = tier_model_id("quick"), tier_model_id("deep")
+    quick = q1("SELECT name FROM models WHERE id=? AND enabled=1", (quick_id,)) if quick_id else None
+    deep = q1("SELECT name FROM models WHERE id=? AND enabled=1", (deep_id,)) if deep_id else None
+    return show(
+        chat_id,
+        "<b>🎚 نقش مدل‌ها</b>\n"
+        f"⚡ Quick (تحلیل‌گران، پژوهش‌گران و معامله‌گر): <b>{esc(quick['name']) if quick else 'مدل پیش‌فرض تنظیم نشده'}</b>\n"
+        f"🧠 Deep (مدیران پژوهش و پورتفولیو): <b>{esc(deep['name']) if deep else 'مدل پیش‌فرض تنظیم نشده'}</b>\n"
+        "هر نقش می‌تواند از Provider و Endpoint مستقل استفاده کند.",
+        [
+            [("⚡ انتخاب مدل Quick", "assign_tier_menu:quick")],
+            [("🧠 انتخاب مدل Deep", "assign_tier_menu:deep")],
+            [("بازگشت", "models")],
+        ],
+        target_mid,
+    )
+
+
+def assign_tier_screen(chat_id: int, tier: str, target_mid: int | None = None) -> int:
+    if tier not in {"quick", "deep"}:
+        raise ValueError("نقش مدل نامعتبر است.")
+    active = tier_model_id(tier)
+    rows = q("SELECT id,name FROM models WHERE enabled=1 ORDER BY name COLLATE NOCASE")
+    buttons = [[(f"{'✅ ' if r['id'] == active else ''}{r['name'][:48]}", f"assign_tier:{tier}:{r['id']}")] for r in rows]
+    buttons.append([("بازگشت", "model_roles")])
+    label = "Quick" if tier == "quick" else "Deep"
+    return show(chat_id, f"<b>انتخاب مدل {label}</b>\nمدل موردنظر را انتخاب کن.", buttons, target_mid)
+
+
+def settings_menu(chat_id: int, target_mid: int | None = None) -> int:
+    cfg = get_run_settings()
+    lines = [
+        "<b>⚙️ تنظیمات موتور تحلیل</b>",
+        f"زبان گزارش: <b>{esc(cfg['output_language'])}</b>",
+        f"عمق مناظره: <b>{cfg['max_debate_rounds']}</b> | ریسک: <b>{cfg['max_risk_discuss_rounds']}</b>",
+        f"حد ابزار هر Agent: <b>{cfg['max_tool_rounds']}</b>",
+        f"حد خروجی: <b>{esc(cfg['max_tokens'] if cfg['max_tokens'] is not None else 'پیش‌فرض Provider')}</b>",
+        f"Temperature: <b>{esc(cfg['temperature'] if cfg['temperature'] is not None else 'پیش‌فرض Provider')}</b>",
+        f"Checkpoint: <b>{'روشن' if cfg['checkpoint_enabled'] else 'خاموش'}</b>",
+        f"Holding period: <b>{cfg['holding_period_days']} روز معاملاتی</b>",
+        f"Benchmark: <b>{esc(cfg['benchmark_ticker'] or 'خودکار بر اساس بازار')}</b>",
+    ]
+    buttons = [
+        [("🌐 زبان خروجی", "setting_menu:output_language")],
+        [("🗣 دور مناظره", "setting_menu:max_debate_rounds"), ("🛡 دور ریسک", "setting_menu:max_risk_discuss_rounds")],
+        [("🔧 دور ابزار Agent", "setting_menu:max_tool_rounds"), ("🎯 Max Tokens", "setting_menu:max_tokens")],
+        [("🌡 Temperature", "setting_menu:temperature"), ("💾 Checkpoint", "setting_menu:checkpoint_enabled")],
+        [("🧠 Google Thinking", "setting_menu:google_thinking_level")],
+        [("🧠 OpenAI Reasoning", "setting_menu:openai_reasoning_effort"), ("🧠 Anthropic Effort", "setting_menu:anthropic_effort")],
+        [("📆 Holding Period", "setting_menu:holding_period_days"), ("🏁 Benchmark", "benchmark_input")],
+        [("🗃 منابع داده", "data_vendors_menu")],
+        [("♻️ بازنشانی تنظیمات", "settings_reset"), ("🏠 خانه", "home")],
+    ]
+    return show(chat_id, "\n".join(lines), buttons, target_mid)
+
+
+def setting_choices_screen(chat_id: int, key: str, target_mid: int | None = None) -> int:
+    if key not in SETTING_CHOICES:
+        raise ValueError("این تنظیم قابل تغییر نیست.")
+    current = get_run_settings()
+    labels = {
+        "output_language": {"Persian": "فارسی", "English": "English", "German": "Deutsch", "French": "Français", "Spanish": "Español", "Arabic": "العربية", "Chinese": "中文", "Japanese": "日本語"},
+        "checkpoint_enabled": {True: "روشن", False: "خاموش"},
+    }
+    buttons = []
+    for value in SETTING_CHOICES[key]:
+        token = "default" if value is None else str(value).lower() if isinstance(value, bool) else str(value)
+        label = labels.get(key, {}).get(value, "پیش‌فرض Provider" if value is None else str(value))
+        selected = "✅ " if current.get(key) == value else ""
+        buttons.append([(selected + label, f"setting:{key}:{token}")])
+    buttons.append([("بازگشت", "engine_settings")])
+    return show(chat_id, f"<b>انتخاب مقدار</b>\n<code>{esc(key)}</code>", buttons, target_mid)
+
+
+def data_vendors_menu(chat_id: int, target_mid: int | None = None) -> int:
+    cfg = get_run_settings()
+    names = {
+        "core_stock_apis": "قیمت و داده‌های اصلی",
+        "technical_indicators": "اندیکاتورهای تکنیکال",
+        "fundamental_data": "داده بنیادی",
+        "news_data": "اخبار",
+        "macro_data": "داده کلان",
+        "prediction_markets": "بازارهای پیش‌بینی",
+    }
+    lines = ["<b>🗃 منابع داده</b>"]
+    buttons = []
+    for key, title in names.items():
+        lines.append(f"{title}: <code>{esc(cfg['data_vendors'][key])}</code>")
+        buttons.append([(title, f"vendor_menu:{key}")])
+    buttons.append([("بازگشت", "engine_settings")])
+    return show(chat_id, "\n".join(lines), buttons, target_mid)
+
+
+def data_vendor_choices_screen(chat_id: int, category: str, target_mid: int | None = None) -> int:
+    if category not in DATA_VENDOR_OPTIONS:
+        raise ValueError("دسته منبع داده نامعتبر است.")
+    current = get_run_settings()["data_vendors"][category]
+    buttons = []
+    for vendor in DATA_VENDOR_OPTIONS[category]:
+        label = vendor.replace(",", " + ")
+        buttons.append([(f"{'✅ ' if vendor == current else ''}{label}", f"vendor:{category}:{vendor}")])
+    buttons.append([("بازگشت", "data_vendors_menu")])
+    return show(chat_id, f"<b>انتخاب منبع داده</b>\n<code>{esc(category)}</code>", buttons, target_mid)
+
+
+def portfolio_json_screen(chat_id: int, target_mid: int | None = None) -> int:
+    return show(
+        chat_id,
+        "<b>🎒 پورتفولیو (JSON)</b>\n"
+        "یک JSON با ساختار زیر بفرست. اطلاعات فقط همراه همین اجرا و به‌صورت رمزنگاری‌شده منتقل می‌شود.\n"
+        "<pre>{\n  \"cash\": 10000,\n  \"currency\": \"USD\",\n  \"positions\": [{\"ticker\": \"NVDA\", \"quantity\": 5, \"average_price\": 120}]\n}</pre>",
+        [[("❌ لغو ورود", "portfolio_cancel")]],
+        target_mid,
+    )
 
 
 def providers_menu(chat_id: int, target_mid: int | None = None) -> int:
@@ -1610,10 +1770,12 @@ def analysis_confirm_screen(chat_id: int, target_mid: int | None = None) -> int:
         f"<b>✅ آماده اجرا</b>\n"
         f"Ticker: <code>{esc(data.get('ticker'))}</code>\n"
         f"تاریخ: <code>{esc(data.get('date'))}</code>\n"
-        f"تحلیلگران: <b>{esc(chosen)}</b>",
+        f"تحلیلگران: <b>{esc(chosen)}</b>\n"
+        f"پورتفولیو: <b>{'تنظیم‌شده' if data.get('portfolio') else 'بدون اطلاعات پورتفولیو'}</b>",
         [
             [("🚀 شروع", "analysis_run")],
             [("🎛 تحلیلگران", "analysis_analysts"), ("📅 تاریخ", "analysis_change_date")],
+            [("🎒 پورتفولیو JSON", "portfolio_input"), ("🧹 حذف پورتفولیو", "portfolio_clear")],
             [("❌ لغو", "flow_cancel")],
         ],
         target_mid,
@@ -1629,10 +1791,15 @@ def backtest_confirm_screen(chat_id: int, target_mid: int | None = None) -> int:
         f"<b>✅ آماده بک‌تست</b>\n"
         f"Tickerها: <code>{esc(data.get('tickers'))}</code>\n"
         f"از <code>{esc(data.get('start'))}</code> تا <code>{esc(data.get('end'))}</code>\n"
-        f"فاصله: <b>هر {esc(data.get('every', 7))} روز</b>",
+        f"فاصله: <b>هر {esc(data.get('every', 7))} روز</b>\n"
+        f"نوع دارایی: <b>{esc(data.get('asset_type', 'stock'))}</b>\n"
+        f"تحلیلگران: <b>{esc(chosen)}</b>\n"
+        f"پورتفولیو: <b>{'تنظیم‌شده' if data.get('portfolio') else 'بدون اطلاعات پورتفولیو'}</b>",
         [
             [("🚀 شروع", "backtest_run")],
             [("🎛 تحلیلگران", "backtest_analysts"), ("📅 فاصله", "backtest_every")],
+            [("💱 نوع دارایی", "backtest_asset_type")],
+            [("🎒 پورتفولیو JSON", "portfolio_input"), ("🧹 حذف پورتفولیو", "portfolio_clear")],
             [("❌ لغو", "flow_cancel")],
         ],
         target_mid,
