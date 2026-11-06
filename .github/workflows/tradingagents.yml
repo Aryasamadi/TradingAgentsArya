@@ -21,7 +21,7 @@ env:
   TRADINGAGENTS_MAX_DEBATE_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_DEBATE_ROUNDS || '1' }}
   TRADINGAGENTS_MAX_RISK_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_RISK_ROUNDS || '1' }}
   TRADINGAGENTS_MAX_TOOL_ROUNDS: ${{ secrets.TRADINGAGENTS_MAX_TOOL_ROUNDS || '20' }}
-  TRADINGAGENTS_LLM_MAX_RETRIES: ${{ secrets.TRADINGAGENTS_LLM_MAX_RETRIES || '6' }}
+  # Provider SDK retries are disabled; the engine applies RPM-only fixed-delay retries.\n  TRADINGAGENTS_LLM_MAX_RETRIES: '0'\n  TRADINGAGENTS_RPM_RETRIES: '3'
   TRADINGAGENTS_MAX_TOKENS: ${{ secrets.TRADINGAGENTS_MAX_TOKENS || '8192' }}
   TRADINGAGENTS_TEMPERATURE: ${{ secrets.TRADINGAGENTS_TEMPERATURE || '0.0' }}
   TRADINGAGENTS_GOOGLE_THINKING_LEVEL: ${{ secrets.TRADINGAGENTS_GOOGLE_THINKING_LEVEL || 'medium' }}
@@ -188,6 +188,9 @@ jobs:
         env:
           REQUEST_JSON: ${{ toJSON(github.event.client_payload) }}
           BOT_STATE_KEY: ${{ secrets.BOT_STATE_KEY }}
+          BOT_GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPO: ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -227,71 +230,80 @@ jobs:
           if config_enc:
               state_key = os.environ.get("BOT_STATE_KEY", "").strip()
               if not state_key:
-                  print("Warning: config_enc received but BOT_STATE_KEY is not set. Falling back to global secrets.")
-              else:
-                  try:
-                      from nacl.secret import SecretBox
+                  # Match bot.py's automatic fallback exactly. BOT_GITHUB_TOKEN
+                  # is already required by the Telegram controller, so no extra
+                  # secret or user-managed encryption password is necessary.
+                  gh_token = os.environ.get("BOT_GITHUB_TOKEN", "").strip()
+                  owner = os.environ.get("GITHUB_OWNER", "").strip()
+                  repo = os.environ.get("GITHUB_REPO", "").strip()
+                  if not (gh_token and owner and repo):
+                      raise SystemExit(
+                          "Missing BOT_GITHUB_TOKEN/GITHUB_OWNER/GITHUB_REPO for automatic request decryption."
+                      )
+                  state_key = f"legacy:{owner}:{repo}:{gh_token}"
+              try:
+                  from nacl.secret import SecretBox
 
-                      key = hashlib.sha256(state_key.encode("utf-8")).digest()
-                      decrypted = SecretBox(key).decrypt(base64.b64decode(config_enc))
-                      cfg = json.loads(decrypted.decode("utf-8"))
+                  key = hashlib.sha256(state_key.encode("utf-8")).digest()
+                  decrypted = SecretBox(key).decrypt(base64.b64decode(config_enc))
+                  cfg = json.loads(decrypted.decode("utf-8"))
 
-                      tiers = cfg.get("tiers")
-                      if isinstance(tiers, dict):
-                          for tier in ("quick", "deep"):
-                              item = tiers.get(tier) or {}
-                              prefix = tier.upper()
-                              write_env(f"TRADINGAGENTS_{prefix}_THINK_PROVIDER", item.get("provider_type"))
-                              write_env(f"TRADINGAGENTS_{prefix}_THINK_LLM", item.get("model_name"))
-                              write_env(f"TRADINGAGENTS_{prefix}_THINK_BACKEND_URL", item.get("base_url"))
-                              token = str(item.get("api_token") or "")
-                              env_key = str(item.get("provider_env_key") or "")
-                              if token:
-                                  print(f"::add-mask::{token}")
-                                  if env_key:
-                                      write_env(env_key, token)
-                          write_env("TRADINGAGENTS_LLM_PROVIDER", (tiers.get("quick") or {}).get("provider_type"))
-                          write_env("TRADINGAGENTS_LLM_BACKEND_URL", (tiers.get("quick") or {}).get("base_url"))
-                      else:
-                          token = str(cfg.get("api_token") or "")
+                  tiers = cfg.get("tiers")
+                  if isinstance(tiers, dict):
+                      for tier in ("quick", "deep"):
+                          item = tiers.get(tier) or {}
+                          prefix = tier.upper()
+                          write_env(f"TRADINGAGENTS_{prefix}_THINK_PROVIDER", item.get("provider_type"))
+                          write_env(f"TRADINGAGENTS_{prefix}_THINK_LLM", item.get("model_name"))
+                          write_env(f"TRADINGAGENTS_{prefix}_THINK_BACKEND_URL", item.get("base_url"))
+                          token = str(item.get("api_token") or "")
+                          env_key = str(item.get("provider_env_key") or "")
                           if token:
                               print(f"::add-mask::{token}")
-                              env_key = str(cfg.get("provider_env_key") or "")
                               if env_key:
                                   write_env(env_key, token)
-                          write_env("TRADINGAGENTS_LLM_PROVIDER", cfg.get("provider_type"))
-                          write_env("TRADINGAGENTS_DEEP_THINK_LLM", cfg.get("model_name"))
-                          write_env("TRADINGAGENTS_QUICK_THINK_LLM", cfg.get("model_name"))
-                          write_env("TRADINGAGENTS_LLM_BACKEND_URL", cfg.get("base_url"))
+                      write_env("TRADINGAGENTS_LLM_PROVIDER", (tiers.get("quick") or {}).get("provider_type"))
+                      write_env("TRADINGAGENTS_LLM_BACKEND_URL", (tiers.get("quick") or {}).get("base_url"))
+                  else:
+                      token = str(cfg.get("api_token") or "")
+                      if token:
+                          print(f"::add-mask::{token}")
+                          env_key = str(cfg.get("provider_env_key") or "")
+                          if env_key:
+                              write_env(env_key, token)
+                      write_env("TRADINGAGENTS_LLM_PROVIDER", cfg.get("provider_type"))
+                      write_env("TRADINGAGENTS_DEEP_THINK_LLM", cfg.get("model_name"))
+                      write_env("TRADINGAGENTS_QUICK_THINK_LLM", cfg.get("model_name"))
+                      write_env("TRADINGAGENTS_LLM_BACKEND_URL", cfg.get("base_url"))
 
-                      run_settings = cfg.get("run_settings") or {}
-                      setting_env = {
-                          "output_language": "TRADINGAGENTS_OUTPUT_LANGUAGE",
-                          "max_debate_rounds": "TRADINGAGENTS_MAX_DEBATE_ROUNDS",
-                          "max_risk_discuss_rounds": "TRADINGAGENTS_MAX_RISK_ROUNDS",
-                          "max_tool_rounds": "TRADINGAGENTS_MAX_TOOL_ROUNDS",
-                          "checkpoint_enabled": "TRADINGAGENTS_CHECKPOINT_ENABLED",
-                          "temperature": "TRADINGAGENTS_TEMPERATURE",
-                          "max_tokens": "TRADINGAGENTS_MAX_TOKENS",
-                          "google_thinking_level": "TRADINGAGENTS_GOOGLE_THINKING_LEVEL",
-                          "openai_reasoning_effort": "TRADINGAGENTS_OPENAI_REASONING_EFFORT",
-                          "anthropic_effort": "TRADINGAGENTS_ANTHROPIC_EFFORT",
-                          "holding_period_days": "TRADINGAGENTS_HOLDING_PERIOD_DAYS",
-                          "benchmark_ticker": "TRADINGAGENTS_BENCHMARK_TICKER",
-                      }
-                      for key_name, env_name in setting_env.items():
-                          if key_name in run_settings:
-                              # An empty GITHUB_ENV value clears a workflow-level
-                              # default and lets the provider choose its own default.
-                              write_env(env_name, run_settings[key_name])
-                      if "data_vendors" in run_settings:
-                          write_env("TRADINGAGENTS_DATA_VENDORS_JSON", json.dumps(run_settings["data_vendors"], separators=(",", ":")))
-                      portfolio = cfg.get("portfolio")
-                      if portfolio:
-                          packed = base64.b64encode(json.dumps(portfolio, separators=(",", ":")).encode("utf-8")).decode("ascii")
-                          write_env("PORTFOLIO_JSON_B64", packed)
-                  except Exception as exc:
-                      raise SystemExit(f"Failed to decrypt request model config: {exc}")
+                  run_settings = cfg.get("run_settings") or {}
+                  setting_env = {
+                      "output_language": "TRADINGAGENTS_OUTPUT_LANGUAGE",
+                      "max_debate_rounds": "TRADINGAGENTS_MAX_DEBATE_ROUNDS",
+                      "max_risk_discuss_rounds": "TRADINGAGENTS_MAX_RISK_ROUNDS",
+                      "max_tool_rounds": "TRADINGAGENTS_MAX_TOOL_ROUNDS",
+                      "checkpoint_enabled": "TRADINGAGENTS_CHECKPOINT_ENABLED",
+                      "temperature": "TRADINGAGENTS_TEMPERATURE",
+                      "max_tokens": "TRADINGAGENTS_MAX_TOKENS",
+                      "google_thinking_level": "TRADINGAGENTS_GOOGLE_THINKING_LEVEL",
+                      "openai_reasoning_effort": "TRADINGAGENTS_OPENAI_REASONING_EFFORT",
+                      "anthropic_effort": "TRADINGAGENTS_ANTHROPIC_EFFORT",
+                      "holding_period_days": "TRADINGAGENTS_HOLDING_PERIOD_DAYS",
+                      "benchmark_ticker": "TRADINGAGENTS_BENCHMARK_TICKER",
+                  }
+                  for key_name, env_name in setting_env.items():
+                      if key_name in run_settings:
+                          # An empty GITHUB_ENV value clears a workflow-level
+                          # default and lets the provider choose its own default.
+                          write_env(env_name, run_settings[key_name])
+                  if "data_vendors" in run_settings:
+                      write_env("TRADINGAGENTS_DATA_VENDORS_JSON", json.dumps(run_settings["data_vendors"], separators=(",", ":")))
+                  portfolio = cfg.get("portfolio")
+                  if portfolio:
+                      packed = base64.b64encode(json.dumps(portfolio, separators=(",", ":")).encode("utf-8")).decode("ascii")
+                      write_env("PORTFOLIO_JSON_B64", packed)
+              except Exception as exc:
+                  raise SystemExit(f"Failed to decrypt request model config: {exc}")
           PY
 
       - name: Validate unattended configuration
