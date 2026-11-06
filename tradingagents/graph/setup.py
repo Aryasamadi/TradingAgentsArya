@@ -94,9 +94,9 @@ def _check_analyst_results(state, specs):
             "Continuing with partial analyst coverage. Failed analysts: %s",
             ", ".join(name for name, _ in failures),
         )
-        warning_block = "\\n\\n".join(report for _, report in failures)
+        warning_block = "\n\n".join(report for _, report in failures)
         previous_note = str(state.get("memory_note") or "").strip()
-        combined_note = "\\n\\n".join(part for part in (previous_note, warning_block) if part)
+        combined_note = "\n\n".join(part for part in (previous_note, warning_block) if part)
         return {"memory_note": combined_note}
     return {}
 
