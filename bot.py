@@ -674,6 +674,33 @@ def active_model_id() -> str:
     return get_setting("active_model", "")
 
 
+def role_model_id(role: str) -> str:
+    if role not in ("quick", "deep"):
+        raise ValueError("نقش مدل نامعتبر است.")
+    return get_setting(f"{role}_model_id", "") or active_model_id()
+
+
+def role_model_row(role: str):
+    model_id = role_model_id(role)
+    return q1("SELECT * FROM models WHERE id=? AND enabled=1", (model_id,)) if model_id else None
+
+
+def set_role_model(role: str, model_id: str) -> None:
+    if role not in ("quick", "deep"):
+        raise ValueError("نقش مدل نامعتبر است.")
+    if not q1("SELECT id FROM models WHERE id=? AND enabled=1", (model_id,)):
+        raise ValueError("مدل انتخاب‌شده معتبر یا فعال نیست.")
+    key = f"{role}_model_id"
+    previous = get_setting(key, "")
+    set_setting(key, model_id)
+    if not persist_state_if_dirty(force=True):
+        if previous:
+            set_setting(key, previous)
+        else:
+            db("DELETE FROM settings WHERE key=?", (key,))
+        raise RuntimeError("پشتیبان رمزگذاری‌شده GitHub به‌روز نشد؛ انتخاب نقش مدل ذخیره نشد.")
+
+
 def set_active_model(model_id: str) -> None:
     previous = active_model_id()
     set_setting("active_model", model_id)
@@ -875,9 +902,15 @@ def dispatch_run(chat_id: int, mode: str, params: dict) -> str:
     row = q1("SELECT * FROM models WHERE id=? AND enabled=1", (model_id,))
     if not row:
         raise ValueError("مدل فعال دیگر در فهرست مدل‌ها وجود ندارد؛ یک مدل معتبر انتخاب کن.")
-    prov = get_provider(str(row["provider_id"]))
-    if not prov:
-        raise ValueError("Provider مدل فعال پیدا نشد؛ مدل را دوباره بررسی کن.")
+    quick_row = role_model_row("quick") or row
+    deep_row = role_model_row("deep") or row
+    quick_provider = get_provider(str(quick_row["provider_id"]))
+    deep_provider = get_provider(str(deep_row["provider_id"]))
+    if not quick_provider or not deep_provider:
+        raise ValueError("Provider یکی از مدل‌های Quick/Deep پیدا نشد.")
+    if quick_provider["id"] != deep_provider["id"] or quick_row["base_url"] != deep_row["base_url"]:
+        raise ValueError("مدل‌های Quick و Deep فعلاً باید از یک Provider و Base URL باشند؛ هسته در حال حاضر چند Provider هم‌زمان را پشتیبانی نمی‌کند.")
+    prov = deep_provider
 
     request_id = uuid.uuid4().hex
     payload = {
@@ -893,6 +926,8 @@ def dispatch_run(chat_id: int, mode: str, params: dict) -> str:
             "request_id": request_id,
             "provider_type": prov["provider_type"],
             "model_name": row["name"],
+            "quick_model_name": quick_row["name"],
+            "deep_model_name": deep_row["name"],
             "base_url": strip_known_suffix(prov["base_url"]),
             "provider_env_key": PROVIDER_SECRET.get(prov["provider_type"], ""),
             "api_token": token,
@@ -1242,6 +1277,7 @@ def home_screen(chat_id: int, force_new: bool = False, target_mid: int | None = 
     rows = [
         [("🚀 تحلیل جدید", "flow_analysis_start"), ("📈 بک‌تست", "flow_backtest_start")],
         [("🤖 مدل‌ها", "models"), ("📊 اجراهای جاری", "active_runs")],
+        [("🧠 نقش مدل‌ها", "model_roles")],
         [("📄 خروجی‌ها", "outputs")],
     ]
 
@@ -1290,11 +1326,41 @@ def models_screen(chat_id: int, page: int = 0, target_mid: int | None = None) ->
     if admin(chat_id):
         buttons += [
             [("➕ افزودن مدل", "model_add"), ("📋 پرووایدرها", "providers_menu")],
+            [("🧠 نقش مدل‌ها (Quick/Deep)", "model_roles")],
             [("🗑 حذف مدل", "model_delete_menu")],
         ]
     buttons.append([("🏠 خانه", "home")])
 
     return show(chat_id, text, buttons, target_mid)
+
+
+def model_roles_screen(chat_id: int, target_mid: int | None = None) -> int:
+    quick_row, deep_row = role_model_row("quick"), role_model_row("deep")
+    quick_name = quick_row["name"] if quick_row else "مدل پیش‌فرض"
+    deep_name = deep_row["name"] if deep_row else "مدل پیش‌فرض"
+    return show(
+        chat_id,
+        "<b>🧠 تخصیص نقش مدل‌ها</b>\n"
+        "Quick برای کارهای سریع و Deep برای استدلال عمیق استفاده می‌شود. "
+        "فعلاً هر دو باید از یک Provider و Base URL باشند.\n\n"
+        f"Quick: <code>{esc(quick_name)}</code>\nDeep: <code>{esc(deep_name)}</code>",
+        [[("⚡ انتخاب Quick", "model_role_picker:quick")],
+         [("🧠 انتخاب Deep", "model_role_picker:deep")],
+         [("↩️ بازگشت به مدل‌ها", "models")]],
+        target_mid,
+    )
+
+
+def model_role_picker_screen(chat_id: int, role: str, target_mid: int | None = None) -> int:
+    if role not in ("quick", "deep"):
+        raise ValueError("نقش مدل نامعتبر است.")
+    buttons = []
+    current = role_model_id(role)
+    for row in model_rows():
+        marker = "✅ " if row["id"] == current else ""
+        buttons.append([(f"{marker}{row['name'][:48]}", f"set_model_role:{role}:{row['id']}")])
+    buttons.append([("↩️ بازگشت", "model_roles")])
+    return show(chat_id, f"<b>انتخاب مدل {role.upper()}</b>\nمدل موردنظر را انتخاب کن:", buttons, target_mid)
 
 
 def providers_menu(chat_id: int, target_mid: int | None = None) -> int:
@@ -1901,13 +1967,14 @@ def callback(query: dict[str, Any]) -> None:
     admin_only = (
         data in {
             "model_add", "wizard_manual_model", "fetch_models_list", "model_delete_menu",
-            "providers_menu", "model_test_menu",
+            "providers_menu", "model_test_menu", "model_roles",
         }
         or data.startswith((
             "provider_detail:", "list_provider_models:", "prov_models_page:",
             "ask_delete_provider:", "confirm_delete_provider:", "manual_model_for_prov:",
             "pmd_select:", "mdt_select:", "delete_model:", "activate:", "test_model:",
             "pmd_test:", "mdt_test:", "md_temp:", "md:", "bulk_do:all",
+            "model_role_picker:", "set_model_role:",
         ))
     )
     if admin_only and not admin(user_id):
@@ -1932,6 +1999,18 @@ def callback(query: dict[str, Any]) -> None:
         elif data.startswith("models_page:"):
             page = int(data.split(":", 1)[1])
             models_screen(chat_id, page=page, target_mid=cb_mid)
+
+        elif data == "model_roles":
+            model_roles_screen(chat_id, cb_mid)
+
+        elif data.startswith("model_role_picker:"):
+            model_role_picker_screen(chat_id, data.split(":", 1)[1], cb_mid)
+
+        elif data.startswith("set_model_role:"):
+            _, role, model_id = data.split(":", 2)
+            set_role_model(role, model_id)
+            answer_callback(query["id"], f"مدل {role.upper()} ذخیره شد.", True)
+            model_roles_screen(chat_id, cb_mid)
 
         elif data == "providers_menu":
             providers_menu(chat_id, cb_mid)
