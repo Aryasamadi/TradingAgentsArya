@@ -377,7 +377,7 @@ jobs:
               --cache-dir "${TRADINGAGENTS_CACHE_DIR}" \
               --ticker "${TICKER}" \
               --chat-id "${REQUEST_CHAT_ID}" \
-              --request-id "${REQUEST_ID}" \\
+              --request-id "${REQUEST_ID}" \
               --log-path ".runtime/run/agent.log" &
             watcher_pid=$!
             echo "Live stream watcher started (pid ${watcher_pid})."
