@@ -787,37 +787,71 @@ def fetch_active_runs():
 
 
 def dispatch_run(chat_id: int, mode: str, params: dict) -> str:
-    model_id = active_model_id()
-    if not model_id:
-        raise ValueError("اول از بخش مدل‌ها یک مدل فعال کن.")
+    quick_id, deep_id = tier_model_id("quick"), tier_model_id("deep")
+    if not quick_id or not deep_id:
+        raise ValueError("مدل‌های Quick و Deep را در بخش «نقش مدل‌ها» انتخاب کن.")
+    if not STATE_KEY:
+        raise ValueError("برای انتقال امن تنظیمات مستقل مدل‌ها و پورتفولیو، Secret با نام BOT_STATE_KEY باید در GitHub تنظیم شده باشد.")
 
     request_id = uuid.uuid4().hex
+    safe_params = dict(params)
+    portfolio = safe_params.pop("portfolio", None)
+    if portfolio is not None:
+        portfolio = validate_portfolio(portfolio)
+
+    def model_bundle(tier: str, model_id: str) -> dict[str, str]:
+        row = q1("SELECT * FROM models WHERE id=? AND enabled=1", (model_id,))
+        if not row:
+            raise ValueError(f"مدل {tier} حذف شده یا غیرفعال است؛ نقش مدل را دوباره تنظیم کن.")
+        prov = get_provider(row["provider_id"])
+        if not prov:
+            raise ValueError(f"Provider مدل {tier} پیدا نشد.")
+        token = decrypt_token(prov["token_ciphertext"])
+        provider_type = str(prov["provider_type"]).strip().lower()
+        if provider_type not in PROVIDER_SECRET and provider_type not in {"ollama"}:
+            raise ValueError(f"Provider مدل {tier} در نگاشت کلید API پشتیبانی نشده است: {provider_type}")
+        return {
+            "provider_type": provider_type,
+            "model_name": str(row["name"]),
+            "base_url": strip_known_suffix(str(prov["base_url"])),
+            "provider_env_key": PROVIDER_SECRET.get(provider_type, ""),
+            "api_token": token,
+        }
+
+    tiers = {
+        "quick": model_bundle("Quick", quick_id),
+        "deep": model_bundle("Deep", deep_id),
+    }
+
+    # GitHub Actions exposes one environment variable per provider credential.
+    # Two roles may share a provider only when they use the same credential.
+    credentials: dict[str, str] = {}
+    for bundle in tiers.values():
+        env_key, token = bundle["provider_env_key"], bundle["api_token"]
+        if env_key and token:
+            if env_key in credentials and credentials[env_key] != token:
+                raise ValueError(
+                    "برای دو نقش با یک Provider نمی‌توان دو API Token جداگانه در یک اجرا تزریق کرد. "
+                    "از یک Credential مشترک استفاده کن یا برای یکی از نقش‌ها Provider دیگری انتخاب کن."
+                )
+            credentials[env_key] = token
+
+    config = {
+        "request_id": request_id,
+        "tiers": tiers,
+        "run_settings": get_run_settings(),
+    }
+    if portfolio is not None:
+        config["portfolio"] = portfolio
+
     payload = {
         "request_id": request_id,
         "mode": mode,
         "chat_id": str(chat_id),
-        "model_id": model_id,
-        "params": params,
+        "model_id": quick_id,
+        "params": safe_params,
+        "config_enc": encrypt_request_config(config),
     }
-
-    row = q1("SELECT * FROM models WHERE id=? AND enabled=1", (model_id,))
-    prov = get_provider(row["provider_id"]) if row else None
-
-    if row and prov:
-        try:
-            token = decrypt_token(prov["token_ciphertext"])
-            config = {
-                "request_id": request_id,
-                "provider_type": prov["provider_type"],
-                "model_name": row["name"],
-                "base_url": strip_known_suffix(prov["base_url"]),
-                "provider_env_key": PROVIDER_SECRET.get(prov["provider_type"], ""),
-                "api_token": token,
-            }
-            if STATE_KEY:
-                payload["config_enc"] = encrypt_request_config(config)
-        except Exception as exc:
-            sys.stderr.write(f"Failed to build encrypted model config: {exc}\n")
 
     gh(
         "POST",
@@ -828,11 +862,10 @@ def dispatch_run(chat_id: int, mode: str, params: dict) -> str:
     db(
         "INSERT INTO runs(request_id,workflow_run_id,chat_id,mode,payload_json,model_id,status,conclusion,notified,created_at,updated_at) "
         "VALUES(?,?,?,?,?,?,?,?,0,?,?)",
-        (request_id, None, chat_id, mode, json.dumps(params, ensure_ascii=False), model_id, "queued", "", now(), now()),
+        (request_id, None, chat_id, mode, json.dumps(safe_params, ensure_ascii=False), quick_id, "queued", "", now(), now()),
     )
 
     return request_id
-
 
 def sync_run_records() -> None:
     rows = q("SELECT * FROM runs WHERE status NOT IN " + str(TERMINAL) + " ORDER BY created_at DESC LIMIT 30")
