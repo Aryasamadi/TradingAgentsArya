@@ -83,9 +83,6 @@ def is_rpm_rate_limit_error(exc: BaseException) -> bool:
         if "request" in name and "remaining" in name and value.strip() in {"0", "0.0"}:
             return True
 
-    # Never retry account/billing exhaustion just because the provider used 429.
-    if any(pattern.search(details) for pattern in _BILLING_PATTERNS):
-        return False
     return any(pattern.search(details) for pattern in _RPM_REQUEST_PATTERNS)
 
 
