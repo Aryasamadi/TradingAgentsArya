@@ -221,7 +221,7 @@ class AgentLogReader:
     """Read newly appended warning/error lines without blocking the engine."""
 
     ALERT = re.compile(
-        r"\\b(?:ERROR|CRITICAL|WARNING)\\b|rate.?limit|\\b429\\b|analyst failure|\\bfailed\\b",
+        r"\b(?:ERROR|CRITICAL|WARNING)\b|rate.?limit|\b429\b|analyst failure|\bfailed\b",
         re.IGNORECASE,
     )
 
@@ -236,9 +236,9 @@ class AgentLogReader:
                 part in name.upper() for part in ("API_KEY", "TOKEN", "SECRET")
             ):
                 line = line.replace(value, "[REDACTED]")
-        line = re.sub(r"\\bsk-[A-Za-z0-9_-]{12,}\\b", "[REDACTED]", line)
+        line = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "[REDACTED]", line)
         return re.sub(
-            r"(?i)bearer\\s+[A-Za-z0-9._~+/-]{12,}", "Bearer [REDACTED]", line
+            r"(?i)bearer\s+[A-Za-z0-9._~+/-]{12,}", "Bearer [REDACTED]", line
         )
 
     def poll(self) -> list[tuple[str, str]]:
@@ -263,7 +263,7 @@ class AgentLogReader:
                 alerts.append(self._redact(line)[:500])
         if not alerts:
             return []
-        return [("هشدارها و خطاهای موتور", "\\n".join(alerts[-20:]))]
+        return [("هشدارها و خطاهای موتور", "\n".join(alerts[-20:]))]
 
 
 # ---- markdown as Telegram HTML --------------------------------------------
