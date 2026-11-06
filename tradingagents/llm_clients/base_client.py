@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import os
 import re
@@ -51,10 +52,8 @@ def _error_payload(exc: BaseException) -> tuple[str, dict[str, str]]:
                 headers = {}
     raw_headers = getattr(exc, "headers", None)
     if raw_headers:
-        try:
+        with contextlib.suppress(Exception):
             headers.update({str(k).lower(): str(v) for k, v in raw_headers.items()})
-        except Exception:
-            pass
     return "\n".join(part for part in parts if part and part != "None"), headers
 
 
