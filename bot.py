@@ -895,6 +895,67 @@ def fetch_active_runs():
     return list({int(run["id"]): run for run in active if run.get("id")}.values())
 
 
+ENGINE_SETTING_CHOICES = {
+    "output_language": ["Persian", "English"],
+    "max_tool_rounds": ["4", "8", "12", "20"],
+    "max_debate_rounds": ["1", "2", "3"],
+    "max_risk_rounds": ["1", "2", "3"],
+    "max_tokens": ["2048", "4096", "8192"],
+    "checkpoint_enabled": ["true", "false"],
+}
+
+
+def engine_settings_values() -> dict[str, str]:
+    defaults = {
+        "output_language": "Persian",
+        "max_tool_rounds": "20",
+        "max_debate_rounds": "1",
+        "max_risk_rounds": "1",
+        "max_tokens": "8192",
+        "checkpoint_enabled": "true",
+    }
+    return {key: get_setting("engine_" + key, default) for key, default in defaults.items()}
+
+
+def engine_settings_screen(chat_id: int, target_mid: int | None = None) -> int:
+    values = engine_settings_values()
+    labels = {
+        "output_language": "زبان گزارش",
+        "max_tool_rounds": "حداکثر دور ابزار",
+        "max_debate_rounds": "دور مناظره",
+        "max_risk_rounds": "دور ارزیابی ریسک",
+        "max_tokens": "حداکثر توکن خروجی",
+        "checkpoint_enabled": "Checkpoint / Resume",
+    }
+    lines = ["<b>⚙️ تنظیمات موتور تحلیل</b>", "این گزینه‌ها برای اجرای بعدی اعمال می‌شوند."]
+    buttons = []
+    for key, label in labels.items():
+        value = values[key]
+        display = {"true": "روشن", "false": "خاموش"}.get(value, value)
+        lines.append(f"{label}: <b>{esc(display)}</b>")
+        buttons.append([(f"تنظیم {label}", f"engine_cycle:{key}")])
+    buttons += [[("↩️ خانه", "home")]]
+    return show(chat_id, "\n".join(lines), buttons, target_mid)
+
+
+def cycle_engine_setting(key: str) -> str:
+    if key not in ENGINE_SETTING_CHOICES:
+        raise ValueError("تنظیم موتور ناشناخته است.")
+    choices = ENGINE_SETTING_CHOICES[key]
+    setting_key = "engine_" + key
+    current = get_setting(setting_key, choices[0])
+    try:
+        index = choices.index(current)
+    except ValueError:
+        index = 0
+    new_value = choices[(index + 1) % len(choices)]
+    set_setting(setting_key, new_value)
+    if not persist_state_if_dirty(force=True):
+        set_setting(setting_key, current)
+        raise RuntimeError("ذخیره پایدار تنظیم موتور ناموفق بود.")
+    return new_value
+
+
 def dispatch_run(chat_id: int, mode: str, params: dict) -> str:
     model_id = active_model_id()
     if not model_id:
@@ -931,6 +992,7 @@ def dispatch_run(chat_id: int, mode: str, params: dict) -> str:
             "base_url": strip_known_suffix(prov["base_url"]),
             "provider_env_key": PROVIDER_SECRET.get(prov["provider_type"], ""),
             "api_token": token,
+            "engine_options": engine_settings_values(),
         }
         if not STATE_KEY:
             raise RuntimeError("BOT_STATE_KEY is required to protect per-run provider configuration.")
@@ -1277,7 +1339,7 @@ def home_screen(chat_id: int, force_new: bool = False, target_mid: int | None = 
     rows = [
         [("🚀 تحلیل جدید", "flow_analysis_start"), ("📈 بک‌تست", "flow_backtest_start")],
         [("🤖 مدل‌ها", "models"), ("📊 اجراهای جاری", "active_runs")],
-        [("🧠 نقش مدل‌ها", "model_roles")],
+        [("🧠 نقش مدل‌ها", "model_roles"), ("⚙️ تنظیمات موتور", "engine_settings")],
         [("📄 خروجی‌ها", "outputs")],
     ]
 
@@ -1974,7 +2036,7 @@ def callback(query: dict[str, Any]) -> None:
             "ask_delete_provider:", "confirm_delete_provider:", "manual_model_for_prov:",
             "pmd_select:", "mdt_select:", "delete_model:", "activate:", "test_model:",
             "pmd_test:", "mdt_test:", "md_temp:", "md:", "bulk_do:all",
-            "model_role_picker:", "set_model_role:",
+            "model_role_picker:", "set_model_role:", "engine_cycle:",
         ))
     )
     if admin_only and not admin(user_id):
@@ -1999,6 +2061,19 @@ def callback(query: dict[str, Any]) -> None:
         elif data.startswith("models_page:"):
             page = int(data.split(":", 1)[1])
             models_screen(chat_id, page=page, target_mid=cb_mid)
+
+        elif data == "engine_settings":
+            if not admin(user_id):
+                raise ValueError("تنظیمات موتور فقط برای Admin مجاز است.")
+            engine_settings_screen(chat_id, cb_mid)
+
+        elif data.startswith("engine_cycle:"):
+            if not admin(user_id):
+                raise ValueError("تنظیمات موتور فقط برای Admin مجاز است.")
+            key = data.split(":", 1)[1]
+            value = cycle_engine_setting(key)
+            answer_callback(query["id"], f"{key}: {value}", True)
+            engine_settings_screen(chat_id, cb_mid)
 
         elif data == "model_roles":
             model_roles_screen(chat_id, cb_mid)
