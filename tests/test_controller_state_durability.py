@@ -414,6 +414,24 @@ def test_an_unrestorable_state_is_not_published_over_the_durable_one():
     assert restore.check(empty) == 1
 
 
+def test_a_state_with_a_real_configuration_is_published_after_a_failed_restore():
+    """The marker must not block a state that the controller has filled."""
+    restore = _load_restore_module()
+    destination = _STATE_DIR / "restore-fail-real" / "bot_state.db"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    marker = destination.with_name(restore.MARKER_NAME)
+    marker.write_text("restore failed\n")
+
+    empty = destination.parent / "empty.db"
+    _make_state_db(empty, providers=0, models=0, runs=0)
+    assert restore.check(empty) == 1
+
+    filled = destination.parent / "filled.db"
+    _make_state_db(filled, providers=1, models=1, runs=0)
+    assert restore.check(filled) == 0
+    assert not marker.exists()
+
+
 def test_a_broken_download_does_not_stop_the_search():
     """The next artifact may still hold a usable state."""
     restore = _load_restore_module()

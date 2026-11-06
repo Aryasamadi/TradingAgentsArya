@@ -215,14 +215,20 @@ def check(db_path: Path) -> int:
 
     marker = db_path.with_name(MARKER_NAME)
     if marker.exists():
-        # The restore could not load the durable state, so this file was
-        # started empty. Publishing it would replace the state that is still
-        # waiting in the artifact.
-        print(
-            f"{marker} exists: the durable state could not be restored, so the "
-            "empty state will not be published."
-        )
-        return 1
+        if summary["providers"] or summary["models"]:
+            # The controller wrote a real configuration after the failed
+            # restore, so this state is worth keeping. The marker has done
+            # its job.
+            marker.unlink()
+        else:
+            # The restore could not load the durable state, so this file was
+            # started empty. Publishing it would replace the state that is
+            # still waiting in the artifact.
+            print(
+                f"{marker} exists: the durable state could not be restored, so the "
+                "empty state will not be published."
+            )
+            return 1
 
     print(
         f"State file is valid (providers={summary['providers']}, "
