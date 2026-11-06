@@ -283,6 +283,10 @@ jobs:
                               write_env(env_name, run_settings[key_name])
                       if "data_vendors" in run_settings:
                           write_env("TRADINGAGENTS_DATA_VENDORS_JSON", json.dumps(run_settings["data_vendors"], separators=(",", ":")))
+                      portfolio = cfg.get("portfolio")
+                      if portfolio:
+                          packed = base64.b64encode(json.dumps(portfolio, separators=(",", ":")).encode("utf-8")).decode("ascii")
+                          write_env("PORTFOLIO_JSON_B64", packed)
                   except Exception as exc:
                       raise SystemExit(f"Failed to decrypt request model config: {exc}")
           PY
