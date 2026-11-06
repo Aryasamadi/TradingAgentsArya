@@ -24,6 +24,8 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
+from tradingagents.llm_clients.base_client import is_rpm_rate_limit_error
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
@@ -74,6 +76,10 @@ def invoke_structured(structured_llm: Any | None, prompt: Any, agent_name: str) 
             raise ValueError("structured output returned no parsed result")
         return result
     except Exception as exc:
+        # An RPM limit must reach the graph-level fixed-delay retry handler;
+        # falling back to free text here would hide the throttling and add load.
+        if is_rpm_rate_limit_error(exc):
+            raise
         logger.warning(
             "%s: structured-output invocation failed (%s); retrying once as free text",
             agent_name, exc,
