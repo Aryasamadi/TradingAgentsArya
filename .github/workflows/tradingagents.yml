@@ -235,17 +235,33 @@ jobs:
                       decrypted = SecretBox(key).decrypt(base64.b64decode(config_enc))
                       cfg = json.loads(decrypted.decode("utf-8"))
 
-                      token = str(cfg.get("api_token") or "")
-                      if token:
-                          print(f"::add-mask::{token}")
-                          env_key = str(cfg.get("provider_env_key") or "")
-                          if env_key:
-                              write_env(env_key, token)
-
-                      write_env("TRADINGAGENTS_LLM_PROVIDER", cfg.get("provider_type"))
-                      write_env("TRADINGAGENTS_DEEP_THINK_LLM", cfg.get("model_name"))
-                      write_env("TRADINGAGENTS_QUICK_THINK_LLM", cfg.get("model_name"))
-                      write_env("TRADINGAGENTS_LLM_BACKEND_URL", cfg.get("base_url"))
+                      tiers = cfg.get("tiers")
+                      if isinstance(tiers, dict):
+                          for tier in ("quick", "deep"):
+                              item = tiers.get(tier) or {}
+                              prefix = tier.upper()
+                              write_env(f"TRADINGAGENTS_{prefix}_THINK_PROVIDER", item.get("provider_type"))
+                              write_env(f"TRADINGAGENTS_{prefix}_THINK_LLM", item.get("model_name"))
+                              write_env(f"TRADINGAGENTS_{prefix}_THINK_BACKEND_URL", item.get("base_url"))
+                              token = str(item.get("api_token") or "")
+                              env_key = str(item.get("provider_env_key") or "")
+                              if token:
+                                  print(f"::add-mask::{token}")
+                                  if env_key:
+                                      write_env(env_key, token)
+                          write_env("TRADINGAGENTS_LLM_PROVIDER", (tiers.get("quick") or {}).get("provider_type"))
+                          write_env("TRADINGAGENTS_LLM_BACKEND_URL", (tiers.get("quick") or {}).get("base_url"))
+                      else:
+                          token = str(cfg.get("api_token") or "")
+                          if token:
+                              print(f"::add-mask::{token}")
+                              env_key = str(cfg.get("provider_env_key") or "")
+                              if env_key:
+                                  write_env(env_key, token)
+                          write_env("TRADINGAGENTS_LLM_PROVIDER", cfg.get("provider_type"))
+                          write_env("TRADINGAGENTS_DEEP_THINK_LLM", cfg.get("model_name"))
+                          write_env("TRADINGAGENTS_QUICK_THINK_LLM", cfg.get("model_name"))
+                          write_env("TRADINGAGENTS_LLM_BACKEND_URL", cfg.get("base_url"))
                   except Exception as exc:
                       raise SystemExit(f"Failed to decrypt request model config: {exc}")
           PY
