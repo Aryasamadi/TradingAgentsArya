@@ -32,8 +32,8 @@ class AnalystExecutionPlanTests(unittest.TestCase):
 
 class AnalystFailureIsolationTests(unittest.TestCase):
     def test_one_no_tool_analyst_failure_becomes_visible_report(self):
-        from tradingagents.graph.setup import ANALYST_FAILURE_PREFIX, _analyst_graph
         from tradingagents.graph.analyst_execution import AnalystNodeSpec
+        from tradingagents.graph.setup import ANALYST_FAILURE_PREFIX, _analyst_graph
 
         spec = AnalystNodeSpec(
             key="broken",
