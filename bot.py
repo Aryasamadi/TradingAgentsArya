@@ -804,9 +804,6 @@ def dispatch_run(chat_id: int, mode: str, params: dict) -> str:
     quick_id, deep_id = tier_model_id("quick"), tier_model_id("deep")
     if not quick_id or not deep_id:
         raise ValueError("مدل‌های Quick و Deep را در بخش «نقش مدل‌ها» انتخاب کن.")
-    if not STATE_KEY:
-        raise ValueError("برای انتقال امن تنظیمات مستقل مدل‌ها و پورتفولیو، Secret با نام BOT_STATE_KEY باید در GitHub تنظیم شده باشد.")
-
     request_id = uuid.uuid4().hex
     safe_params = dict(params)
     portfolio = safe_params.pop("portfolio", None)
