@@ -45,12 +45,24 @@ MARKER_NAME = "bot_state.restore-incomplete"
 
 
 def run_gh(args: list[str], repo: str) -> str:
-    """Run a gh command and return its stdout."""
+    """Run a gh command and return its stdout.
+
+    ``gh api`` takes an absolute path and has no ``--repo`` flag: passing one
+    makes it fail with "unknown flag", which would leave the restore without
+    any artifact at all.
+    """
+    env = dict(os.environ)
+    # gh reads the token from GH_TOKEN; the workflow passes it under the
+    # GITHUB_TOKEN name as well, and gh only looks at GH_TOKEN.
+    token = env.get("GH_TOKEN") or env.get("GITHUB_TOKEN") or ""
+    if token:
+        env["GH_TOKEN"] = token
     result = subprocess.run(
-        ["gh", *args, "--repo", repo],
+        ["gh", *args],
         capture_output=True,
         text=True,
         check=True,
+        env=env,
     )
     return result.stdout
 
@@ -75,11 +87,16 @@ def download_artifact(repo: str, artifact_id: int, dest: Path) -> Path:
     """Download an artifact zip and return the path of the zip file."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     with dest.open("wb") as handle:
+        env = dict(os.environ)
+        token = env.get("GH_TOKEN") or env.get("GITHUB_TOKEN") or ""
+        if token:
+            env["GH_TOKEN"] = token
         subprocess.run(
-            ["gh", "api", f"/repos/{repo}/actions/artifacts/{artifact_id}/zip", "--repo", repo],
+            ["gh", "api", f"/repos/{repo}/actions/artifacts/{artifact_id}/zip"],
             stdout=handle,
             stderr=subprocess.PIPE,
             check=True,
+            env=env,
         )
     return dest
 
