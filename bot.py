@@ -1339,9 +1339,10 @@ def home_screen(chat_id: int, force_new: bool = False, target_mid: int | None = 
     rows = [
         [("🚀 تحلیل جدید", "flow_analysis_start"), ("📈 بک‌تست", "flow_backtest_start")],
         [("🤖 مدل‌ها", "models"), ("📊 اجراهای جاری", "active_runs")],
-        [("🧠 نقش مدل‌ها", "model_roles"), ("⚙️ تنظیمات موتور", "engine_settings")],
         [("📄 خروجی‌ها", "outputs")],
     ]
+    if admin(chat_id):
+        rows.insert(2, [("🧠 نقش مدل‌ها", "model_roles"), ("⚙️ تنظیمات موتور", "engine_settings")])
 
     if force_new:
         new_mid = send_message(chat_id, text, rows)
