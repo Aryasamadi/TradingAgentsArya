@@ -262,6 +262,27 @@ jobs:
                           write_env("TRADINGAGENTS_DEEP_THINK_LLM", cfg.get("model_name"))
                           write_env("TRADINGAGENTS_QUICK_THINK_LLM", cfg.get("model_name"))
                           write_env("TRADINGAGENTS_LLM_BACKEND_URL", cfg.get("base_url"))
+
+                      run_settings = cfg.get("run_settings") or {}
+                      setting_env = {
+                          "output_language": "TRADINGAGENTS_OUTPUT_LANGUAGE",
+                          "max_debate_rounds": "TRADINGAGENTS_MAX_DEBATE_ROUNDS",
+                          "max_risk_discuss_rounds": "TRADINGAGENTS_MAX_RISK_ROUNDS",
+                          "max_tool_rounds": "TRADINGAGENTS_MAX_TOOL_ROUNDS",
+                          "checkpoint_enabled": "TRADINGAGENTS_CHECKPOINT_ENABLED",
+                          "temperature": "TRADINGAGENTS_TEMPERATURE",
+                          "max_tokens": "TRADINGAGENTS_MAX_TOKENS",
+                          "google_thinking_level": "TRADINGAGENTS_GOOGLE_THINKING_LEVEL",
+                          "openai_reasoning_effort": "TRADINGAGENTS_OPENAI_REASONING_EFFORT",
+                          "anthropic_effort": "TRADINGAGENTS_ANTHROPIC_EFFORT",
+                          "holding_period_days": "TRADINGAGENTS_HOLDING_PERIOD_DAYS",
+                          "benchmark_ticker": "TRADINGAGENTS_BENCHMARK_TICKER",
+                      }
+                      for key_name, env_name in setting_env.items():
+                          if key_name in run_settings and run_settings[key_name] is not None:
+                              write_env(env_name, run_settings[key_name])
+                      if "data_vendors" in run_settings:
+                          write_env("TRADINGAGENTS_DATA_VENDORS_JSON", json.dumps(run_settings["data_vendors"], separators=(",", ":")))
                   except Exception as exc:
                       raise SystemExit(f"Failed to decrypt request model config: {exc}")
           PY
