@@ -386,3 +386,54 @@ def test_the_message_ends_as_done():
     message.flush()
     message.finish()
     assert client.texts("editMessageText")[-1].startswith("📊 <b>BTC</b> · <i>done</i>")
+
+
+def test_agent_log_reader_streams_alerts_once_and_redacts_secrets(tmp_path, monkeypatch):
+    log = tmp_path / "agent.log"
+    log.write_text(
+        "INFO: routine startup\\n"
+        "WARNING: Model Analyst hit requests-per-minute limit; retry 1/3\\n"
+        "ERROR: provider request failed with sk-1234567890abcdefghijk\\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "super-secret-api-key-value")
+    with log.open("a", encoding="utf-8") as stream:
+        stream.write("ERROR: leaked token super-secret-api-key-value\\n")
+
+    reader = live_stream.AgentLogReader(str(log))
+    first = reader.poll()
+    assert len(first) == 1
+    assert "requests-per-minute" in first[0][1]
+    assert "sk-1234567890abcdefghijk" not in first[0][1]
+    assert "super-secret-api-key-value" not in first[0][1]
+    assert reader.poll() == []
+
+
+def test_watcher_publishes_engine_errors_inside_the_expandable_live_message(tmp_path):
+    db = tmp_path / "BTC.db"
+    log = tmp_path / "agent.log"
+    log.write_text("WARNING: Market Analyst hit requests-per-minute limit; retry 1/3\\n", encoding="utf-8")
+    client = FakeClient()
+    polls = {"count": 0}
+
+    def should_stop():
+        polls["count"] += 1
+        return polls["count"] > 2
+
+    live_stream.watch(
+        str(db),
+        42,
+        "token",
+        "BTC",
+        "request-logs",
+        client=client,
+        log_path=str(log),
+        should_stop=should_stop,
+        interval=0,
+        edit_seconds=0,
+        action_seconds=0,
+    )
+
+    all_messages = client.texts("sendMessage") + client.texts("editMessageText")
+    assert any("requests-per-minute" in content for content in all_messages)
+    assert any("<blockquote expandable>" in content for content in all_messages)
