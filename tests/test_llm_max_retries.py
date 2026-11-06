@@ -93,3 +93,99 @@ def test_env_override_sets_config(monkeypatch):
     # None-default key: env value arrives as a string and is coerced downstream.
     assert config["llm_max_retries"] == "8"
     assert _coerce_max_retries(config["llm_max_retries"]) == 8
+
+
+
+# --- requests-per-minute-only retry policy --------------------------------
+
+
+class _ProviderError(Exception):
+    def __init__(self, message, status_code=429, headers=None):
+        super().__init__(message)
+        from types import SimpleNamespace
+        self.status_code = status_code
+        self.response = SimpleNamespace(
+            status_code=status_code, headers=headers or {}, text=message
+        )
+
+
+@pytest.mark.unit
+def test_classifies_explicit_requests_per_minute_limit_only():
+    from tradingagents.llm_clients.base_client import is_rpm_rate_limit_error
+
+    assert is_rpm_rate_limit_error(
+        _ProviderError("Rate limit reached: 60 requests per minute")
+    )
+    assert is_rpm_rate_limit_error(
+        _ProviderError("RESOURCE_EXHAUSTED: GenerateRequestsPerMinutePerProjectPerModel")
+    )
+    assert is_rpm_rate_limit_error(
+        _ProviderError("Too many requests", headers={"x-ratelimit-remaining-requests": "0"})
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "message",
+    [
+        "HTTP 429 insufficient_quota; check billing",
+        "HTTP 429: tokens per minute limit reached",
+        "HTTP 429: account hard limit reached",
+        "HTTP 429: generic throttling with no RPM detail",
+    ],
+)
+def test_does_not_retry_non_rpm_429(message):
+    from tradingagents.llm_clients.base_client import is_rpm_rate_limit_error
+
+    assert not is_rpm_rate_limit_error(_ProviderError(message))
+
+
+@pytest.mark.unit
+def test_rpm_retry_waits_exactly_twenty_seconds(monkeypatch):
+    from tradingagents.llm_clients import base_client
+
+    monkeypatch.setenv("TRADINGAGENTS_RPM_RETRIES", "2")
+    waits = []
+    attempts = []
+
+    def fake_operation():
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise _ProviderError("requests per minute limit reached")
+        return "recovered"
+
+    monkeypatch.setattr(base_client.time, "sleep", waits.append)
+    assert base_client.run_with_rpm_retries(fake_operation, agent_name="Test Analyst") == "recovered"
+    assert len(attempts) == 3
+    assert waits == [20, 20]
+
+
+@pytest.mark.unit
+def test_generic_429_is_not_retried(monkeypatch):
+    from tradingagents.llm_clients import base_client
+
+    monkeypatch.setenv("TRADINGAGENTS_RPM_RETRIES", "3")
+    waits = []
+    attempts = []
+
+    def fake_operation():
+        attempts.append(1)
+        raise _ProviderError("HTTP 429 insufficient_quota")
+
+    monkeypatch.setattr(base_client.time, "sleep", waits.append)
+    with pytest.raises(_ProviderError):
+        base_client.run_with_rpm_retries(fake_operation)
+    assert len(attempts) == 1
+    assert waits == []
+
+
+@pytest.mark.unit
+def test_structured_output_does_not_swallow_rpm_limit():
+    from tradingagents.agents.structured import invoke_structured
+
+    class StructuredModel:
+        def invoke(self, _prompt):
+            raise _ProviderError("requests per minute limit reached")
+
+    with pytest.raises(_ProviderError):
+        invoke_structured(StructuredModel(), [], "Test Analyst")
