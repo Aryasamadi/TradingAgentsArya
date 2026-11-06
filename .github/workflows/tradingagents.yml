@@ -382,13 +382,61 @@ jobs:
             echo "Live stream watcher started (pid ${watcher_pid})."
           fi
 
+          set +e
           "${CMD[@]}" 2>&1 | tee .runtime/run/agent.log
+          run_status=${PIPESTATUS[0]}
+          set -e
 
           # Give the watcher a moment to publish the last messages.
           sleep 5
           if [[ -n "${watcher_pid}" ]]; then
             kill "${watcher_pid}" 2>/dev/null || true
             wait "${watcher_pid}" 2>/dev/null || true
+          fi
+
+          if [[ "${run_status}" -ne 0 ]]; then
+            echo "TradingAgents failed with exit code ${run_status}; notifying Telegram."
+            python - <<'PY'
+          import html
+          import json
+          import os
+          import pathlib
+          import re
+          import urllib.request
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          chat_id = os.environ.get("REQUEST_CHAT_ID", "").strip()
+          log_path = pathlib.Path(".runtime/run/agent.log")
+          if token and chat_id and log_path.exists():
+              lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+              detail = "\\n".join(lines[-35:])[-2600:]
+              for name, value in os.environ.items():
+                  if value and any(part in name.upper() for part in ("API_KEY", "TOKEN", "SECRET")):
+                      detail = detail.replace(value, "[REDACTED]")
+              detail = re.sub(r"(?i)bearer\\s+[A-Za-z0-9._~+/-]{12,}", "Bearer [REDACTED]", detail)
+              message = (
+                  f"❌ اجرای TradingAgents ناموفق بود.\\n"
+                  f"Request: <code>{html.escape(os.environ.get('REQUEST_ID', ''))}</code>\\n"
+                  f"<pre>{html.escape(detail or 'No error output captured.')}</pre>"
+              )
+              payload = json.dumps({
+                  "chat_id": chat_id,
+                  "text": message[:3900],
+                  "parse_mode": "HTML",
+                  "disable_web_page_preview": True,
+              }).encode("utf-8")
+              request = urllib.request.Request(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  data=payload,
+                  headers={"Content-Type": "application/json"},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=15) as response:
+                      print(f"Telegram failure notice sent (HTTP {response.status}).")
+              except Exception as error:
+                  print(f"::warning::Could not send Telegram failure notice: {type(error).__name__}: {error}")
+          PY
+            exit "${run_status}"
           fi
 
       - name: Install report dependencies
