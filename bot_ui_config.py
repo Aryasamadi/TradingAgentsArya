@@ -49,9 +49,9 @@ SETTING_CHOICES = {
     "max_tokens": (None, 2048, 4096, 8192, 16384, 32768),
     "temperature": (None, 0.0, 0.2, 0.5, 0.7, 1.0),
     "checkpoint_enabled": (True, False),
-    "google_thinking_level": ("minimal", "low", "medium", "high"),
-    "openai_reasoning_effort": ("low", "medium", "high"),
-    "anthropic_effort": ("low", "medium", "high"),
+    "google_thinking_level": (None, "minimal", "low", "medium", "high"),
+    "openai_reasoning_effort": (None, "low", "medium", "high"),
+    "anthropic_effort": (None, "low", "medium", "high"),
     "holding_period_days": (1, 3, 5, 10, 20, 60),
 }
 
