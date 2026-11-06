@@ -237,6 +237,21 @@ jobs:
                       write_env("TRADINGAGENTS_DEEP_THINK_LLM", cfg.get("deep_model_name") or cfg.get("model_name"))
                       write_env("TRADINGAGENTS_QUICK_THINK_LLM", cfg.get("quick_model_name") or cfg.get("model_name"))
                       write_env("TRADINGAGENTS_LLM_BACKEND_URL", cfg.get("base_url"))
+
+                      # Per-run core settings selected from the Telegram controller.
+                      options = cfg.get("engine_options") or {}
+                      option_env = {
+                          "output_language": "TRADINGAGENTS_OUTPUT_LANGUAGE",
+                          "max_tool_rounds": "TRADINGAGENTS_MAX_TOOL_ROUNDS",
+                          "max_debate_rounds": "TRADINGAGENTS_MAX_DEBATE_ROUNDS",
+                          "max_risk_rounds": "TRADINGAGENTS_MAX_RISK_ROUNDS",
+                          "max_tokens": "TRADINGAGENTS_MAX_TOKENS",
+                          "checkpoint_enabled": "TRADINGAGENTS_CHECKPOINT_ENABLED",
+                      }
+                      for option, env_name in option_env.items():
+                          value = options.get(option)
+                          if value is not None and str(value).strip():
+                              write_env(env_name, value)
                   except Exception as exc:
                       raise SystemExit(f"Failed to decrypt request model config: {exc}")
           PY
