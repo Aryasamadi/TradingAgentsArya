@@ -1,4 +1,4 @@
-name: TradingAgents Engine + Telegram Controller (phase 1 UI)
+name: TradingAgents Engine + Telegram Controller (phase 2 reliability)
 
 run-name: >-
   ${{ github.event_name == 'repository_dispatch'
