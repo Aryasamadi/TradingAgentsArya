@@ -80,4 +80,6 @@ class AnalystFailureIsolationTests(unittest.TestCase):
             "market_report": "A grounded market report",
             "news_report": "⚠️ ANALYST FAILURE — News Analyst",
         }
-        self.assertEqual(_check_analyst_results(state, specs), {})
+        result = _check_analyst_results(state, specs)
+        self.assertIn("ANALYST FAILURE", result["memory_note"])
+        self.assertIn("News Analyst", result["memory_note"])
