@@ -74,6 +74,10 @@ def is_rpm_rate_limit_error(exc: BaseException) -> bool:
     if not (status_429 or resource_exhausted or re.search(r"\bhttp\s*429\b", lowered)):
         return False
 
+    # Never retry account/billing exhaustion just because the provider used 429.
+    if any(pattern.search(details) for pattern in _BILLING_PATTERNS):
+        return False
+
     # A zero remaining-request header is explicit RPM evidence.
     for name, value in headers.items():
         if "request" in name and "remaining" in name and value.strip() in {"0", "0.0"}:
