@@ -14,6 +14,7 @@ import io
 import json
 import os
 import re
+import signal
 import sqlite3
 import sys
 import threading
@@ -62,15 +63,27 @@ RUN_STATUS_LABEL = {
     "waiting": "منتظر رانر",
     "requested": "درخواست شده",
     "in_progress": "در حال اجرا",
+    # A cancel that GitHub accepted but has not finished yet. It is not
+    # terminal, so the next sync replaces it with the real outcome.
+    "cancelling": "در حال توقف",
     "success": "موفق",
     "failure": "ناموفق",
     "cancelled": "لغو شده",
 }
 KNOWN_SUFFIXES = ("/chat/completions", "/completions", "/messages", "/generateContent")
 
+# The state database is uploaded as a single file, so it must always be
+# complete on its own. WAL keeps the newest writes in a sidecar next to the
+# file; that sidecar is wiped together with the runner, so the log is folded
+# into the main file on every write (see checkpoint_state).
+with contextlib.suppress(OSError):
+    os.makedirs(os.path.dirname(os.path.abspath(STATE_PATH)), exist_ok=True)
 DB = sqlite3.connect(STATE_PATH, check_same_thread=False)
 DB.row_factory = sqlite3.Row
 DB.execute("PRAGMA foreign_keys=ON")
+DB.execute("PRAGMA busy_timeout=10000")
+with contextlib.suppress(sqlite3.OperationalError):
+    DB.execute("PRAGMA journal_mode=WAL")
 DB.executescript(
     """
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -122,7 +135,9 @@ for stmt in (
         DB.execute(stmt)
 
 DB.commit()
-DB_LOCK = threading.Lock()
+# An RLock, not a Lock: checkpoint_state() runs inside db() while the lock is
+# already held, and a plain Lock would deadlock on that second acquire.
+DB_LOCK = threading.RLock()
 
 CACHE: dict[str, Any] = {"runs": [], "ts": 0.0}
 WIZARDS: dict[int, dict[str, Any]] = {}
@@ -160,10 +175,32 @@ def db(sql: str, args: tuple | list = ()):
         try:
             cur = DB.execute(sql, args)
             DB.commit()
+            # Fold the write-ahead log into the main file right away, so the
+            # file that is uploaded is complete even if the runner dies.
+            checkpoint_state()
             return cur
         except Exception as e:
             sys.stderr.write(f"DB Exec Error: {e}\nSQL: {sql}\nArgs: {args}\n")
             return None
+
+
+def checkpoint_state() -> None:
+    """Fold the write-ahead log into the main state file.
+
+    The controller state is uploaded as a single file, but SQLite keeps the
+    newest writes in a ``-wal`` sidecar next to it. A runner that is wiped
+    takes that sidecar with it, so the writes that were never folded in are
+    lost and the state of the next runner looks frozen. Checkpointing on
+    every write keeps the uploaded file complete on its own.
+    """
+    with DB_LOCK:
+        try:
+            # fetchall() matters: an unfinished PRAGMA statement keeps the
+            # transaction open and the next commit fails with "SQL statements
+            # in progress".
+            DB.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        except Exception as e:
+            sys.stderr.write(f"DB checkpoint error: {e}\n")
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -847,11 +884,71 @@ def worker_loop() -> None:
         time.sleep(20)
 
 
-def cancel_run(run_id: int) -> None:
+def cancel_run(run_id: int) -> str:
+    """Cancel a workflow run and report what GitHub really did.
+
+    GitHub answers 202 when the cancellation is accepted, 409 when the run has
+    already finished and 403 when the token is not allowed to cancel it. The
+    old version swallowed every error and returned normally, so the bot told
+    the user "لغو شد" for runs that were still running.
+
+    The answer is asynchronous: 202 only means the request was accepted, so
+    the run is read back and the caller learns whether it really stopped.
+    """
     try:
         gh("POST", f"/actions/runs/{run_id}/cancel", timeout=15)
-    except Exception:
-        pass
+    except RuntimeError as exc:
+        status = 0
+        match = re.search(r"GitHub API error (\d+)", str(exc))
+        if match:
+            status = int(match.group(1))
+        if status == 409:
+            raise RuntimeError("این اجرا قبلاً تمام شده و دیگر قابل لغو نیست.") from exc
+        if status == 403:
+            raise RuntimeError("اجازهٔ لغو این اجرا را ندارم.") from exc
+        if status == 404:
+            raise RuntimeError("این اجرا در گیت‌هاب پیدا نشد.") from exc
+        raise RuntimeError(f"لغو ثبت نشد: {exc}") from exc
+
+    # 202 means "accepted", not "cancelled". Read the run back until it
+    # reaches a final state, so the message matches reality.
+    for _ in range(3):
+        time.sleep(1)
+        try:
+            run = gh("GET", f"/actions/runs/{run_id}", timeout=15) or {}
+        except Exception:
+            continue
+        status = str(run.get("status") or "")
+        conclusion = str(run.get("conclusion") or "")
+        if status == "completed":
+            if conclusion == "cancelled":
+                return "cancelled"
+            return f"completed:{conclusion or 'unknown'}"
+    return "cancelling"
+
+
+def mark_run_cancelled(workflow_run_id: int | None, outcome: str) -> None:
+    """Write the outcome of a cancel back into the local run row.
+
+    A run that really stopped is marked terminal, so the list stops showing
+    it. A run that is only "cancelling" keeps a non-terminal status, so the
+    next sync corrects it with whatever GitHub finally reports. The row is
+    matched on the workflow run id, which is unique, so an admin stopping
+    another user's run updates that run's own row.
+    """
+    if workflow_run_id is None:
+        return
+    if outcome == "cancelled":
+        db(
+            "UPDATE runs SET status='cancelled', conclusion='cancelled_by_user', updated_at=? "
+            "WHERE workflow_run_id=?",
+            (now(), workflow_run_id),
+        )
+    else:
+        db(
+            "UPDATE runs SET status='cancelling', updated_at=? WHERE workflow_run_id=?",
+            (now(), workflow_run_id),
+        )
 
 
 def hard_cancel(chat_id: int) -> str:
@@ -859,25 +956,58 @@ def hard_cancel(chat_id: int) -> str:
     FLOWS.pop(chat_id, None)
 
     cancelled_engines = 0
+    failed = 0
+    errors: list[str] = []
+    pending = 0
 
     try:
-        runs = fetch_active_runs()
-        for run in runs:
+        api_runs = fetch_active_runs()
+        db_rows = [
+            dict(row)
+            for row in q(
+                "SELECT * FROM runs WHERE status NOT IN " + str(TERMINAL) + " ORDER BY created_at DESC LIMIT 50"
+            )
+        ]
+        # Only the runs of this chat are stopped; the list is chat-scoped, so
+        # one user cannot cancel the work of another.
+        entries = _collect_active_runs(chat_id, api_runs, db_rows, admin(chat_id))
+        for entry in entries:
+            if not entry.get("cancelable"):
+                continue
+            workflow_run_id = entry.get("workflow_run_id")
+            if not workflow_run_id:
+                # GitHub has not given this run an id yet, so there is nothing
+                # to cancel; it is reported instead of being faked.
+                pending += 1
+                continue
             try:
-                cancel_run(run["id"])
+                outcome = cancel_run(int(workflow_run_id))
+            except Exception as exc:
+                failed += 1
+                errors.append(f"#{entry['request_id'][:8]}: {exc}")
+                continue
+            mark_run_cancelled(workflow_run_id, outcome)
+            if outcome == "cancelled":
                 cancelled_engines += 1
-            except Exception:
-                pass
-    except Exception:
-        pass
+            else:
+                failed += 1
+                errors.append(f"#{entry['request_id'][:8]}: اجرا هنوز متوقف نشده است.")
+    except Exception as exc:
+        errors.append(str(exc))
 
-    db(
-        "UPDATE runs SET status='cancelled', conclusion='cancelled_by_user', updated_at=? "
-        "WHERE chat_id=? AND status NOT IN " + str(TERMINAL),
-        (now(), chat_id),
-    )
-
-    return f"✅ همه چیز متوقف شد ({cancelled_engines} اجرای Engine)."
+    # The local rows are only marked cancelled for the runs that really
+    # stopped. A failed cancel keeps its row, so the next sync can correct it.
+    lines = []
+    if cancelled_engines:
+        lines.append(f"✅ {cancelled_engines} اجرای Engine لغو شد.")
+    else:
+        lines.append("ℹ️ هیچ اجرای فعالی برای لغو نبود.")
+    if pending:
+        lines.append(f"⏳ {pending} اجرا هنوز در گیت‌هاب ثبت نشده و قابل لغو نبود.")
+    if failed:
+        lines.append(f"⚠️ {failed} اجرا لغو نشد.")
+        lines.extend(f"• {esc(err)}" for err in errors[:5])
+    return "\n".join(lines)
 
 
 def make_summary_text(row: sqlite3.Row, info: dict[str, Any]) -> str:
@@ -2174,11 +2304,19 @@ def callback(query: dict[str, Any]) -> None:
         elif data.startswith("cancelw:"):
             run_id = int(data.split(":", 1)[1])
             try:
-                cancel_run(run_id)
-                answer_callback(query["id"], "🛑 لغو شد.", True)
-                active_runs_screen(chat_id)
+                outcome = cancel_run(run_id)
             except Exception as exc:
-                show(chat_id, f"<b>❌ لغو ناموفق</b>\n{esc(exc)}", [[("بازگشت", "active_runs")]])
+                # The run keeps going, so the button says so instead of
+                # pretending it stopped.
+                answer_callback(query["id"], f"❌ لغو ناموفق: {exc}", True)
+                active_runs_screen(chat_id)
+                return
+            mark_run_cancelled(run_id, outcome)
+            if outcome == "cancelled":
+                answer_callback(query["id"], "🛑 لغو شد.", True)
+            else:
+                answer_callback(query["id"], "⏳ لغو ثبت شد، اجرا هنوز در حال توقف است.", True)
+            active_runs_screen(chat_id)
 
         elif data == "outputs":
             outputs_screen(chat_id, page=0, target_mid=cb_mid)
@@ -2407,5 +2545,27 @@ def poll() -> None:
                 time.sleep(5)
 
 
+def _install_shutdown_handler() -> None:
+    """Fold the last writes into the state file when the runner stops us.
+
+    GitHub Actions ends the job with SIGTERM. Without a handler the process
+    dies right there and the writes that are still only in the write-ahead
+    log are lost with the runner.
+    """
+
+    def handler(signum, _frame):
+        sys.stdout.write(f"Received signal {signum}; saving controller state.\n")
+        sys.stdout.flush()
+        checkpoint_state()
+        with contextlib.suppress(Exception):
+            DB.close()
+        sys.exit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError, ValueError):
+            signal.signal(sig, handler)
+
+
 if __name__ == "__main__":
+    _install_shutdown_handler()
     poll()
