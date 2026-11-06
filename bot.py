@@ -1746,7 +1746,7 @@ def analyst_picker(chat_id: int, backtest: bool, target_mid: int | None = None) 
     allowed = list(ANALYST_ORDER)
     ticker = data.get("ticker", "")
 
-    if not backtest and ticker and is_crypto(ticker):
+    if (not backtest and ticker and is_crypto(ticker)) or (backtest and data.get("asset_type") == "crypto"):
         allowed.remove("fundamentals")
 
     selected = {x for x in data.get("analysts", "").split(",") if x in allowed}
@@ -2100,7 +2100,14 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
         stage = item.get("stage")
 
         try:
-            if stage == "url":
+            if stage == "benchmark":
+                cfg = get_run_settings()
+                cfg["benchmark_ticker"] = text
+                save_run_settings(cfg)
+                WIZARDS.pop(chat_id, None)
+                settings_menu(chat_id, target_mid)
+
+            elif stage == "url":
                 item["url"] = clean_base_url(text)
                 item["provider_type"] = infer_provider_type(item["url"])
                 item["provider_name"] = infer_provider_name(item["url"])
@@ -2178,6 +2185,18 @@ def handle_text(chat_id: int, text: str, target_mid: int) -> None:
                 flow["stage"] = "every"
                 backtest_every_screen(chat_id, target_mid)
 
+            elif stage == "portfolio":
+                try:
+                    raw_portfolio = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"JSON معتبر نیست: {exc.msg}") from exc
+                flow["portfolio"] = validate_portfolio(raw_portfolio)
+                flow["stage"] = "confirm"
+                if kind == "analysis":
+                    analysis_confirm_screen(chat_id, target_mid)
+                else:
+                    backtest_confirm_screen(chat_id, target_mid)
+
         except ValueError as exc:
             show(chat_id, f"<b>⚠️ {esc(exc)}</b>\nلطفاً دوباره تلاش کنید.", [[("❌ لغو", "flow_cancel")]], target_mid)
 
@@ -2212,6 +2231,63 @@ def callback(query: dict[str, Any]) -> None:
 
         elif data == "models":
             models_screen(chat_id, page=0, target_mid=cb_mid)
+
+        elif data == "engine_settings":
+            settings_menu(chat_id, cb_mid)
+
+        elif data.startswith("setting_menu:"):
+            setting_choices_screen(chat_id, data.split(":", 1)[1], cb_mid)
+
+        elif data.startswith("setting:"):
+            if not admin(user_id):
+                raise ValueError("فقط Admin می‌تواند تنظیمات سراسری موتور را تغییر دهد.")
+            _, key, value = data.split(":", 2)
+            updated = apply_setting(get_run_settings(), key, value)
+            save_run_settings(updated)
+            settings_menu(chat_id, cb_mid)
+
+        elif data == "settings_reset":
+            if not admin(user_id):
+                raise ValueError("فقط Admin.")
+            save_run_settings({})
+            settings_menu(chat_id, cb_mid)
+
+        elif data == "data_vendors_menu":
+            data_vendors_menu(chat_id, cb_mid)
+
+        elif data.startswith("vendor_menu:"):
+            data_vendor_choices_screen(chat_id, data.split(":", 1)[1], cb_mid)
+
+        elif data.startswith("vendor:"):
+            if not admin(user_id):
+                raise ValueError("فقط Admin می‌تواند منابع داده را تغییر دهد.")
+            _, category, vendor = data.split(":", 2)
+            updated = set_data_vendor(get_run_settings(), category, vendor)
+            save_run_settings(updated)
+            data_vendors_menu(chat_id, cb_mid)
+
+        elif data == "benchmark_input":
+            if not admin(user_id):
+                raise ValueError("فقط Admin.")
+            WIZARDS[chat_id] = {"stage": "benchmark"}
+            show(chat_id, "<b>🏁 Benchmark سفارشی</b>\nنماد شاخص را بفرست؛ برای بازگشت به تشخیص خودکار، <code>-</code> بفرست.", [[("لغو", "benchmark_cancel")]], cb_mid)
+
+        elif data == "benchmark_cancel":
+            WIZARDS.pop(chat_id, None)
+            settings_menu(chat_id, cb_mid)
+
+        elif data == "model_roles":
+            model_roles_screen(chat_id, cb_mid)
+
+        elif data.startswith("assign_tier_menu:"):
+            assign_tier_screen(chat_id, data.split(":", 1)[1], cb_mid)
+
+        elif data.startswith("assign_tier:"):
+            if not admin(user_id):
+                raise ValueError("فقط Admin.")
+            _, tier, model_id = data.split(":", 2)
+            set_tier_model_id(tier, model_id)
+            model_roles_screen(chat_id, cb_mid)
 
         elif data.startswith("models_page:"):
             page = int(data.split(":", 1)[1])
@@ -2535,10 +2611,57 @@ def callback(query: dict[str, Any]) -> None:
             analysis_ticker_screen(chat_id, cb_mid)
 
         elif data == "flow_backtest_start":
-            if not active_model_id():
-                raise ValueError("اول مدل فعال کن.")
-            FLOWS[chat_id] = {"kind": "backtest", "stage": "tickers", "every": 7, "analysts": "market,social,news,fundamentals"}
+            if not (tier_model_id("quick") and tier_model_id("deep")):
+                raise ValueError("ابتدا مدل‌های Quick و Deep را در بخش نقش مدل‌ها تنظیم کن.")
+            FLOWS[chat_id] = {"kind": "backtest", "stage": "tickers", "every": 7, "asset_type": "stock", "analysts": "market,social,news,fundamentals"}
             backtest_tickers_screen(chat_id, cb_mid)
+
+        elif data == "portfolio_input":
+            flow = FLOWS.get(chat_id)
+            if not flow:
+                raise ValueError("ابتدا یک تحلیل یا بک‌تست بساز.")
+            flow["stage"] = "portfolio"
+            portfolio_json_screen(chat_id, cb_mid)
+
+        elif data == "portfolio_clear":
+            flow = FLOWS.get(chat_id)
+            if not flow:
+                raise ValueError("اجرا پیدا نشد.")
+            flow.pop("portfolio", None)
+            if flow.get("kind") == "analysis":
+                analysis_confirm_screen(chat_id, cb_mid)
+            else:
+                backtest_confirm_screen(chat_id, cb_mid)
+
+        elif data == "portfolio_cancel":
+            flow = FLOWS.get(chat_id)
+            if not flow:
+                home_screen(chat_id, cb_mid)
+            elif flow.get("kind") == "analysis":
+                flow["stage"] = "confirm"
+                analysis_confirm_screen(chat_id, cb_mid)
+            else:
+                flow["stage"] = "confirm"
+                backtest_confirm_screen(chat_id, cb_mid)
+
+        elif data == "backtest_asset_type":
+            flow = FLOWS.get(chat_id)
+            if not flow:
+                raise ValueError("اجرا منقضی شده است.")
+            show(chat_id, "<b>نوع دارایی بک‌تست</b>", [[("📈 سهام", "asset_type:stock"), ("₿ کریپتو", "asset_type:crypto")], [("بازگشت", "noop")]], cb_mid)
+
+        elif data.startswith("asset_type:"):
+            flow = FLOWS.get(chat_id)
+            if not flow or flow.get("kind") != "backtest":
+                raise ValueError("بک‌تست منقضی شده است.")
+            asset_type = data.split(":", 1)[1]
+            if asset_type not in {"stock", "crypto"}:
+                raise ValueError("نوع دارایی نامعتبر است.")
+            flow["asset_type"] = asset_type
+            if asset_type == "crypto":
+                selected = [x for x in flow.get("analysts", "").split(",") if x and x != "fundamentals"]
+                flow["analysts"] = ",".join(selected)
+            backtest_confirm_screen(chat_id, cb_mid)
 
         elif data == "flow_cancel":
             FLOWS.pop(chat_id, None)
@@ -2631,9 +2754,12 @@ def callback(query: dict[str, Any]) -> None:
                     "start": flow["start"],
                     "end": flow["end"],
                     "every": int(flow.get("every", 7)),
+                    "asset_type": flow.get("asset_type", "stock"),
                     "analysts": flow.get("analysts", ""),
                 }
                 mode = "backtest"
+            if flow.get("portfolio"):
+                params["portfolio"] = flow["portfolio"]
 
             request_id = dispatch_run(chat_id, mode, params)
             FLOWS.pop(chat_id, None)
