@@ -81,18 +81,16 @@ jobs:
       - name: Restore controller state
         env:
           GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          BOT_STATE_PATH: ${{ github.workspace }}/.runtime/controller/bot_state.db
         run: |
           set -euo pipefail
           mkdir -p .runtime/controller
-
-          artifact_id="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
-            --jq '[.artifacts[] | select(.name=="tradingagents-controller-state" and .expired==false)] | sort_by(.created_at) | reverse | .[0].id // empty')"
-
-          if [[ -n "${artifact_id:-}" ]]; then
-            gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > .runtime/controller/state.zip
-            unzip -o .runtime/controller/state.zip -d .runtime/controller >/dev/null
-            rm -f .runtime/controller/state.zip
-          fi
+          # The newest artifact is not always the newest usable one: a
+          # controller that crashed early can publish an empty state. The
+          # script walks the artifacts from newest to oldest and takes the
+          # first one that is a real state database.
+          python scripts/restore_state.py --repo "${GITHUB_REPOSITORY}" --destination "${BOT_STATE_PATH}"
 
       - name: Install controller dependency
         run: python -m pip install --disable-pip-version-check PyNaCl
@@ -112,10 +110,21 @@ jobs:
 
       - name: Save controller state
         if: always()
+        env:
+          BOT_STATE_PATH: ${{ github.workspace }}/.runtime/controller/bot_state.db
+        run: |
+          set -euo pipefail
+          # The state is only published when it is a usable database. A
+          # controller that crashed before it could read the state must not
+          # replace the durable state with an empty file.
+          python scripts/restore_state.py --check "${BOT_STATE_PATH}"
+
+      - name: Upload controller state
+        if: always() && steps.save-controller-state.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: tradingagents-controller-state
-          path: .runtime/controller/bot_state.db
+          path: ${{ github.workspace }}/.runtime/controller/bot_state.db
           retention-days: 90
           if-no-files-found: warn
 
