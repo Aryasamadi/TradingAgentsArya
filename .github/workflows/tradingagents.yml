@@ -280,7 +280,9 @@ jobs:
                           "benchmark_ticker": "TRADINGAGENTS_BENCHMARK_TICKER",
                       }
                       for key_name, env_name in setting_env.items():
-                          if key_name in run_settings and run_settings[key_name] is not None:
+                          if key_name in run_settings:
+                              # An empty GITHUB_ENV value clears a workflow-level
+                              # default and lets the provider choose its own default.
                               write_env(env_name, run_settings[key_name])
                       if "data_vendors" in run_settings:
                           write_env("TRADINGAGENTS_DATA_VENDORS_JSON", json.dumps(run_settings["data_vendors"], separators=(",", ":")))
