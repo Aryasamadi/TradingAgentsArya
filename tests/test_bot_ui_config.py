@@ -87,3 +87,23 @@ def test_portfolio_validation_normalizes_values():
 def test_invalid_portfolios_are_rejected(portfolio):
     with pytest.raises(ValueError):
         validate_portfolio(portfolio)
+
+
+def test_engine_config_accepts_structured_vendor_overrides(monkeypatch):
+    from tradingagents.default_config import build_default_config
+
+    monkeypatch.setenv("TRADINGAGENTS_HOLDING_PERIOD_DAYS", "10")
+    monkeypatch.setenv("TRADINGAGENTS_DATA_VENDORS_JSON", '{"news_data":"alpha_vantage"}')
+    monkeypatch.setenv("TRADINGAGENTS_TOOL_VENDORS_JSON", '{"get_stock_data":"yfinance"}')
+    cfg = build_default_config()
+    assert cfg["holding_period_days"] == 10
+    assert cfg["data_vendors"]["news_data"] == "alpha_vantage"
+    assert cfg["tool_vendors"]["get_stock_data"] == "yfinance"
+
+
+def test_engine_config_rejects_invalid_vendor_json(monkeypatch):
+    from tradingagents.default_config import build_default_config
+
+    monkeypatch.setenv("TRADINGAGENTS_DATA_VENDORS_JSON", "[]")
+    with pytest.raises(ValueError, match="must contain a JSON object"):
+        build_default_config()
