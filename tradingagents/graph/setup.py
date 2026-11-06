@@ -102,6 +102,20 @@ def _tools_or_done(state) -> str:
     return "tools" if state["messages"][-1].tool_calls else END
 
 
+def _isolated_analyst_runnable(spec, compiled):
+    """Keep a failed analyst local to its own branch of the parallel graph."""
+    def isolated_analyst(state, config=None, **kwargs):
+        try:
+            return compiled.invoke(state, config=config, **kwargs)
+        except Exception as exc:
+            logger.error(
+                "%s failed; continuing without this analyst (%s): %s",
+                spec.agent_node, type(exc).__name__, describe_error(exc),
+            )
+            return {spec.report_key: _analyst_failure_report(spec.agent_node, exc)}
+    return isolated_analyst
+
+
 def _analyst_graph(spec, agent, max_tool_rounds: int):
     """One analyst as a graph of its own: the model and its tools, on a private message history.
 
@@ -121,7 +135,7 @@ def _analyst_graph(spec, agent, max_tool_rounds: int):
     graph.add_edge(START, "agent")
     if not spec.tools:
         graph.add_edge("agent", END)
-        return graph.compile()
+        return _isolated_analyst_runnable(spec, graph.compile())
 
     def calls(messages):
         return [call["name"] for m in messages for call in (getattr(m, "tool_calls", None) or [])]
@@ -143,21 +157,7 @@ def _analyst_graph(spec, agent, max_tool_rounds: int):
     graph.add_conditional_edges("agent", _tools_or_done, ["tools", END])
     graph.add_conditional_edges("tools", more_or_wrap_up, ["agent", "wrap_up"])
     graph.add_edge("wrap_up", END)
-    compiled = graph.compile()
-
-    def isolated_analyst(state, config=None, **kwargs):
-        # A failed analyst must not cancel its healthy parallel peers. Its
-        # report key carries a visible diagnostic for the downstream agents.
-        try:
-            return compiled.invoke(state, config=config, **kwargs)
-        except Exception as exc:
-            logger.error(
-                "%s failed; continuing without this analyst (%s): %s",
-                spec.agent_node, type(exc).__name__, describe_error(exc),
-            )
-            return {spec.report_key: _analyst_failure_report(spec.agent_node, exc)}
-
-    return isolated_analyst
+    return _isolated_analyst_runnable(spec, graph.compile())
 
 
 class GraphSetup:
